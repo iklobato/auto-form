@@ -1,0 +1,59 @@
+# --- secrets / credentials ---
+.env
+.env.local
+.env.*.local
+.credentials.env
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+deploy_key*
+
+# --- personal data: resume content, salary, identity ---
+knowledge/
+
+# --- portal credentials store (plaintext passwords) ---
+systems.yaml
+systems-all.yaml
+*.yaml.bkp
+*.yaml.bak
+
+# --- run artifacts ---
+applied.jsonl
+attempted.jsonl
+applications/
+screenshots/
+logs/
+browser_profiles/
+remote_pull_*/
+
+# --- python ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# --- editors / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+._*
+*.swp
+*.swo
+*~
+
+# --- ad-hoc backups / deploy scratch ---
+*.bak
+*.bkp
+deploy_*/
