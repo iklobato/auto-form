@@ -146,7 +146,7 @@ def yaml_store(systems_yaml_file: Path) -> YamlStore:
 
 @pytest.fixture
 def knowledge_base(tmp_app_root: Path, silent_logger: logging.Logger) -> KnowledgeBase:
-    (Paths.KNOWLEDGE / "01_personal.md").write_text("Name: Henrique")
+    (Paths.KNOWLEDGE / "01_personal.md").write_text("Name: Test Candidate")
     (Paths.KNOWLEDGE / "02_work.md").write_text("Senior Backend Engineer")
     return KnowledgeBase(dir_path=Paths.KNOWLEDGE, log=silent_logger)
 

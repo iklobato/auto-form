@@ -98,8 +98,9 @@ Other anti-loop rules:
 2. **"Continue with Google"** → skip if no Google credentials available.
 3. **"Apply with Indeed"** → use only if portal explicitly accepts it.
 
-**Self-register only if NO SSO is offered.** Fill: First name = Henrique, Last name = Lobato,
-Email = iklobato@proton.me, Password = `<portal_password>`. Click create. Immediately call
+**Self-register only if NO SSO is offered.** Fill: First name = `<first_name>`,
+Last name = `<last_name>`, Email = `<primary_email>`, Password = `<portal_password>`.
+Click create. Immediately call
 `save_credentials(email, password)`. If "verify email" appears, also call `save_note` and
 mark the application partial.
 

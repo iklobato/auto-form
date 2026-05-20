@@ -23,8 +23,14 @@ from tests.fixtures.forms import ALL_FORMS, FormField
 
 @pytest.fixture(scope="module")
 def real_knowledge() -> str:
-    """Loads the actual knowledge/ directory the agent uses at runtime."""
+    """Loads the actual knowledge/ directory the agent uses at runtime.
+
+    Skips the whole test module on fresh clones where knowledge/ is empty —
+    the directory is gitignored because it contains personal profile data.
+    """
     knowledge_dir = Path(__file__).parent.parent / "knowledge"
+    if not knowledge_dir.exists() or not any(knowledge_dir.glob("*.md")):
+        pytest.skip("knowledge/ not populated — copy your profile files in to enable")
     return KnowledgeBase(dir_path=knowledge_dir).load()
 
 

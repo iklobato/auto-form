@@ -28,7 +28,7 @@ class TestFiltering:
         rec = NetworkRecorder("acme", mock_app_logger)
         rec._on_request({
             "request": {"method": method, "url": "https://acme/api/apply",
-                        "postData": '{"name":"Henrique"}',
+                        "postData": '{"name":"Alex"}',
                         "headers": {"Content-Type": "application/json"}}
         })
         assert len(rec.recent) == 1
@@ -64,7 +64,7 @@ class TestFiltering:
         rec._on_request({
             "request": {"method": "POST",
                         "url": "https://boards.greenhouse.io/acme/applications",
-                        "postData": "first_name=Henrique&last_name=Lobato",
+                        "postData": "first_name=Alex&last_name=Doe",
                         "headers": {"content-type": "application/x-www-form-urlencoded"}}
         })
         assert len(rec.recent) == 1
@@ -75,16 +75,16 @@ class TestFiltering:
 
 class TestBodyParsing:
     def test_parses_json_body(self):
-        body = '{"first_name":"Henrique","email":"x@y.com"}'
+        body = '{"first_name":"Alex","email":"x@y.com"}'
         parsed = NetworkRecorder._parse_body(body, {"Content-Type": "application/json"})
-        assert parsed == {"first_name": "Henrique", "email": "x@y.com"}
+        assert parsed == {"first_name": "Alex", "email": "x@y.com"}
 
     def test_parses_form_urlencoded(self):
-        body = "first_name=Henrique&last_name=Lobato"
+        body = "first_name=Alex&last_name=Doe"
         parsed = NetworkRecorder._parse_body(
             body, {"Content-Type": "application/x-www-form-urlencoded"}
         )
-        assert parsed == {"first_name": ["Henrique"], "last_name": ["Lobato"]}
+        assert parsed == {"first_name": ["Alex"], "last_name": ["Doe"]}
 
     def test_returns_none_for_unknown_ctype(self):
         parsed = NetworkRecorder._parse_body("raw bytes",

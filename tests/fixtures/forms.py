@@ -1,4 +1,4 @@
-"""Sample apply-form schemas drawn from real internal portals.
+"""Sample apply-form schemas drawn from real-world portal patterns.
 
 Each fixture is a list of fields. A field declares:
     - label:     the question text the agent will see on screen
@@ -7,9 +7,15 @@ Each fixture is a list of fields. A field declares:
     - options:   for dropdown/radio — the allowed choices (None = free-form)
     - expect_in: a substring that the answer MUST contain for the agent to be considered "correct"
 
-The expect_in values map to fields in knowledge/00_form_answers.md and the rest of
-the knowledge base. The coverage test verifies that for every (label, expect_in) pair,
-the loaded knowledge actually contains that expected substring (case-insensitive).
+The expect_in values map to fields in the user's local knowledge/00_form_answers.md and
+the rest of their knowledge base. The coverage test verifies that for every
+(label, expect_in) pair, the loaded knowledge actually contains that expected
+substring (case-insensitive).
+
+The placeholder values below ("Test Candidate", "test@example.com", etc.) are
+for the public test suite. A real deployment overrides knowledge/ with the
+user's actual identity — fork this file and adjust expect_in to match your own
+profile if you want test_form_coverage to pass on real data.
 """
 
 from dataclasses import dataclass
@@ -24,15 +30,15 @@ class FormField:
     options: tuple[str, ...] | None = None
 
 
-# ── Fixture 1: the example form from the user's internal system ─────────────
+# ── Fixture 1: a representative internal-portal form ────────────────────────
 
 SAMPLE_INTERNAL_FORM = [
     FormField("Upload Your Resume/CV", kind="file",
-              expect_in="henrique_lobato", required=True),
+              expect_in="resume", required=True),
     FormField('Target job title', kind="text",
               expect_in="Senior Backend Engineer", required=True),
     FormField("Your full name", kind="text",
-              expect_in="Henrique Lobato", required=True),
+              expect_in="Test Candidate", required=True),
     FormField("Experience Level", kind="dropdown",
               options=("Entry (0-2 years)", "Mid (3-5 years)",
                        "Senior (6-10 years)", "Lead (10+ years)"),
@@ -51,14 +57,14 @@ SAMPLE_INTERNAL_FORM = [
 # ── Fixture 2: Greenhouse-style application form ────────────────────────────
 
 GREENHOUSE_FORM = [
-    FormField("First Name", kind="text", expect_in="Henrique"),
-    FormField("Last Name", kind="text", expect_in="Lobato"),
-    FormField("Email", kind="email", expect_in="iklobato@proton.me"),
-    FormField("Phone", kind="phone", expect_in="+55"),
-    FormField("Resume/CV", kind="file", expect_in="henrique_lobato"),
-    FormField("LinkedIn Profile", kind="text", expect_in="linkedin.com/in/henrique-brandao--"),
-    FormField("GitHub Profile", kind="text", expect_in="github.com/iklobato"),
-    FormField("Website", kind="text", expect_in="iklobato.com"),
+    FormField("First Name", kind="text", expect_in="Test"),
+    FormField("Last Name", kind="text", expect_in="Candidate"),
+    FormField("Email", kind="email", expect_in="test@example.com"),
+    FormField("Phone", kind="phone", expect_in="+1"),
+    FormField("Resume/CV", kind="file", expect_in="resume"),
+    FormField("LinkedIn Profile", kind="text", expect_in="linkedin.com/in/"),
+    FormField("GitHub Profile", kind="text", expect_in="github.com/"),
+    FormField("Website", kind="text", expect_in="example.com"),
     FormField("Are you legally authorized to work in the US?", kind="radio",
               options=("Yes", "No"), expect_in="No"),
     FormField("Will you now or in the future require sponsorship?", kind="radio",
@@ -69,11 +75,11 @@ GREENHOUSE_FORM = [
 # ── Fixture 3: Lever / Ashby-style form with cover letter ───────────────────
 
 LEVER_FORM = [
-    FormField("Full name", kind="text", expect_in="Henrique Lobato"),
-    FormField("Email", kind="email", expect_in="iklobato@proton.me"),
-    FormField("Current company", kind="text", expect_in="OneTrust"),
-    FormField("Current location", kind="text", expect_in="São Paulo"),
-    FormField("Resume", kind="file", expect_in="henrique_lobato"),
+    FormField("Full name", kind="text", expect_in="Test Candidate"),
+    FormField("Email", kind="email", expect_in="test@example.com"),
+    FormField("Current company", kind="text", expect_in="Acme"),
+    FormField("Current location", kind="text", expect_in="Remote"),
+    FormField("Resume", kind="file", expect_in="resume"),
     FormField("LinkedIn URL", kind="text", expect_in="linkedin.com"),
     FormField('How did you hear about this role?', kind="dropdown",
               options=("Internal job board", "LinkedIn", "Referral", "Other"),
