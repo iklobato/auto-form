@@ -28,6 +28,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import httpx
 import yaml
@@ -414,6 +415,258 @@ class LLMFactory:
         )
         return ChatOpenRouter(model=chosen, api_key=token,
                               http_client=client, max_retries=0)
+
+
+# ── Proxy providers ──────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class Proxy:
+    """One HTTP/SOCKS proxy. Value object — providers mint these, runner consumes."""
+    host: str
+    port: int
+    username: str | None = None
+    password: str | None = None
+    scheme: str = "http"
+    label: str = ""
+
+    def to_browser_profile(self) -> dict:
+        """Adapter to browser_use ProxySettings — keeps providers framework-agnostic."""
+        return {
+            "server": f"{self.scheme}://{self.host}:{self.port}",
+            "username": self.username,
+            "password": self.password,
+        }
+
+
+class ProxyProvider(Protocol):
+    """One-method strategy: hand back a Proxy for a portal. Failures propagate."""
+
+    def acquire(self, portal: str) -> Proxy: ...
+
+
+class StaticProxyProvider:
+    """Single fixed proxy from yaml/env — cheapest path, useful for self-hosted gateways."""
+
+    def __init__(self, *, host: str, port: int, scheme: str = "http",
+                 username: str | None = None, password: str | None = None,
+                 label: str = "static"):
+        if not host:
+            raise ValueError("StaticProxyProvider requires a host")
+        self._proxy = Proxy(host=host, port=int(port), scheme=scheme,
+                            username=username or None, password=password or None,
+                            label=label)
+
+    def acquire(self, portal: str) -> Proxy:
+        return self._proxy
+
+
+class ProxyListProvider:
+    """Round-robins through a file of `host:port` or `host:port:user:pass` lines."""
+
+    def __init__(self, *, path: Path, scheme: str = "http"):
+        raw = path.read_text().splitlines()
+        lines = [l.strip() for l in raw if l.strip() and not l.startswith("#")]
+        if not lines:
+            raise ValueError(f"ProxyListProvider: no entries in {path}")
+        self._proxies = [self._parse(line, scheme) for line in lines]
+        self._cursor = 0
+
+    @staticmethod
+    def _parse(line: str, scheme: str) -> Proxy:
+        parts = line.split(":")
+        if len(parts) == 2:
+            host, port = parts
+            return Proxy(host=host, port=int(port), scheme=scheme, label="list")
+        if len(parts) == 4:
+            host, port, user, pwd = parts
+            return Proxy(host=host, port=int(port), scheme=scheme,
+                         username=user, password=pwd, label="list")
+        raise ValueError(
+            f"ProxyListProvider: bad line {line!r}; expected host:port or host:port:user:pass"
+        )
+
+    def acquire(self, portal: str) -> Proxy:
+        proxy = self._proxies[self._cursor % len(self._proxies)]
+        self._cursor += 1
+        return proxy
+
+
+class WebshareProvider:
+    """Webshare.io paid provider — pulls the first usable proxy from the v2 API."""
+
+    API_URL = "https://proxy.webshare.io/api/v2/proxy/list/"
+
+    def __init__(self, *, token: str, mode: str = "direct",
+                 country: str | None = None, scheme: str = "http",
+                 http: httpx.Client | None = None):
+        if not token:
+            raise ValueError("WebshareProvider requires a token")
+        self._token = token
+        self._mode = mode
+        self._country = country
+        self._scheme = scheme
+        self._http = http or httpx.Client(timeout=15.0)
+
+    def acquire(self, portal: str) -> Proxy:
+        params: dict[str, object] = {"mode": self._mode, "page_size": 1}
+        if self._country:
+            params["country_code__in"] = self._country
+        r = self._http.get(
+            self.API_URL, params=params,
+            headers={"Authorization": f"Token {self._token}"},
+        )
+        r.raise_for_status()
+        results = r.json().get("results") or []
+        if not results:
+            raise RuntimeError(f"Webshare returned no proxies for portal={portal}")
+        p = results[0]
+        return Proxy(
+            host=p["proxy_address"], port=int(p["port"]),
+            username=p["username"], password=p["password"],
+            scheme=self._scheme,
+            label=f"webshare:{p.get('country_code', '?')}",
+        )
+
+
+class BrightDataProvider:
+    """Bright Data residential/datacenter gateway — fixed host, per-zone composite username."""
+
+    DEFAULT_HOST = "brd.superproxy.io"
+    DEFAULT_PORT = 22225
+
+    def __init__(self, *, customer: str, zone: str, password: str,
+                 host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+                 country: str | None = None, scheme: str = "http"):
+        if not (customer and zone and password):
+            raise ValueError("BrightDataProvider requires customer, zone, password")
+        user = f"brd-customer-{customer}-zone-{zone}"
+        if country:
+            user += f"-country-{country}"
+        self._proxy = Proxy(host=host, port=port, scheme=scheme,
+                            username=user, password=password,
+                            label=f"brightdata:{zone}")
+
+    def acquire(self, portal: str) -> Proxy:
+        return self._proxy
+
+
+class LoggingProxyProvider:
+    """Decorator — logs every acquire so we know which proxy a portal got."""
+
+    def __init__(self, inner: ProxyProvider, log: logging.Logger):
+        self._inner = inner
+        self._log = log
+
+    def acquire(self, portal: str) -> Proxy:
+        proxy = self._inner.acquire(portal)
+        self._log.info("proxy: portal=%s label=%s endpoint=%s:%d",
+                       portal, proxy.label, proxy.host, proxy.port)
+        return proxy
+
+
+class CachingProxyProvider:
+    """Decorator — re-uses the last acquired proxy per portal for ttl_s seconds."""
+
+    def __init__(self, inner: ProxyProvider, *, ttl_s: float,
+                 clock=time.monotonic):
+        if ttl_s <= 0:
+            raise ValueError("CachingProxyProvider ttl_s must be > 0")
+        self._inner = inner
+        self._ttl_s = ttl_s
+        self._clock = clock
+        self._cache: dict[str, tuple[float, Proxy]] = {}
+
+    def acquire(self, portal: str) -> Proxy:
+        now = self._clock()
+        cached = self._cache.get(portal)
+        if cached and (now - cached[0]) < self._ttl_s:
+            return cached[1]
+        proxy = self._inner.acquire(portal)
+        self._cache[portal] = (now, proxy)
+        return proxy
+
+
+class ProxyProviderFactory:
+    """Builds a ProxyProvider from a config dict. Unknown kinds raise — no fallbacks."""
+
+    @classmethod
+    def build(cls, config: dict | None, *,
+              log: logging.Logger) -> ProxyProvider | None:
+        if not config:
+            return None
+        kind = config.get("kind")
+        if not kind or kind == "none":
+            return None
+        builders = {
+            "static": cls._static,
+            "list": cls._list,
+            "webshare": cls._webshare,
+            "brightdata": cls._brightdata,
+        }
+        if kind not in builders:
+            raise ValueError(
+                f"Unknown proxy kind {kind!r}; known: {sorted(builders)}"
+            )
+        provider: ProxyProvider = builders[kind](config)
+        if config.get("cache_s"):
+            provider = CachingProxyProvider(provider, ttl_s=float(config["cache_s"]))
+        return LoggingProxyProvider(provider, log)
+
+    @staticmethod
+    def _static(cfg: dict) -> ProxyProvider:
+        port_raw = cfg.get("port")
+        if port_raw is None:
+            raise ValueError("static proxy requires 'port'")
+        username = (
+            expand_env(cfg.get("username", ""))
+            or (os.getenv(cfg["username_env"]) if cfg.get("username_env") else None)
+        )
+        password = (
+            expand_env(cfg.get("password", ""))
+            or (os.getenv(cfg["password_env"]) if cfg.get("password_env") else None)
+        )
+        return StaticProxyProvider(
+            host=expand_env(cfg.get("host", "")),
+            port=int(expand_env(str(port_raw)) or port_raw),
+            scheme=cfg.get("scheme", "http"),
+            username=username or None,
+            password=password or None,
+        )
+
+    @staticmethod
+    def _list(cfg: dict) -> ProxyProvider:
+        return ProxyListProvider(
+            path=Path(expand_env(cfg["path"])),
+            scheme=cfg.get("scheme", "http"),
+        )
+
+    @staticmethod
+    def _webshare(cfg: dict) -> ProxyProvider:
+        env_name = cfg.get("token_env", "WEBSHARE_TOKEN")
+        token = os.getenv(env_name)
+        if not token:
+            raise RuntimeError(f"{env_name} not set in env")
+        return WebshareProvider(
+            token=token, mode=cfg.get("mode", "direct"),
+            country=cfg.get("country"),
+            scheme=cfg.get("scheme", "http"),
+        )
+
+    @staticmethod
+    def _brightdata(cfg: dict) -> ProxyProvider:
+        customer_env = cfg.get("customer_env", "BRIGHTDATA_CUSTOMER")
+        password_env = cfg.get("password_env", "BRIGHTDATA_PASSWORD")
+        customer = os.getenv(customer_env)
+        password = os.getenv(password_env)
+        zone = cfg.get("zone", "")
+        if not (customer and password and zone):
+            raise RuntimeError(
+                f"BrightData requires {customer_env}, {password_env}, and zone"
+            )
+        return BrightDataProvider(
+            customer=customer, zone=zone, password=password,
+            country=cfg.get("country"),
+        )
 
 
 # ── JSONL trackers ────────────────────────────────────────────────────────────
@@ -1169,7 +1422,8 @@ class PortalRunner:
                  opts: RunOptions, yaml_store: YamlStore | None,
                  task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
                  applied: JsonlTracker, attempted: JsonlTracker,
-                 recorder: ApplicationRecorder, app_logger: AppLogger):
+                 recorder: ApplicationRecorder, app_logger: AppLogger,
+                 proxy_provider: ProxyProvider | None = None):
         self.system = system
         self.name = system["name"]
         self.url = expand_env(system.get("url", ""))
@@ -1183,6 +1437,7 @@ class PortalRunner:
         self.attempted = attempted
         self.recorder = recorder
         self.app_logger = app_logger
+        self.proxy_provider = proxy_provider
         self.plog = app_logger.portal(self.name)
         self._network_recorder: NetworkRecorder | None = None
 
@@ -1278,12 +1533,17 @@ class PortalRunner:
         elif resume_path:
             self.plog.warning("RESUME_PATH=%s does not exist — uploads will fail", resume_path)
 
+        profile_kwargs: dict[str, object] = {
+            "headless": self.opts.headless,
+            "user_data_dir": str(portal_profile),
+        }
+        if self.proxy_provider is not None:
+            proxy = self.proxy_provider.acquire(self.name)
+            profile_kwargs["proxy"] = proxy.to_browser_profile()
+
         agent = Agent(
             task=task, llm=self.llm,
-            browser_profile=BrowserProfile(
-                headless=self.opts.headless,
-                user_data_dir=str(portal_profile),
-            ),
+            browser_profile=BrowserProfile(**profile_kwargs),
             sensitive_data=credentials,
             available_file_paths=allowed_uploads or None,
             max_failures=self.MAX_FAILURES,
@@ -1325,7 +1585,8 @@ class Orchestrator:
                  yaml_store: YamlStore | None, task_builder: TaskBuilder,
                  cred_resolver: CredentialsResolver,
                  applied: JsonlTracker, attempted: JsonlTracker,
-                 recorder: ApplicationRecorder, app_logger: AppLogger):
+                 recorder: ApplicationRecorder, app_logger: AppLogger,
+                 default_proxy_provider: ProxyProvider | None = None):
         self.systems = systems
         self.knowledge = knowledge
         self.llm = llm
@@ -1338,6 +1599,7 @@ class Orchestrator:
         self.attempted = attempted
         self.recorder = recorder
         self.app_logger = app_logger
+        self.default_proxy_provider = default_proxy_provider
         self.log = app_logger.main()
         self.active = self._select_active(systems)
         self.skipped_count = len(systems) - len(self.active)
@@ -1432,7 +1694,14 @@ class Orchestrator:
             cred_resolver=self.cred_resolver,
             applied=self.applied, attempted=self.attempted,
             recorder=self.recorder, app_logger=self.app_logger,
+            proxy_provider=self._proxy_for(system),
         )
+
+    def _proxy_for(self, system: dict) -> ProxyProvider | None:
+        """Portal-level proxy overrides default. None = direct connection."""
+        if "proxy" in system:
+            return ProxyProviderFactory.build(system["proxy"], log=self.log)
+        return self.default_proxy_provider
 
 
 # ── Reports ──────────────────────────────────────────────────────────────────
@@ -1536,6 +1805,7 @@ class CLI:
         yaml_store = YamlStore(Path(args.systems).resolve())
         raw = yaml_store.load()
         systems = raw.get("systems") or raw.get("sources") or []
+        default_proxy_cfg = raw.get("proxy")
         log.info("Loaded %d portals from %s", len(systems), args.systems)
 
         if args.list:
@@ -1551,11 +1821,15 @@ class CLI:
             log.info("Resume PDF: %s", opts.resume_path)
 
         deps = cls._build_deps(args, log, app_logger, yaml_store, opts)
+        deps["default_proxy_provider"] = ProxyProviderFactory.build(
+            default_proxy_cfg, log=log,
+        )
         app_logger.emit("startup", run_id=app_logger.run_id,
                         systems_file=str(yaml_store.path),
                         dry_run=args.dry_run, headless=args.headless,
                         workers=args.workers, resume=opts.resume_path,
-                        model=deps["model_id"])
+                        model=deps["model_id"],
+                        proxy_kind=(default_proxy_cfg or {}).get("kind") or "none")
 
         if args.all:
             cls._run_all(systems, args.workers, opts, yaml_store, deps, app_logger, log)
@@ -1605,6 +1879,7 @@ class CLI:
             task_builder=deps["task_builder"], cred_resolver=deps["cred_resolver"],
             applied=deps["applied"], attempted=deps["attempted"],
             recorder=deps["recorder"], app_logger=app_logger,
+            default_proxy_provider=deps["default_proxy_provider"],
         ).run())
 
     @staticmethod
@@ -1620,12 +1895,17 @@ class CLI:
         if not url or url.startswith("$"):
             log.error("[%s] URL not configured — set the env var in .env", system_name)
             raise SystemExit(1)
+        proxy_provider = (
+            ProxyProviderFactory.build(system["proxy"], log=log)
+            if "proxy" in system else deps["default_proxy_provider"]
+        )
         runner = PortalRunner(
             system, knowledge=deps["knowledge"], llm=deps["llm"], opts=opts,
             yaml_store=yaml_store, task_builder=deps["task_builder"],
             cred_resolver=deps["cred_resolver"],
             applied=deps["applied"], attempted=deps["attempted"],
             recorder=deps["recorder"], app_logger=app_logger,
+            proxy_provider=proxy_provider,
         )
         asyncio.run(runner.run())
 

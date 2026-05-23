@@ -5,11 +5,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import fill
 from fill import (
     ApplicationRecorder,
     CredentialsResolver,
     JsonlTracker,
     PortalRunner,
+    Proxy,
     RunOptions,
     TaskBuilder,
     YamlStore,
@@ -17,12 +19,14 @@ from fill import (
 
 
 def _make_runner(system, *, opts, yaml_store, mock_app_logger,
-                 task_builder, cred_resolver, applied, attempted, recorder) -> PortalRunner:
+                 task_builder, cred_resolver, applied, attempted, recorder,
+                 proxy_provider=None) -> PortalRunner:
     return PortalRunner(
         system, knowledge="K", llm=MagicMock(), opts=opts, yaml_store=yaml_store,
         task_builder=task_builder, cred_resolver=cred_resolver,
         applied=applied, attempted=attempted, recorder=recorder,
         app_logger=mock_app_logger,
+        proxy_provider=proxy_provider,
     )
 
 
@@ -148,3 +152,80 @@ class TestCleanStaleLocks:
                               cred_resolver=cred_resolver, applied=applied_tracker,
                               attempted=attempted_tracker, recorder=recorder)
         runner._clean_stale_locks(profile)  # no exception
+
+
+class TestProxyWiring:
+    """The browser profile must carry proxy info iff a provider was injected."""
+
+    @staticmethod
+    def _patch_browser(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock]:
+        profile_ctor = MagicMock(return_value=MagicMock(name="profile"))
+        agent_ctor = MagicMock(return_value=MagicMock(name="agent"))
+        monkeypatch.setattr(fill, "BrowserProfile", profile_ctor)
+        monkeypatch.setattr(fill, "Agent", agent_ctor)
+        return profile_ctor, agent_ctor
+
+    def test_proxy_kwarg_passed_when_provider_set(
+        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
+        yaml_store: YamlStore, mock_app_logger: MagicMock,
+        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        profile_ctor, _ = self._patch_browser(monkeypatch)
+        provider = MagicMock()
+        provider.acquire.return_value = Proxy(
+            host="5.5.5.5", port=8080, username="u", password="p"
+        )
+        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
+                              mock_app_logger=mock_app_logger, task_builder=task_builder,
+                              cred_resolver=cred_resolver, applied=applied_tracker,
+                              attempted=attempted_tracker, recorder=recorder,
+                              proxy_provider=provider)
+        runner._build_agent(task="t", credentials={})
+        provider.acquire.assert_called_once_with(sample_system["name"])
+        kwargs = profile_ctor.call_args.kwargs
+        assert kwargs["proxy"] == {
+            "server": "http://5.5.5.5:8080",
+            "username": "u",
+            "password": "p",
+        }
+
+    def test_no_proxy_kwarg_when_provider_absent(
+        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
+        yaml_store: YamlStore, mock_app_logger: MagicMock,
+        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        profile_ctor, _ = self._patch_browser(monkeypatch)
+        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
+                              mock_app_logger=mock_app_logger, task_builder=task_builder,
+                              cred_resolver=cred_resolver, applied=applied_tracker,
+                              attempted=attempted_tracker, recorder=recorder,
+                              proxy_provider=None)
+        runner._build_agent(task="t", credentials={})
+        assert "proxy" not in profile_ctor.call_args.kwargs
+
+    def test_provider_failure_propagates(
+        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
+        yaml_store: YamlStore, mock_app_logger: MagicMock,
+        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        # No fallbacks: a failed acquire MUST bubble up; the runner does not
+        # fall back to a direct connection.
+        self._patch_browser(monkeypatch)
+        provider = MagicMock()
+        provider.acquire.side_effect = RuntimeError("upstream gone")
+        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
+                              mock_app_logger=mock_app_logger, task_builder=task_builder,
+                              cred_resolver=cred_resolver, applied=applied_tracker,
+                              attempted=attempted_tracker, recorder=recorder,
+                              proxy_provider=provider)
+        with pytest.raises(RuntimeError, match="upstream gone"):
+            runner._build_agent(task="t", credentials={})
