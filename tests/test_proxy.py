@@ -318,3 +318,109 @@ class TestProxyProviderFactory:
         # Logging wraps Caching wraps Static — both decorators present.
         assert isinstance(prov, LoggingProxyProvider)
         assert isinstance(prov._inner, CachingProxyProvider)
+
+
+class TestProxyListParsing:
+    def test_skips_indented_comment(self, tmp_path: Path):
+        f = tmp_path / "p.txt"
+        f.write_text("  # backup pool\n1.1.1.1:80\n")
+        assert ProxyListProvider(path=f).acquire("x").host == "1.1.1.1"
+
+    def test_password_may_contain_colon(self, tmp_path: Path):
+        f = tmp_path / "p.txt"
+        f.write_text("1.2.3.4:8080:user:pa:ss\n")
+        proxy = ProxyListProvider(path=f).acquire("x")
+        assert (proxy.username, proxy.password) == ("user", "pa:ss")
+
+
+class TestSocksAuth:
+    def test_socks_with_credentials_is_rejected(self):
+        with pytest.raises(ValueError, match="SOCKS"):
+            Proxy(host="x", port=1080, scheme="socks5", username="u", password="p")
+
+    def test_socks_without_credentials_is_allowed(self):
+        proxy = Proxy(host="x", port=1080, scheme="socks5")
+        assert proxy.to_browser_profile()["server"] == "socks5://x:1080"
+
+
+class TestWebshareSelection:
+    @staticmethod
+    def _client(results: list[dict]) -> httpx.Client:
+        return httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, json={"results": results})
+            )
+        )
+
+    @staticmethod
+    def _entry(addr: str, valid: bool = True) -> dict:
+        return {
+            "proxy_address": addr,
+            "port": 80,
+            "username": "u",
+            "password": "p",
+            "valid": valid,
+            "country_code": "US",
+        }
+
+    def test_skips_invalid_and_rotates(self):
+        prov = WebshareProvider(
+            token="t",
+            http=self._client(
+                [
+                    self._entry("1.1.1.1", valid=False),
+                    self._entry("2.2.2.2"),
+                    self._entry("3.3.3.3"),
+                ]
+            ),
+        )
+        hosts = [prov.acquire("x").host for _ in range(3)]
+        assert hosts == ["2.2.2.2", "3.3.3.3", "2.2.2.2"]
+
+    def test_all_invalid_raises(self):
+        prov = WebshareProvider(
+            token="t", http=self._client([self._entry("1.1.1.1", valid=False)])
+        )
+        with pytest.raises(RuntimeError, match="no valid proxies"):
+            prov.acquire("x")
+
+    def test_backbone_mode_is_rejected_at_build(self):
+        with pytest.raises(ValueError, match="backbone"):
+            WebshareProvider(token="t", mode="backbone")
+
+
+class TestStaticUnsetEnv:
+    def test_unset_host_var_is_rejected(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("PROXY_HOST_UNSET", raising=False)
+        with pytest.raises(ValueError, match="host"):
+            ProxyProviderFactory.build(
+                {"kind": "static", "host": "${PROXY_HOST_UNSET}", "port": 8080},
+                log=logging.getLogger("t"),
+            )
+
+    def test_unset_password_var_is_rejected(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("PROXY_PASS_UNSET", raising=False)
+        with pytest.raises(ValueError, match="password"):
+            ProxyProviderFactory.build(
+                {
+                    "kind": "static",
+                    "host": "h",
+                    "port": 8080,
+                    "username": "u",
+                    "password": "${PROXY_PASS_UNSET}",
+                },
+                log=logging.getLogger("t"),
+            )
+
+    def test_literal_password_with_dollar_is_kept(self):
+        prov = ProxyProviderFactory.build(
+            {
+                "kind": "static",
+                "host": "h",
+                "port": 8080,
+                "username": "u",
+                "password": "pa$$w0rd",
+            },
+            log=logging.getLogger("t"),
+        )
+        assert prov.acquire("x").password == "pa$$w0rd"

@@ -1,5 +1,6 @@
 """PortalRunner — credential injection (portal_password + LinkedIn SSO)."""
 
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -381,7 +382,8 @@ class TestProxyWiring:
         monkeypatch.setattr(fill, "Agent", agent_ctor)
         return profile_ctor, agent_ctor
 
-    def test_proxy_kwarg_passed_when_provider_set(
+    @pytest.mark.asyncio
+    async def test_proxy_kwarg_passed_when_provider_set(
         self,
         tmp_app_root: Path,
         sample_system: dict,
@@ -397,10 +399,14 @@ class TestProxyWiring:
         monkeypatch: pytest.MonkeyPatch,
     ):
         profile_ctor, _ = self._patch_browser(monkeypatch)
+        acquired_on = []
+
+        def acquire(portal: str) -> Proxy:
+            acquired_on.append(threading.current_thread())
+            return Proxy(host="5.5.5.5", port=8080, username="u", password="p")
+
         provider = MagicMock()
-        provider.acquire.return_value = Proxy(
-            host="5.5.5.5", port=8080, username="u", password="p"
-        )
+        provider.acquire.side_effect = acquire
         runner = _make_runner(
             sample_system,
             opts=run_opts,
@@ -413,8 +419,13 @@ class TestProxyWiring:
             recorder=recorder,
             proxy_provider=provider,
         )
-        runner._build_agent(task="t", credentials={})
+        monkeypatch.setattr(runner, "_run_agent", AsyncMock(return_value="done"))
+
+        await runner.run()
+
         provider.acquire.assert_called_once_with(sample_system["name"])
+        # Off the event loop thread, so a slow provider API cannot stall other portals
+        assert acquired_on and acquired_on[0] is not threading.main_thread()
         kwargs = profile_ctor.call_args.kwargs
         assert kwargs["proxy"] == {
             "server": "http://5.5.5.5:8080",
@@ -453,7 +464,8 @@ class TestProxyWiring:
         runner._build_agent(task="t", credentials={})
         assert "proxy" not in profile_ctor.call_args.kwargs
 
-    def test_provider_failure_propagates(
+    @pytest.mark.asyncio
+    async def test_provider_failure_propagates(
         self,
         tmp_app_root: Path,
         sample_system: dict,
@@ -486,4 +498,4 @@ class TestProxyWiring:
             proxy_provider=provider,
         )
         with pytest.raises(RuntimeError, match="upstream gone"):
-            runner._build_agent(task="t", credentials={})
+            await runner.run()
