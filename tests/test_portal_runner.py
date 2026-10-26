@@ -521,6 +521,39 @@ class TestProxyWiring:
         assert agent_ctor.call_args.kwargs["available_file_paths"] == [str(portal_cv)]
         assert opts.resume_for(system) == str(portal_cv)
 
+    def test_dry_run_refuses_authenticated_proxy(
+        self,
+        tmp_app_root: Path,
+        sample_system: dict,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        self._patch_browser(monkeypatch)
+        runner = _make_runner(
+            sample_system,
+            opts=RunOptions(dry_run=True),
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
+        with pytest.raises(ValueError, match="authenticated proxy"):
+            runner._build_agent(
+                task="t",
+                credentials={},
+                proxy=Proxy(host="h", port=80, username="u", password="p"),
+            )
+
     def test_no_proxy_kwarg_when_provider_absent(
         self,
         tmp_app_root: Path,

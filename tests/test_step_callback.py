@@ -1,5 +1,6 @@
 """StepCallback — log line, screenshot persistence, action-name extraction."""
 
+import asyncio
 import base64
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -7,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from browser_use.browser.views import BrowserStateSummary
 
-from fill import Paths, StepCallback
+from fill import DryRunGuard, Paths, StepCallback
 
 
 def _png_b64() -> str:
@@ -145,3 +146,65 @@ class TestOnStep:
             step_num=1,
         )
         assert mock_app_logger.emit.call_args.kwargs["url"] == "unknown"
+
+
+class TestDryRunGuard:
+    @staticmethod
+    def _attached_guard(mock_app_logger: MagicMock) -> tuple[DryRunGuard, MagicMock]:
+        client = MagicMock()
+        client.send.Fetch.failRequest = AsyncMock()
+        client.send.Fetch.continueRequest = AsyncMock()
+        guard = DryRunGuard("acme", mock_app_logger)
+        guard._client = client
+        return guard, client
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method, url, blocked",
+        [
+            ("POST", "https://boards.greenhouse.io/acme/jobs/1/submit", True),
+            ("PUT", "https://acme.breezy.hr/api/apply", True),
+            ("GET", "https://acme.breezy.hr/p/123", False),
+            ("POST", "https://www.google-analytics.com/collect", False),
+        ],
+    )
+    async def test_fails_only_real_writes(
+        self,
+        method: str,
+        url: str,
+        blocked: bool,
+        tmp_app_root: Path,
+        mock_app_logger: MagicMock,
+    ):
+        guard, client = self._attached_guard(mock_app_logger)
+
+        guard._on_paused({"requestId": "f1", "request": {"method": method, "url": url}})
+        await asyncio.gather(*guard._pending)
+
+        if blocked:
+            client.send.Fetch.failRequest.assert_awaited_once_with(
+                params={"requestId": "f1", "errorReason": "BlockedByClient"},
+                session_id=None,
+            )
+            client.send.Fetch.continueRequest.assert_not_called()
+        else:
+            client.send.Fetch.continueRequest.assert_awaited_once_with(
+                params={"requestId": "f1"}, session_id=None
+            )
+            client.send.Fetch.failRequest.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_attach_failure_reaches_the_agent(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ):
+        # A dry run must never act unguarded: browser_use drops the step's actions
+        # when the callback raises, so the error must not be swallowed.
+        guard = DryRunGuard("acme", mock_app_logger)
+        cb = StepCallback("acme", mock_app_logger, dry_run_guard=guard)
+        cb.agent_ref = MagicMock(browser_session=None)
+        state = MagicMock(spec=BrowserStateSummary)
+        state.url = "https://acme/jobs"
+        state.screenshot = None
+
+        with pytest.raises(RuntimeError, match="dry-run guard"):
+            await cb.on_step(state, MagicMock(action=[]), step_num=1)

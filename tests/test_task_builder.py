@@ -82,6 +82,14 @@ class TestResume:
         task = task_builder.build(sample_system, "K", RunOptions())
         assert "no resume path configured" in task
 
+    def test_dry_run_tells_the_agent_not_to_submit(
+        self, task_builder: TaskBuilder, sample_system: dict
+    ):
+        dry = task_builder.build(sample_system, "K", RunOptions(dry_run=True))
+        real = task_builder.build(sample_system, "K", RunOptions())
+        assert dry.startswith("DRY RUN.") and "do NOT click the final submit" in dry
+        assert "DRY RUN" not in real
+
 
 class TestKnowledgeInjection:
     def test_knowledge_appears(self, task_builder: TaskBuilder, sample_system: dict):

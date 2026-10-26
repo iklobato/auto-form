@@ -342,6 +342,15 @@ DEFAULT_FILTER_NOTES = (
 class TaskBuilder:
     """Renders the task.md prompt template for one portal."""
 
+    # The browser blocks submits in a dry run anyway (DryRunGuard); this keeps the
+    # agent from burning steps retrying a submit that can never go through.
+    DRY_RUN_NOTICE = (
+        "DRY RUN. This is a test run. Fill each application form completely, but do "
+        "NOT click the final submit/apply/send button, and do not create accounts. "
+        "Any submit is blocked by the browser and will fail. When a form is filled, "
+        "call mark_applied for it (nothing is recorded in a dry run) and move on."
+    )
+
     def __init__(
         self,
         template_path: Path = Paths.TASK_TEMPLATE,
@@ -388,6 +397,8 @@ class TaskBuilder:
             "resume_line_inner": effective_resume or "no resume path configured",
         }
         task = self.template_path.read_text().format(**substitutions).strip()
+        if opts.dry_run:
+            task = f"{self.DRY_RUN_NOTICE}\n\n{task}"
         self.log.debug("  task built — %d chars", len(task))
         return task
 
@@ -1465,6 +1476,65 @@ class CDPDebugger:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+# ── Dry-run guard ─────────────────────────────────────────────────────────────
+
+
+class DryRunGuard:
+    """Makes --dry-run unable to submit anything, whatever the agent decides.
+
+    Pauses every request browser-wide through CDP Fetch and fails each POST, PUT
+    or PATCH that is not analytics noise. Fetch is enabled on the browser target,
+    not on a page session: a page-session Fetch let a POST from a cross-origin
+    iframe (how Greenhouse embeds its form) reach the server in a real-Chrome test.
+    """
+
+    BLOCKED_METHODS = NetworkRecorder.INTERESTING_METHODS
+    ERROR_REASON = "BlockedByClient"
+
+    def __init__(self, portal_name: str, app_logger: AppLogger):
+        self.portal_name = portal_name
+        self.app_logger = app_logger
+        self.plog = app_logger.portal(portal_name)
+        self.blocked: list[str] = []
+        self._client = None
+        self._pending: set[asyncio.Task] = set()
+
+    async def attach_if_needed(self, browser_session) -> None:
+        if self._client is not None:
+            return
+        if browser_session is None:
+            raise RuntimeError("dry-run guard: no browser session to protect yet")
+        client = browser_session.cdp_client
+        add_cdp_handler(client, "Fetch.requestPaused", self._on_paused)
+        await client.send.Fetch.enable(
+            params={"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}
+        )
+        self._client = client
+        self.plog.info("DRY RUN: browser-wide submit block is on")
+
+    def _on_paused(self, event: dict, session_id: str | None = None) -> None:
+        request = event.get("request", {}) or {}
+        method, url = request.get("method", ""), request.get("url", "")
+        params: dict[str, object] = {"requestId": event["requestId"]}
+        if method in self.BLOCKED_METHODS and not any(
+            noise in url for noise in NetworkRecorder.NOISE_FRAGMENTS
+        ):
+            params["errorReason"] = self.ERROR_REASON
+            self.blocked.append(url)
+            self.plog.warning("DRY RUN: blocked %s %s", method, url[:100])
+            self.app_logger.emit(
+                "dry_run_blocked", portal=self.portal_name, method=method, url=url
+            )
+            command = self._client.send.Fetch.failRequest
+        else:
+            command = self._client.send.Fetch.continueRequest
+        # Never await a CDP command inside an event handler: its reply arrives on
+        # the same read loop that is running this handler.
+        task = asyncio.create_task(command(params=params, session_id=session_id))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+
 # ── Per-step callback ─────────────────────────────────────────────────────────
 
 
@@ -1483,7 +1553,9 @@ class StepCallback:
         app_logger: AppLogger,
         network_recorder: "NetworkRecorder | None" = None,
         cdp_debugger: "CDPDebugger | None" = None,
+        dry_run_guard: DryRunGuard | None = None,
     ):
+        self.dry_run_guard = dry_run_guard
         self.portal_name = portal_name
         self.app_logger = app_logger
         self.plog = app_logger.portal(portal_name)
@@ -1498,6 +1570,11 @@ class StepCallback:
         # browser_use runs this hook between the LLM reply and executing its actions,
         # and an exception here makes it drop that step's actions. Logging and
         # screenshots must never cost the agent a step.
+        if self.dry_run_guard:
+            # Outside the try on purpose: if the guard cannot attach, dropping the
+            # step's actions is exactly right, a dry run must not act unguarded.
+            session = getattr(self.agent_ref, "browser_session", None)
+            await self.dry_run_guard.attach_if_needed(session)
         try:
             await self._record_step(browser_state, agent_output, step_num)
         except Exception as exc:
@@ -2149,11 +2226,20 @@ class PortalRunner:
         cdp_debugger = CDPDebugger(
             self.name, self.app_logger, noise_fragments=NetworkRecorder.NOISE_FRAGMENTS
         )
+        if self.opts.dry_run and proxy is not None and proxy.username:
+            # browser_use's proxy-auth handler continues every paused request,
+            # which would let submits through the dry-run guard
+            raise ValueError(
+                f"{self.name}: --dry-run cannot run with an authenticated proxy"
+            )
         callback = StepCallback(
             self.name,
             self.app_logger,
             network_recorder=network_recorder,
             cdp_debugger=cdp_debugger,
+            dry_run_guard=(
+                DryRunGuard(self.name, self.app_logger) if self.opts.dry_run else None
+            ),
         )
         # Files the agent is allowed to upload via browser_use's upload_file action.
         # Without this whitelist, EVERY upload attempt fails with
