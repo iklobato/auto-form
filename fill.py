@@ -28,6 +28,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -895,8 +896,10 @@ class NetworkRecorder:
         if len(self.recent) > self.RING_BUFFER_SIZE:
             self.recent.pop(0)
 
-        ts_compact = time.strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        path = self.captures_dir / f"{ts_compact}_{method.lower()}.json"
+        # time.strftime has no %f; the requestId keeps same-microsecond POSTs apart
+        ts_compact = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        stem = f"{ts_compact}_{request_id}" if request_id else ts_compact
+        path = self.captures_dir / f"{stem}_{method.lower()}.json"
         path.write_text(json.dumps(capture, ensure_ascii=False, indent=2))
         # DEBUG only — full record is on disk + attached to mark_applied. CDPDebugger
         # surfaces the response status of these POSTs at WARNING when 4xx/5xx.

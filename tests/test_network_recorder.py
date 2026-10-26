@@ -123,6 +123,19 @@ class TestPersistence:
         assert loaded["url"] == "https://acme/api/apply"
         assert loaded["parsed"] == {"x": 1}
 
+    def test_posts_in_the_same_second_get_their_own_file(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ):
+        rec = NetworkRecorder("acme", mock_app_logger)
+        for rid in ("r1", "r2", "r3"):
+            rec._on_request({"requestId": rid,
+                             "request": {"method": "POST", "url": f"https://acme/{rid}"}})
+
+        files = (Paths.APPLICATIONS / "acme" / "network").glob("*_post.json")
+        assert sorted(json.loads(f.read_text())["url"] for f in files) == [
+            "https://acme/r1", "https://acme/r2", "https://acme/r3",
+        ]
+
     def test_caps_body_size(
         self, tmp_app_root: Path, mock_app_logger: MagicMock
     ):
