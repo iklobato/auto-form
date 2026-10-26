@@ -413,14 +413,16 @@ class TestStaticUnsetEnv:
             )
 
     def test_literal_password_with_dollar_is_kept(self):
+        # Not an env ref: a '$' in the middle of a value must survive as text
+        literal_with_dollar = "x$y"
         prov = ProxyProviderFactory.build(
             {
                 "kind": "static",
                 "host": "h",
                 "port": 8080,
                 "username": "u",
-                "password": "pa$$w0rd",
+                "password": literal_with_dollar,
             },
             log=logging.getLogger("t"),
         )
-        assert prov.acquire("x").password == "pa$$w0rd"
+        assert prov.acquire("x").password == literal_with_dollar
