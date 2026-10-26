@@ -80,6 +80,14 @@ class RunOptions:
     note: str = ""
     resume_path: str = ""
 
+    def resume_for(self, system: dict) -> str:
+        """A portal's own resume_path overrides the run-wide one.
+
+        The prompt and the upload allowlist must agree, or the agent is told to
+        upload a file browser_use then refuses.
+        """
+        return expand_env(system.get("resume_path", "")) or self.resume_path
+
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -354,7 +362,7 @@ class TaskBuilder:
             else ""
         )
         filter_line = self._filter_line(opts)
-        effective_resume = expand_env(system.get("resume_path", "")) or opts.resume_path
+        effective_resume = opts.resume_for(system)
 
         substitutions = {
             "url": primary_url,
@@ -2114,7 +2122,7 @@ class PortalRunner:
         # "File path X is not available." — observed as the root cause of
         # earlier Reveleer/WWR apply failures.
         allowed_uploads: list[str] = []
-        resume_path = self.opts.resume_path or self.system.get("resume_path", "")
+        resume_path = self.opts.resume_for(self.system)
         if resume_path and os.path.exists(resume_path):
             allowed_uploads.append(resume_path)
             self.plog.debug("file uploads allowed: %s", allowed_uploads)

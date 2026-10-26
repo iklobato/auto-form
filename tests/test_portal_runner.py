@@ -433,6 +433,44 @@ class TestProxyWiring:
             "password": "p",
         }
 
+    def test_portal_resume_overrides_run_resume_for_uploads(
+        self,
+        tmp_app_root: Path,
+        tmp_path: Path,
+        sample_system: dict,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _, agent_ctor = self._patch_browser(monkeypatch)
+        run_cv, portal_cv = tmp_path / "run.pdf", tmp_path / "portal.pdf"
+        run_cv.write_bytes(b"%PDF")
+        portal_cv.write_bytes(b"%PDF")
+        system = {**sample_system, "resume_path": str(portal_cv)}
+        opts = RunOptions(resume_path=str(run_cv))
+        runner = _make_runner(
+            system,
+            opts=opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
+
+        runner._build_agent(task="t", credentials={})
+
+        assert agent_ctor.call_args.kwargs["available_file_paths"] == [str(portal_cv)]
+        assert opts.resume_for(system) == str(portal_cv)
+
     def test_no_proxy_kwarg_when_provider_absent(
         self,
         tmp_app_root: Path,
