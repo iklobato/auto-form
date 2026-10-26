@@ -1,6 +1,6 @@
 """Orchestrator — active-portal selection only (full run integration is too heavy)."""
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -89,3 +89,36 @@ class TestProxyProviders:
         first = orch._make_runner(system).proxy_provider.acquire("a").host
         retry = orch._make_runner(system).proxy_provider.acquire("a").host
         assert (first, retry) == ("1.1.1.1", "2.2.2.2")
+
+
+class TestCrashIsolation:
+    @pytest.mark.asyncio
+    async def test_bug_in_one_portal_lets_the_others_finish(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        orch = TestProxyProviders._orchestrator(
+            [
+                {"name": "buggy", "url": "https://a.example.com/"},
+                {"name": "fine", "url": "https://b.example.com/"},
+            ]
+        )
+        runs = {
+            "buggy": AsyncMock(side_effect=TypeError("bad arg")),
+            "fine": AsyncMock(return_value="applied to 1 role"),
+        }
+        monkeypatch.setattr(
+            orch, "_make_runner", lambda system: MagicMock(run=runs[system["name"]])
+        )
+
+        with pytest.raises(TypeError, match="bad arg"):
+            await orch.run()
+
+        runs["fine"].assert_awaited_once()
+        runs["buggy"].assert_awaited_once()  # a bug is not retried
+        run_done = [
+            c.kwargs
+            for c in orch.app_logger.emit.call_args_list
+            if c.args and c.args[0] == "run_done"
+        ]
+        assert run_done[0]["succeeded"] == ["fine"]
+        assert run_done[0]["failed"] == ["buggy"]

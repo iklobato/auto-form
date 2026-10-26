@@ -2221,6 +2221,7 @@ class Orchestrator:
             s["name"]: portal_proxy_provider(s, default_proxy_provider, log=self.log)
             for s in self.active
         }
+        self._crashed: dict[str, Exception] = {}
 
     @staticmethod
     def _select_active(systems: list[dict]) -> list[dict]:
@@ -2252,11 +2253,15 @@ class Orchestrator:
         results = await self._run_batch(self.active, "pass 1")
         results = await self._retry_failures(results)
         self._summarise(results)
+        if self._crashed:
+            raise next(iter(self._crashed.values()))
 
     async def _retry_failures(
         self, results: list[tuple[str, str | Exception]]
     ) -> list[tuple[str, str | Exception]]:
-        failed = {n for n, r in results if isinstance(r, Exception)}
+        failed = {
+            n for n, r in results if isinstance(r, Exception) and n not in self._crashed
+        }
         if not failed:
             return results
         self.log.info("Retrying %d failed portal(s): %s", len(failed), sorted(failed))
@@ -2272,6 +2277,8 @@ class Orchestrator:
         self.log.info("━━━━━━━━━━━━━━━━━━━━ all portals done ━━━━━━━━━━━━━━━━━━━━")
         self.log.info("  succeeded: %d — %s", len(ok), ok)
         self.log.info("  failed:    %d — %s", len(failed), failed)
+        if self._crashed:
+            self.log.info("  crashed:   %s (bug, not retried)", sorted(self._crashed))
         if self.skipped_count:
             self.log.info("  skipped:   %d (URL not configured)", self.skipped_count)
         self.app_logger.emit(
@@ -2289,8 +2296,9 @@ class Orchestrator:
         # - browser_use's own runtime errors (wrapped in their own classes)
         # - Browser/CDP connection issues (TimeoutError, OSError, asyncio.CancelledError)
         # - Network errors from the LLM (httpx.HTTPError)
-        # Real bugs (TypeError/AttributeError/KeyError from our code) are NOT caught —
-        # let them crash so they don't get hidden behind a "portal failed" log line.
+        # Real bugs (TypeError/AttributeError/KeyError from our code) are not retried
+        # and still crash the run, but only after the other portals finish and the
+        # summary is printed, so one bug does not cancel browsers mid-application.
         recoverable = (TimeoutError, OSError, RuntimeError, httpx.HTTPError)
 
         async def run_one(system: dict) -> tuple[str, str | Exception]:
@@ -2313,6 +2321,22 @@ class Orchestrator:
                         error=str(exc),
                     )
                     return (name, exc)
+                except Exception as exc:
+                    self.log.critical(
+                        "[%s] crashed (bug): %s: %s",
+                        name,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=True,
+                    )
+                    self.app_logger.emit(
+                        "portal_crash",
+                        portal=name,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    self._crashed[name] = exc
+                    return (name, exc)
 
         tasks = [asyncio.create_task(run_one(s)) for s in batch]
         for coro in asyncio.as_completed(tasks):
@@ -2322,7 +2346,7 @@ class Orchestrator:
             self.log.info(
                 "━━ [%d/%d] %s %s  (%s)",
                 completed,
-                len(self.active),
+                len(batch),
                 status,
                 name,
                 label,
