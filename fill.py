@@ -1121,6 +1121,8 @@ class NetworkRecorder:
         "fullstory",
         "hotjar",
         "posthog.com",
+        "snowplowanalytics",
+        "bzr.openai.com",
         # Error / RUM
         "datadoghq",
         "newrelic",
@@ -1129,6 +1131,8 @@ class NetworkRecorder:
         # Social / ad pixels
         "facebook.com/tr",
         "fbcdn.net",
+        "analytics.twitter.com",
+        "t.co/i/adsctp",
         "px.ads.linkedin.com",
         "analytics.tiktok.com",
         "analytics-ipv6.tiktokw",

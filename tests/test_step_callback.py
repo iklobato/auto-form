@@ -166,6 +166,11 @@ class TestDryRunGuard:
             ("PUT", "https://acme.breezy.hr/api/apply", True),
             ("GET", "https://acme.breezy.hr/p/123", False),
             ("POST", "https://www.google-analytics.com/collect", False),
+            (
+                "POST",
+                "https://c.spl.greenhouse.io/com.snowplowanalytics.snowplow/tp2",
+                False,
+            ),
         ],
     )
     async def test_fails_only_real_writes(
