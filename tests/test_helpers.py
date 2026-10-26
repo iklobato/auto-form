@@ -4,7 +4,7 @@ import logging
 
 import pytest
 
-from fill import _SuppressFilter, expand_env
+from fill import CLI, _SuppressFilter, expand_env
 
 
 class TestExpandEnv:
@@ -56,3 +56,13 @@ class TestSuppressFilter:
             "x", logging.INFO, "p", 0, "got %s while running", ("ERROR_X",), None
         )
         assert filt.filter(record) is False
+
+
+class TestWorkersArg:
+    @pytest.mark.parametrize("value", ["0", "-2"])
+    def test_rejects_less_than_one(self, value: str):
+        with pytest.raises(SystemExit):
+            CLI._build_parser().parse_args(["--all", "--workers", value])
+
+    def test_accepts_one(self):
+        assert CLI._build_parser().parse_args(["--all", "--workers", "1"]).workers == 1

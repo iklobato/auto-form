@@ -2441,6 +2441,14 @@ class SummaryReporter:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
+def positive_int(value: str) -> int:
+    """argparse type: --workers 0 would make Semaphore(0) and hang the run forever."""
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {number}")
+    return number
+
+
 class CLI:
     """Argparse-based command-line entrypoint and composition root."""
 
@@ -2472,7 +2480,7 @@ class CLI:
         p.add_argument("--note", default="", help="Extra context for this run")
         p.add_argument(
             "--workers",
-            type=int,
+            type=positive_int,
             default=5,
             help="Max parallel browser sessions when using --all (default: 5)",
         )
