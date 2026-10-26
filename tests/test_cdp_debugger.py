@@ -2,11 +2,11 @@
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
-from fill import CDPDebugger, Paths
+from fill import CDPDebugger, NetworkRecorder, Paths, add_cdp_handler
 
 
 def _events_lines(portal: str) -> list[dict]:
@@ -172,69 +172,83 @@ class TestExceptionAndDialog:
 class TestAttach:
     @pytest.mark.asyncio
     async def test_subscribes_to_all_event_streams(
-        self, tmp_app_root: Path, mock_app_logger: MagicMock
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, cdp_browser: MagicMock
     ):
         d = CDPDebugger("acme", mock_app_logger)
-        client = MagicMock()
-        client.send = MagicMock()
-        client.send.Network = MagicMock(); client.send.Network.enable = AsyncMock()
-        client.send.Page = MagicMock(); client.send.Page.enable = AsyncMock()
-        client.send.Runtime = MagicMock(); client.send.Runtime.enable = AsyncMock()
-        client.send.Target = MagicMock()
-        client.send.Target.setDiscoverTargets = AsyncMock()
-        client.register = MagicMock()
-        for ns in ("Network", "Page", "Runtime", "Target"):
-            setattr(client.register, ns, MagicMock())
-        client.register.Network.requestWillBeSent = MagicMock()
-        client.register.Network.responseReceived = MagicMock()
-        client.register.Network.loadingFailed = MagicMock()
-        client.register.Page.frameNavigated = MagicMock()
-        client.register.Page.javascriptDialogOpening = MagicMock()
-        client.register.Target.targetCreated = MagicMock()
-        client.register.Runtime.exceptionThrown = MagicMock()
+        client = (await cdp_browser.get_or_create_cdp_session()).cdp_client
 
-        session = MagicMock()
-        session.session_id = "s1"; session.cdp_client = client
-        browser = MagicMock()
-        browser.get_or_create_cdp_session = AsyncMock(return_value=session)
+        await d.attach_if_needed(cdp_browser)
 
-        await d.attach_if_needed(browser)
-
-        # Each enable + every register subscription must fire exactly once
         client.send.Network.enable.assert_awaited_once()
         client.send.Page.enable.assert_awaited_once()
         client.send.Runtime.enable.assert_awaited_once()
-        client.register.Network.responseReceived.assert_called_once()
-        client.register.Page.frameNavigated.assert_called_once()
-        client.register.Target.targetCreated.assert_called_once()
-        client.register.Runtime.exceptionThrown.assert_called_once()
+        assert set(client._event_registry.get_registered_methods()) == {
+            "Network.requestWillBeSent", "Network.responseReceived",
+            "Network.loadingFailed", "Page.frameNavigated", "Target.targetCreated",
+            "Runtime.exceptionThrown", "Page.javascriptDialogOpening",
+        }
 
     @pytest.mark.asyncio
     async def test_attach_is_idempotent_per_session(
-        self, tmp_app_root: Path, mock_app_logger: MagicMock
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, cdp_browser: MagicMock
     ):
         d = CDPDebugger("acme", mock_app_logger)
-        client = MagicMock()
-        for cmd in ("Network", "Page", "Runtime", "Target"):
-            setattr(client.send, cmd, MagicMock())
-        client.send.Network.enable = AsyncMock()
-        client.send.Page.enable = AsyncMock()
-        client.send.Runtime.enable = AsyncMock()
-        client.send.Target.setDiscoverTargets = AsyncMock()
-        for ns in ("Network", "Page", "Runtime", "Target"):
-            setattr(client.register, ns, MagicMock())
-        for evt in ("requestWillBeSent", "responseReceived", "loadingFailed"):
-            setattr(client.register.Network, evt, MagicMock())
-        client.register.Page.frameNavigated = MagicMock()
-        client.register.Page.javascriptDialogOpening = MagicMock()
-        client.register.Target.targetCreated = MagicMock()
-        client.register.Runtime.exceptionThrown = MagicMock()
+        client = (await cdp_browser.get_or_create_cdp_session()).cdp_client
 
-        session = MagicMock(); session.session_id = "s1"; session.cdp_client = client
-        browser = MagicMock()
-        browser.get_or_create_cdp_session = AsyncMock(return_value=session)
+        await d.attach_if_needed(cdp_browser)
+        await d.attach_if_needed(cdp_browser)
 
-        await d.attach_if_needed(browser)
-        await d.attach_if_needed(browser)
-        # Only one call regardless of how many times attach is invoked
         assert client.send.Network.enable.await_count == 1
+
+
+class TestHandlerCoexistence:
+    """cdp_use keeps one handler per event: attaching must not evict anyone."""
+
+    @pytest.mark.asyncio
+    async def test_keeps_browser_use_dialog_handler(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, cdp_browser: MagicMock
+    ):
+        client = (await cdp_browser.get_or_create_cdp_session()).cdp_client
+        accepted = []
+        client._event_registry.register(
+            "Page.javascriptDialogOpening", lambda event, sid=None: accepted.append(event)
+        )
+
+        await CDPDebugger("acme", mock_app_logger).attach_if_needed(cdp_browser)
+        await client._event_registry.handle_event(
+            "Page.javascriptDialogOpening", {"type": "confirm", "message": "Submit?"}
+        )
+
+        assert accepted == [{"type": "confirm", "message": "Submit?"}]
+        assert _events_lines("acme")[-1]["kind"] == "js_dialog"
+
+    @pytest.mark.asyncio
+    async def test_network_recorder_still_captures_post_after_debugger_attaches(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, cdp_browser: MagicMock
+    ):
+        client = (await cdp_browser.get_or_create_cdp_session()).cdp_client
+        rec = NetworkRecorder("acme", mock_app_logger)
+
+        await rec.attach_if_needed(cdp_browser)
+        await CDPDebugger("acme", mock_app_logger).attach_if_needed(cdp_browser)
+        await client._event_registry.handle_event("Network.requestWillBeSent", {
+            "requestId": "r1", "request": {"method": "POST", "url": "https://acme/apply"},
+        })
+
+        assert [c["url"] for c in rec.recent] == ["https://acme/apply"]
+
+    @pytest.mark.asyncio
+    async def test_failing_subscriber_does_not_block_the_next(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, cdp_browser: MagicMock
+    ):
+        client = (await cdp_browser.get_or_create_cdp_session()).cdp_client
+        seen = []
+
+        def broken(event, sid=None):
+            raise KeyError("boom")
+
+        add_cdp_handler(client, "Page.frameNavigated", broken)
+        add_cdp_handler(client, "Page.frameNavigated", lambda e, sid=None: seen.append(e))
+        await client._event_registry.handle_event("Page.frameNavigated", {"frame": {}})
+
+        assert seen == [{"frame": {}}]

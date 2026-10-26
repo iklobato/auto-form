@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -162,47 +162,33 @@ class TestRingBuffer:
 class TestAttach:
     @pytest.mark.asyncio
     async def test_attach_subscribes_to_network_event(
-        self, tmp_app_root: Path, mock_app_logger: MagicMock
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, cdp_browser: MagicMock
     ):
         rec = NetworkRecorder("acme", mock_app_logger)
-        # Build a mock browser_session whose CDP API exposes Network.enable + register
-        session = MagicMock()
-        session.session_id = "sess-123"
-        session.cdp_client = MagicMock()
-        session.cdp_client.send = MagicMock()
-        session.cdp_client.send.Network = MagicMock()
-        session.cdp_client.send.Network.enable = AsyncMock()
-        session.cdp_client.register = MagicMock()
-        session.cdp_client.register.Network = MagicMock()
-        session.cdp_client.register.Network.requestWillBeSent = MagicMock()
-        browser = MagicMock()
-        browser.get_or_create_cdp_session = AsyncMock(return_value=session)
+        client = (await cdp_browser.get_or_create_cdp_session()).cdp_client
 
-        await rec.attach_if_needed(browser)
+        await rec.attach_if_needed(cdp_browser)
+        await client._event_registry.handle_event("Network.requestWillBeSent", {
+            "requestId": "r1", "request": {"method": "POST", "url": "https://acme/apply"},
+        })
 
-        session.cdp_client.send.Network.enable.assert_awaited_once_with(session_id="sess-123")
-        session.cdp_client.register.Network.requestWillBeSent.assert_called_once()
+        client.send.Network.enable.assert_awaited_once_with(session_id="s1")
+        assert [c["url"] for c in rec.recent] == ["https://acme/apply"]
 
     @pytest.mark.asyncio
     async def test_attach_is_idempotent_per_session(
-        self, tmp_app_root: Path, mock_app_logger: MagicMock
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, cdp_browser: MagicMock
     ):
         rec = NetworkRecorder("acme", mock_app_logger)
-        session = MagicMock()
-        session.session_id = "sess-abc"
-        session.cdp_client = MagicMock()
-        session.cdp_client.send.Network.enable = AsyncMock()
-        session.cdp_client.register.Network.requestWillBeSent = MagicMock()
-        browser = MagicMock()
-        browser.get_or_create_cdp_session = AsyncMock(return_value=session)
+        client = (await cdp_browser.get_or_create_cdp_session()).cdp_client
 
-        await rec.attach_if_needed(browser)
-        await rec.attach_if_needed(browser)
-        await rec.attach_if_needed(browser)
+        for _ in range(3):
+            await rec.attach_if_needed(cdp_browser)
 
-        # Subscribe should only happen the first time
-        assert session.cdp_client.send.Network.enable.await_count == 1
-        assert session.cdp_client.register.Network.requestWillBeSent.call_count == 1
+        assert client.send.Network.enable.await_count == 1
+        assert client._event_registry._handlers["Network.requestWillBeSent"].callbacks == [
+            rec._on_request
+        ]
 
     @pytest.mark.asyncio
     async def test_attach_with_none_session_is_noop(

@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import base64
 import fcntl
+import inspect
 import json
 import logging
 import logging.handlers
@@ -772,6 +773,33 @@ class ApplicationRecorder:
 
 # ── Network capture ───────────────────────────────────────────────────────────
 
+def add_cdp_handler(cdp_client, method: str, callback) -> None:
+    """Subscribe `callback` to a CDP event without evicting other subscribers.
+
+    cdp_use keeps exactly one handler per event name, shared by every session on
+    the client, so a plain `register.X.y(cb)` silently replaces browser_use's own
+    watchdogs (dialog auto-accept, downloads) and our other recorders.
+    """
+    registry = cdp_client._event_registry
+    existing = registry._handlers.get(method)
+    callbacks = list(getattr(existing, "callbacks", [existing] if existing else []))
+    if callback in callbacks:
+        return
+    callbacks.append(callback)
+
+    async def fan_out(event, session_id=None):
+        for cb in callbacks:
+            try:
+                result = cb(event, session_id)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # one bad subscriber must not starve the others
+                logging.getLogger("auto-form").exception("CDP handler failed for %s", method)
+
+    fan_out.callbacks = callbacks
+    registry.register(method, fan_out)
+
+
 class NetworkRecorder:
     """Captures POST/PUT/PATCH HTTP requests via CDP for audit purposes.
 
@@ -831,7 +859,7 @@ class NetworkRecorder:
         if sid in self._attached_session_ids:
             return
         await cdp_session.cdp_client.send.Network.enable(session_id=sid)
-        cdp_session.cdp_client.register.Network.requestWillBeSent(self._on_request)
+        add_cdp_handler(cdp_session.cdp_client, "Network.requestWillBeSent", self._on_request)
         self._attached_session_ids.add(sid)
         self.plog.debug("NetworkRecorder attached to CDP session %s", sid[:12])
 
@@ -946,13 +974,16 @@ class CDPDebugger:
             params={"discover": True}, session_id=sid,
         )
 
-        client.register.Network.requestWillBeSent(self._on_request_index)
-        client.register.Network.responseReceived(self._on_response)
-        client.register.Network.loadingFailed(self._on_loading_failed)
-        client.register.Page.frameNavigated(self._on_navigated)
-        client.register.Target.targetCreated(self._on_target_created)
-        client.register.Runtime.exceptionThrown(self._on_exception)
-        client.register.Page.javascriptDialogOpening(self._on_dialog)
+        for method, callback in (
+            ("Network.requestWillBeSent", self._on_request_index),
+            ("Network.responseReceived", self._on_response),
+            ("Network.loadingFailed", self._on_loading_failed),
+            ("Page.frameNavigated", self._on_navigated),
+            ("Target.targetCreated", self._on_target_created),
+            ("Runtime.exceptionThrown", self._on_exception),
+            ("Page.javascriptDialogOpening", self._on_dialog),
+        ):
+            add_cdp_handler(client, method, callback)
 
         self._attached_session_ids.add(sid)
         self.plog.debug("CDPDebugger attached to session %s", sid[:12])

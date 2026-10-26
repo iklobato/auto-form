@@ -2,10 +2,11 @@
 
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
+from cdp_use.cdp.registry import EventRegistry
 
 import fill
 from fill import (
@@ -193,3 +194,18 @@ def mock_agent(fake_registry: FakeRegistry) -> MagicMock:
     agent.tools = MagicMock()
     agent.tools.registry = fake_registry
     return agent
+
+
+@pytest.fixture
+def cdp_browser() -> MagicMock:
+    """browser_session stand-in whose CDP client uses cdp_use's real registry,
+    which keeps a single handler per event name across all sessions."""
+    client = MagicMock()
+    client._event_registry = EventRegistry()
+    for domain in ("Network", "Page", "Runtime"):
+        getattr(client.send, domain).enable = AsyncMock()
+    client.send.Target.setDiscoverTargets = AsyncMock()
+    session = MagicMock(session_id="s1", cdp_client=client)
+    browser = MagicMock()
+    browser.get_or_create_cdp_session = AsyncMock(return_value=session)
+    return browser
