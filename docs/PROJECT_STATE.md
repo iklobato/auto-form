@@ -178,6 +178,13 @@ by these runs.
 | 2026-10-26 | Supabase "SDK Engineer - Python" (Ashby, temp YAML) | headless | form filled; 24 `ApiSetFormValue` blocked; agent did not click submit; looped `mark_applied` 7+ times (fixed) |
 | 2026-10-26 | same | headless | 15 steps, `mark_applied` twice then `done`; 17 `ApiSetFormValue` and 1 `ApiCreateFileUploadHandle` blocked; agent reported the upload as an error |
 | 2026-10-26 | weworkremotely, `--model google/gemini-2.5-flash` (run `20261026_004642`) | visible | 23 logged steps, 5 scroll-only (flash-lite: 21 / 14). Accepted the Proxify role that flash-lite rejected on timezone, followed it to `talent.proxify.io/apply`, filled it and uploaded the resume; its "Next" button never enabled, so no POST went to Proxify. Blocked: WWR `job_apply_count` and a Google conversion ping |
+| 2026-10-26 | weworkremotely, cost run, flash-lite (run `20261026_005544`) | visible | **US$ 0.0117** (key `usage` 461.284374135 to 461.296102585), 9 steps, 5 scroll-only, 244 s, no form |
+| 2026-10-26 | weworkremotely, cost run, flash (run `20261026_010014`) | visible | **US$ 0.0800** (461.298752735 to 461.378750505), 27 steps, 6 scroll-only, 178 s, no form |
+
+Cost runs are read from `GET https://openrouter.ai/api/v1/key` (`data.usage`, USD) before and
+after one run; `/api/v1/activity` needs a management key. Usage also rose US$ 0.0027
+between the two runs with nothing of ours running, so each number is good to about
+US$ 0.003. One run per model is a small sample.
 
 Still never seen live: the guard blocking a final submit click. The agent obeys the
 dry-run notice and never clicks it.
@@ -210,11 +217,11 @@ dry-run notice and never clicks it.
 
 Each item says when it is done.
 
-1. **Decide the default model.** Measured on WWR (section 7): `google/gemini-2.5-flash`
-   cut scroll-only steps from 14 to 5 and reached a real form, where flash-lite did not.
-   It also judged the timezone rule differently. Cost per run was not measured. Done when
-   the OpenRouter cost of one run per model is recorded and `LLMFactory.DEFAULT_MODEL` is
-   either changed or kept on purpose.
+1. **Default model: decided 2026-10-26, kept `google/gemini-2.5-flash-lite`.** On WWR,
+   `google/gemini-2.5-flash` cost 6.8 times more per run (US$ 0.0800 vs 0.0117; about
+   2.3 times per step), and its better behavior (fewer scroll-only steps, reached a form)
+   showed in 1 of 2 runs. Use `--model google/gemini-2.5-flash` for a portal where
+   flash-lite stalls. Reopen if more runs show flash-lite missing real matches.
 2. **Dry-run upload is reported as an error.** The guard correctly blocks
    `ApiCreateFileUploadHandle`, and the agent then says the upload failed. Decide whether
    the notice should tell the agent uploads are blocked in a dry run. Done when a dry run
