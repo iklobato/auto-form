@@ -1535,9 +1535,7 @@ class PortalRunner:
             creds = self.cred_resolver.resolve(self.system["credentials"])
 
         portal_pwd_source = "PORTAL_ACCOUNT_PASSWORD env" if os.getenv(self.PORTAL_PWD_ENV) else "generated"
-        creds["<portal_password>"] = (
-            os.getenv(self.PORTAL_PWD_ENV) or secrets.token_urlsafe(12)
-        )
+        creds["<portal_password>"] = self._portal_password()
         self.plog.debug("portal password: source=%s", portal_pwd_source)
 
         linkedin_user = os.getenv(self.LINKEDIN_USER_ENV, "")
@@ -1552,6 +1550,25 @@ class PortalRunner:
         # Names only, never values — sensitive_data placeholder names are safe to log
         self.plog.debug("sensitive_data placeholders: %s", sorted(creds.keys()))
         return creds
+
+    def _portal_password(self) -> str:
+        """Password for accounts the agent creates on this portal.
+
+        Without the env var it is generated once and kept on disk before the agent
+        sees it, so every run and retry uses the same one and an account created
+        without a save_credentials call is not lost.
+        """
+        if from_env := os.getenv(self.PORTAL_PWD_ENV):
+            return from_env
+        path = Paths.PROFILES / self.name / "portal_password"
+        if path.exists():
+            return path.read_text().strip()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        password = secrets.token_urlsafe(12)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(password)
+        return password
 
     def _clean_stale_locks(self, profile_dir: Path) -> None:
         """Remove Chrome SingletonLock/Cookie/Socket symlinks left by a killed run."""

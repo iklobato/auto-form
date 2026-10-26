@@ -62,8 +62,30 @@ class TestBuildCredentials:
         creds = runner._build_credentials()
         assert creds["<portal_password>"] == "fixed-pw"
 
+    def test_generated_password_is_reused_across_runs(
+        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
+        yaml_store: YamlStore, mock_app_logger: MagicMock, task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+    ):
+        def new_runner():
+            return _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
+                                mock_app_logger=mock_app_logger, task_builder=task_builder,
+                                cred_resolver=cred_resolver, applied=applied_tracker,
+                                attempted=attempted_tracker, recorder=recorder)
+
+        first = new_runner()._build_credentials()["<portal_password>"]
+        retry = new_runner()._build_credentials()["<portal_password>"]
+
+        assert first == retry
+        stored = fill.Paths.PROFILES / sample_system["name"] / "portal_password"
+        assert stored.read_text() == first
+        assert stored.stat().st_mode & 0o777 == 0o600
+
     def test_generates_random_when_no_env(
-        self, sample_system: dict, run_opts: RunOptions, yaml_store: YamlStore,
+        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
+        yaml_store: YamlStore,
         mock_app_logger: MagicMock, task_builder: TaskBuilder,
         cred_resolver: CredentialsResolver,
         applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
