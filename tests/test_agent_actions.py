@@ -44,6 +44,44 @@ class TestRegisterAll:
         assert "save_credentials" in fake_registry.actions
 
 
+class TestCheckAppliedUrlVariants:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", [
+        "https://jobs.lever.co/acme/123/",
+        "http://www.Jobs.Lever.co/acme/123",
+        "https://jobs.lever.co/acme/123?utm_source=linkedin&lever-source=LinkedIn",
+        "https://jobs.lever.co/acme/123#apply",
+    ])
+    async def test_same_job_with_tracking_or_formatting_is_already_applied(
+        self, variant: str, mock_agent: MagicMock, fake_registry,
+        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder, mock_app_logger: MagicMock,
+    ):
+        await applied_tracker.append({"job_url": "https://jobs.lever.co/acme/123"})
+        AgentActions(mock_agent, "acme", dry_run=False, yaml_store=None,
+                     applied=applied_tracker, attempted=attempted_tracker,
+                     recorder=recorder, app_logger=mock_app_logger).register_all()
+
+        result = await fake_registry.actions["check_applied"](variant)
+        assert result.extracted_content == "already_applied"
+
+    @pytest.mark.asyncio
+    async def test_different_job_id_param_is_not_applied(
+        self, mock_agent: MagicMock, fake_registry,
+        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder, mock_app_logger: MagicMock,
+    ):
+        await applied_tracker.append({"job_url": "https://acme.com/careers?gh_jid=111"})
+        AgentActions(mock_agent, "acme", dry_run=False, yaml_store=None,
+                     applied=applied_tracker, attempted=attempted_tracker,
+                     recorder=recorder, app_logger=mock_app_logger).register_all()
+
+        result = await fake_registry.actions["check_applied"](
+            "https://acme.com/careers?gh_jid=222&utm_medium=x"
+        )
+        assert result.extracted_content == "not_applied"
+
+
 class TestCheckApplied:
     @pytest.mark.asyncio
     async def test_already_applied_short_circuits(

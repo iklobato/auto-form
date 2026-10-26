@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 import yaml
@@ -697,6 +698,29 @@ class ProxyProviderFactory:
 
 # ── JSONL trackers ────────────────────────────────────────────────────────────
 
+TRACKING_QUERY_PARAMS = frozenset({
+    "gh_src", "lever-source", "lever-origin", "ref", "referrer", "source", "src",
+    "fbclid", "gclid", "mc_cid", "mc_eid", "trk", "trackingid", "refid", "_ga",
+})
+
+
+def job_url_key(url: str) -> str:
+    """Key for "is this the same job" checks.
+
+    Ignores scheme, host case, a leading www., a trailing slash, the fragment and
+    tracking params, so a listing reached through a utm link still matches.
+    Job-id params (Greenhouse gh_jid, Workday ?jobId=) are kept.
+    """
+    parts = urlsplit(url.strip())
+    host = parts.netloc.lower().removeprefix("www.")
+    query = urlencode([
+        (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k.lower() not in TRACKING_QUERY_PARAMS and not k.lower().startswith("utm_")
+    ])
+    key = f"{host}{parts.path.rstrip('/')}"
+    return f"{key}?{query}" if query else key
+
+
 class JsonlTracker:
     """Thread-safe append-only JSONL store with shared/exclusive file locking."""
 
@@ -736,6 +760,9 @@ class JsonlTracker:
         self._log.debug("JsonlTracker.%s: loaded %d keys (skipped %d malformed, %d missing key)",
                         self.path.name, len(out), skipped_malformed, skipped_missing_key)
         return out
+
+    def has_job(self, job_url: str) -> bool:
+        return job_url_key(job_url) in {job_url_key(u) for u in self.load_keys()}
 
     async def append(self, record: dict) -> None:
         line = json.dumps(record, ensure_ascii=False) + "\n"
@@ -1310,8 +1337,9 @@ class AgentActions:
             # Always count the visit FIRST — applies even if the URL is already in
             # applied.jsonl or attempted.jsonl. This catches the sub-loop where the
             # agent re-checks the same URL repeatedly and ignores the skip signal.
-            session_visits[job_url] = session_visits.get(job_url, 0) + 1
-            visits = session_visits[job_url]
+            visit_key = job_url_key(job_url)
+            session_visits[visit_key] = session_visits.get(visit_key, 0) + 1
+            visits = session_visits[visit_key]
 
             if visits > visit_limit:
                 plog.warning("HARD-SKIP (checked %d× this session): %s", visits, job_url)
@@ -1326,12 +1354,12 @@ class AgentActions:
                     )
                 )
 
-            if job_url in applied.load_keys():
+            if applied.has_job(job_url):
                 plog.info("SKIP (already applied) [visit %d]: %s", visits, job_url)
                 app_logger.emit("already_applied", portal=portal, url=job_url, visits=visits)
                 return ActionResult(extracted_content="already_applied")
 
-            if job_url in attempted.load_keys():
+            if attempted.has_job(job_url):
                 plog.info("SKIP (already attempted, did not complete) [visit %d]: %s",
                           visits, job_url)
                 app_logger.emit("already_attempted", portal=portal, url=job_url, visits=visits)
