@@ -1178,6 +1178,18 @@ class StepCallback:
         self.agent_ref = None  # set by PortalRunner after agent build
 
     async def on_step(self, browser_state, agent_output, step_num: int) -> None:
+        # browser_use runs this hook between the LLM reply and executing its actions,
+        # and an exception here makes it drop that step's actions. Logging and
+        # screenshots must never cost the agent a step.
+        try:
+            await self._record_step(browser_state, agent_output, step_num)
+        except Exception as exc:
+            self.plog.warning("step %04d: step callback failed, agent continues: %s: %s",
+                              step_num, type(exc).__name__, exc, exc_info=True)
+            self.app_logger.emit("step_callback_error", portal=self.portal_name,
+                                 step=step_num, error_type=type(exc).__name__, error=str(exc))
+
+    async def _record_step(self, browser_state, agent_output, step_num: int) -> None:
         # Lazy CDP attach — runs once on first step when browser_session exists
         session = getattr(self.agent_ref, "browser_session", None) if self.agent_ref else None
         if self.network_recorder:

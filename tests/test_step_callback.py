@@ -2,7 +2,7 @@
 
 import base64
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from browser_use.browser.views import BrowserStateSummary
@@ -39,6 +39,29 @@ class TestActionNameExtraction:
     def test_handles_none_action_attr(self):
         out = MagicMock(action=None)
         assert StepCallback._extract_action_names(out) == []
+
+
+class TestOnStepFailureIsolation:
+    @pytest.mark.asyncio
+    async def test_cdp_attach_failure_does_not_reach_the_agent(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ):
+        recorder = MagicMock()
+        recorder.attach_if_needed = AsyncMock(
+            side_effect=ValueError("No valid agent focus available")
+        )
+        cb = StepCallback("acme", mock_app_logger, network_recorder=recorder)
+        cb.agent_ref = MagicMock()
+        state = MagicMock(spec=BrowserStateSummary)
+        state.url = "https://acme/jobs"
+        state.screenshot = None
+
+        await cb.on_step(state, MagicMock(action=[]), step_num=3)
+
+        errors = [c.kwargs for c in mock_app_logger.emit.call_args_list
+                  if c.args and c.args[0] == "step_callback_error"]
+        assert errors == [{"portal": "acme", "step": 3, "error_type": "ValueError",
+                           "error": "No valid agent focus available"}]
 
 
 class TestOnStep:
