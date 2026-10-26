@@ -1888,7 +1888,15 @@ class AgentActions:
         ) -> ActionResult:
             if dry_run:
                 plog.info("DRY RUN — would mark applied: %s", job_title)
-                return ActionResult(extracted_content="dry_run — not recorded")
+                # "not recorded" read as a failure: the agent called this 7 times in
+                # a row on one job in a live dry run. Say the job is finished.
+                return ActionResult(
+                    extracted_content=(
+                        f"Done: {job_title} counts as handled for this dry run. "
+                        "Do not call mark_applied again for it. Move on to the next "
+                        "listing, or call done if there is none."
+                    )
+                )
             record = {
                 "portal": portal,
                 "job_url": job_url,
