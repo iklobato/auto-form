@@ -26,6 +26,7 @@ import logging
 import logging.handlers
 import os
 import secrets
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -178,6 +179,14 @@ class YamlStore:
 
     async def update_credentials(self, system_name: str, username: str, password: str) -> None:
         async with self._lock:
+            await asyncio.to_thread(self._update_credentials, system_name, username, password)
+
+    def _update_credentials(self, system_name: str, username: str, password: str) -> None:
+        # The asyncio lock only covers this process; flock also serializes
+        # separate `fill.py --system X` runs sharing the same yaml.
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
             raw = self.load()
             key = "systems" if "systems" in raw else "sources"
             for system in raw.get(key) or []:
@@ -188,10 +197,25 @@ class YamlStore:
                     creds.pop("username_env", None)
                     creds.pop("password_env", None)
                     break
-            self.path.write_text(yaml.dump(
+            self._replace(yaml.dump(
                 raw, allow_unicode=True, sort_keys=False,
                 default_flow_style=False, width=120,
             ))
+
+    def _replace(self, text: str) -> None:
+        """Write to a sibling temp file, then rename, so a crash never truncates the yaml."""
+        mode = self.path.stat().st_mode & 0o777
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.name}.")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, mode)
+            os.replace(tmp, self.path)
+        except BaseException:
+            os.unlink(tmp)
+            raise
 
 
 # ── Knowledge base ────────────────────────────────────────────────────────────

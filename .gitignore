@@ -17,6 +17,8 @@ systems.yaml
 systems-all.yaml
 *.yaml.bkp
 *.yaml.bak
+*.yaml.lock
+.*.yaml.*
 
 # --- run artifacts ---
 applied.jsonl
