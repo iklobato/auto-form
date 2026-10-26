@@ -7,7 +7,9 @@ from fill import KnowledgeBase, Paths
 
 
 class TestKnowledgeBaseLoad:
-    def test_loads_alphabetically(self, tmp_app_root: Path, silent_logger: logging.Logger):
+    def test_loads_alphabetically(
+        self, tmp_app_root: Path, silent_logger: logging.Logger
+    ):
         (Paths.KNOWLEDGE / "02_b.md").write_text("BBB")
         (Paths.KNOWLEDGE / "01_a.md").write_text("AAA")
         kb = KnowledgeBase(dir_path=Paths.KNOWLEDGE, log=silent_logger)
@@ -22,13 +24,17 @@ class TestKnowledgeBaseLoad:
         assert "README CONTENT" not in text
         assert "REAL CONTENT" in text
 
-    def test_separator_between_files(self, tmp_app_root: Path, silent_logger: logging.Logger):
+    def test_separator_between_files(
+        self, tmp_app_root: Path, silent_logger: logging.Logger
+    ):
         (Paths.KNOWLEDGE / "01.md").write_text("A")
         (Paths.KNOWLEDGE / "02.md").write_text("B")
         kb = KnowledgeBase(dir_path=Paths.KNOWLEDGE, log=silent_logger)
         assert "\n\n---\n\n" in kb.load()
 
-    def test_caches_after_first_load(self, tmp_app_root: Path, silent_logger: logging.Logger):
+    def test_caches_after_first_load(
+        self, tmp_app_root: Path, silent_logger: logging.Logger
+    ):
         f = Paths.KNOWLEDGE / "01.md"
         f.write_text("first")
         kb = KnowledgeBase(dir_path=Paths.KNOWLEDGE, log=silent_logger)

@@ -33,24 +33,26 @@ class TestExpandEnv:
 class TestSuppressFilter:
     def test_drops_record_matching_fragment(self):
         filt = _SuppressFilter("noise", "junk")
-        record = logging.LogRecord("x", logging.INFO, "p", 0,
-                                   "this is noise here", None, None)
+        record = logging.LogRecord(
+            "x", logging.INFO, "p", 0, "this is noise here", None, None
+        )
         assert filt.filter(record) is False
 
     def test_keeps_record_with_no_fragment_match(self):
         filt = _SuppressFilter("noise")
-        record = logging.LogRecord("x", logging.INFO, "p", 0,
-                                   "useful message", None, None)
+        record = logging.LogRecord(
+            "x", logging.INFO, "p", 0, "useful message", None, None
+        )
         assert filt.filter(record) is True
 
     def test_no_fragments_keeps_everything(self):
         filt = _SuppressFilter()
-        record = logging.LogRecord("x", logging.INFO, "p", 0,
-                                   "anything", None, None)
+        record = logging.LogRecord("x", logging.INFO, "p", 0, "anything", None, None)
         assert filt.filter(record) is True
 
     def test_handles_format_args(self):
         filt = _SuppressFilter("ERROR_X")
-        record = logging.LogRecord("x", logging.INFO, "p", 0,
-                                   "got %s while running", ("ERROR_X",), None)
+        record = logging.LogRecord(
+            "x", logging.INFO, "p", 0, "got %s while running", ("ERROR_X",), None
+        )
         assert filt.filter(record) is False

@@ -33,24 +33,40 @@ class FormField:
 # ── Fixture 1: a representative internal-portal form ────────────────────────
 
 SAMPLE_INTERNAL_FORM = [
-    FormField("Upload Your Resume/CV", kind="file",
-              expect_in="resume", required=True),
-    FormField('Target job title', kind="text",
-              expect_in="Senior Backend Engineer", required=True),
-    FormField("Your full name", kind="text",
-              expect_in="Test Candidate", required=True),
-    FormField("Experience Level", kind="dropdown",
-              options=("Entry (0-2 years)", "Mid (3-5 years)",
-                       "Senior (6-10 years)", "Lead (10+ years)"),
-              expect_in="Senior", required=True),
-    FormField("Job Status", kind="dropdown",
-              options=("Open To New Opportunities", "Actively Looking",
-                       "Not Looking"),
-              expect_in="Open To New Opportunities", required=True),
-    FormField("Preferred Salary Range", kind="dropdown",
-              options=("$0 - $5,000 USD", "$5,000 - $10,000 USD",
-                       "$10,000 - $25,000 USD"),
-              expect_in="10,000", required=True),
+    FormField("Upload Your Resume/CV", kind="file", expect_in="resume", required=True),
+    FormField(
+        "Target job title",
+        kind="text",
+        expect_in="Senior Backend Engineer",
+        required=True,
+    ),
+    FormField("Your full name", kind="text", expect_in="Test Candidate", required=True),
+    FormField(
+        "Experience Level",
+        kind="dropdown",
+        options=(
+            "Entry (0-2 years)",
+            "Mid (3-5 years)",
+            "Senior (6-10 years)",
+            "Lead (10+ years)",
+        ),
+        expect_in="Senior",
+        required=True,
+    ),
+    FormField(
+        "Job Status",
+        kind="dropdown",
+        options=("Open To New Opportunities", "Actively Looking", "Not Looking"),
+        expect_in="Open To New Opportunities",
+        required=True,
+    ),
+    FormField(
+        "Preferred Salary Range",
+        kind="dropdown",
+        options=("$0 - $5,000 USD", "$5,000 - $10,000 USD", "$10,000 - $25,000 USD"),
+        expect_in="10,000",
+        required=True,
+    ),
 ]
 
 
@@ -65,10 +81,18 @@ GREENHOUSE_FORM = [
     FormField("LinkedIn Profile", kind="text", expect_in="linkedin.com/in/"),
     FormField("GitHub Profile", kind="text", expect_in="github.com/"),
     FormField("Website", kind="text", expect_in="example.com"),
-    FormField("Are you legally authorized to work in the US?", kind="radio",
-              options=("Yes", "No"), expect_in="No"),
-    FormField("Will you now or in the future require sponsorship?", kind="radio",
-              options=("Yes", "No"), expect_in="No"),
+    FormField(
+        "Are you legally authorized to work in the US?",
+        kind="radio",
+        options=("Yes", "No"),
+        expect_in="No",
+    ),
+    FormField(
+        "Will you now or in the future require sponsorship?",
+        kind="radio",
+        options=("Yes", "No"),
+        expect_in="No",
+    ),
 ]
 
 
@@ -81,9 +105,12 @@ LEVER_FORM = [
     FormField("Current location", kind="text", expect_in="Remote"),
     FormField("Resume", kind="file", expect_in="resume"),
     FormField("LinkedIn URL", kind="text", expect_in="linkedin.com"),
-    FormField('How did you hear about this role?', kind="dropdown",
-              options=("Internal job board", "LinkedIn", "Referral", "Other"),
-              expect_in="Internal"),
+    FormField(
+        "How did you hear about this role?",
+        kind="dropdown",
+        options=("Internal job board", "LinkedIn", "Referral", "Other"),
+        expect_in="Internal",
+    ),
     FormField("Cover letter", kind="textarea", expect_in="Python", required=False),
 ]
 
@@ -94,51 +121,83 @@ WORKDAY_COMPENSATION = [
     FormField("Years of professional experience", kind="text", expect_in="10"),
     FormField("Years of Python experience", kind="text", expect_in="10"),
     FormField("Years of Django experience", kind="text", expect_in="8"),
-    FormField("Highest level of education completed", kind="dropdown",
-              options=("High School", "Associate's", "Bachelor's", "Master's", "PhD"),
-              expect_in="Bachelor"),
+    FormField(
+        "Highest level of education completed",
+        kind="dropdown",
+        options=("High School", "Associate's", "Bachelor's", "Master's", "PhD"),
+        expect_in="Bachelor",
+    ),
     FormField("Current job title", kind="text", expect_in="Senior Backend Engineer"),
     FormField("Expected annual salary (USD)", kind="text", expect_in="$"),
-    FormField("Are you a people manager?", kind="radio",
-              options=("Yes", "No"), expect_in="No"),
+    FormField(
+        "Are you a people manager?", kind="radio", options=("Yes", "No"), expect_in="No"
+    ),
 ]
 
 
 # ── Fixture 5: Ashby with technical skill checkboxes ────────────────────────
 
 ASHBY_TECHNICAL = [
-    FormField("Primary programming language", kind="dropdown",
-              options=("Python", "JavaScript", "Go", "Java", "Ruby"),
-              expect_in="Python"),
-    FormField("Frameworks you've used (check all)", kind="checkbox",
-              options=("Django", "FastAPI", "Flask", "Rails", "Spring"),
-              expect_in="Django"),
-    FormField("Cloud platforms (check all)", kind="checkbox",
-              options=("AWS", "GCP", "Azure", "DigitalOcean"),
-              expect_in="AWS"),
-    FormField("Are you comfortable with async communication?", kind="radio",
-              options=("Yes", "No"), expect_in="Yes"),
-    FormField("Have you worked on a fully remote team?", kind="radio",
-              options=("Yes", "No"), expect_in="Yes"),
+    FormField(
+        "Primary programming language",
+        kind="dropdown",
+        options=("Python", "JavaScript", "Go", "Java", "Ruby"),
+        expect_in="Python",
+    ),
+    FormField(
+        "Frameworks you've used (check all)",
+        kind="checkbox",
+        options=("Django", "FastAPI", "Flask", "Rails", "Spring"),
+        expect_in="Django",
+    ),
+    FormField(
+        "Cloud platforms (check all)",
+        kind="checkbox",
+        options=("AWS", "GCP", "Azure", "DigitalOcean"),
+        expect_in="AWS",
+    ),
+    FormField(
+        "Are you comfortable with async communication?",
+        kind="radio",
+        options=("Yes", "No"),
+        expect_in="Yes",
+    ),
+    FormField(
+        "Have you worked on a fully remote team?",
+        kind="radio",
+        options=("Yes", "No"),
+        expect_in="Yes",
+    ),
 ]
 
 
 # ── Fixture 6: EEO / demographic (voluntary) ────────────────────────────────
 
 EEO_FORM = [
-    FormField("Veteran status", kind="dropdown",
-              options=("I am a veteran", "I am not a veteran",
-                       "I prefer not to answer"),
-              expect_in="not a veteran", required=False),
-    FormField("Disability status", kind="dropdown",
-              options=("Yes, I have a disability", "No",
-                       "I prefer not to answer"),
-              expect_in="No", required=False),
-    FormField("Gender", kind="dropdown",
-              options=("Male", "Female", "Non-binary", "Prefer not to say"),
-              expect_in="Prefer not to say", required=False),
-    FormField("Ethnicity", kind="dropdown", expect_in="Prefer not to say",
-              required=False),
+    FormField(
+        "Veteran status",
+        kind="dropdown",
+        options=("I am a veteran", "I am not a veteran", "I prefer not to answer"),
+        expect_in="not a veteran",
+        required=False,
+    ),
+    FormField(
+        "Disability status",
+        kind="dropdown",
+        options=("Yes, I have a disability", "No", "I prefer not to answer"),
+        expect_in="No",
+        required=False,
+    ),
+    FormField(
+        "Gender",
+        kind="dropdown",
+        options=("Male", "Female", "Non-binary", "Prefer not to say"),
+        expect_in="Prefer not to say",
+        required=False,
+    ),
+    FormField(
+        "Ethnicity", kind="dropdown", expect_in="Prefer not to say", required=False
+    ),
 ]
 
 

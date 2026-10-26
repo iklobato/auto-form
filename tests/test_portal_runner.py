@@ -19,13 +19,30 @@ from fill import (
 )
 
 
-def _make_runner(system, *, opts, yaml_store, mock_app_logger,
-                 task_builder, cred_resolver, applied, attempted, recorder,
-                 proxy_provider=None) -> PortalRunner:
+def _make_runner(
+    system,
+    *,
+    opts,
+    yaml_store,
+    mock_app_logger,
+    task_builder,
+    cred_resolver,
+    applied,
+    attempted,
+    recorder,
+    proxy_provider=None,
+) -> PortalRunner:
     return PortalRunner(
-        system, knowledge="K", llm=MagicMock(), opts=opts, yaml_store=yaml_store,
-        task_builder=task_builder, cred_resolver=cred_resolver,
-        applied=applied, attempted=attempted, recorder=recorder,
+        system,
+        knowledge="K",
+        llm=MagicMock(),
+        opts=opts,
+        yaml_store=yaml_store,
+        task_builder=task_builder,
+        cred_resolver=cred_resolver,
+        applied=applied,
+        attempted=attempted,
+        recorder=recorder,
         app_logger=mock_app_logger,
         proxy_provider=proxy_provider,
     )
@@ -33,47 +50,87 @@ def _make_runner(system, *, opts, yaml_store, mock_app_logger,
 
 class TestBuildCredentials:
     def test_includes_portal_credentials_when_configured(
-        self, sample_system: dict, run_opts: RunOptions, yaml_store: YamlStore,
-        mock_app_logger: MagicMock, task_builder: TaskBuilder,
+        self,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
         cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
     ):
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
         creds = runner._build_credentials()
         assert creds["<username>"] == "user@example.com"
         assert creds["<password>"] == "secret"
 
     def test_uses_portal_account_password_env_when_set(
-        self, sample_system: dict, run_opts: RunOptions, yaml_store: YamlStore,
-        mock_app_logger: MagicMock, task_builder: TaskBuilder,
+        self,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
         cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
     ):
         clean_env.setenv("PORTAL_ACCOUNT_PASSWORD", "fixed-pw")
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
         creds = runner._build_credentials()
         assert creds["<portal_password>"] == "fixed-pw"
 
     def test_generated_password_is_reused_across_runs(
-        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
-        yaml_store: YamlStore, mock_app_logger: MagicMock, task_builder: TaskBuilder,
+        self,
+        tmp_app_root: Path,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
         cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
     ):
         def new_runner():
-            return _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                                mock_app_logger=mock_app_logger, task_builder=task_builder,
-                                cred_resolver=cred_resolver, applied=applied_tracker,
-                                attempted=attempted_tracker, recorder=recorder)
+            return _make_runner(
+                sample_system,
+                opts=run_opts,
+                yaml_store=yaml_store,
+                mock_app_logger=mock_app_logger,
+                task_builder=task_builder,
+                cred_resolver=cred_resolver,
+                applied=applied_tracker,
+                attempted=attempted_tracker,
+                recorder=recorder,
+            )
 
         first = new_runner()._build_credentials()["<portal_password>"]
         retry = new_runner()._build_credentials()["<portal_password>"]
@@ -84,49 +141,88 @@ class TestBuildCredentials:
         assert stored.stat().st_mode & 0o777 == 0o600
 
     def test_generates_random_when_no_env(
-        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
+        self,
+        tmp_app_root: Path,
+        sample_system: dict,
+        run_opts: RunOptions,
         yaml_store: YamlStore,
-        mock_app_logger: MagicMock, task_builder: TaskBuilder,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
         cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
     ):
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
         creds = runner._build_credentials()
         assert "<portal_password>" in creds
         assert len(creds["<portal_password>"]) >= 12  # token_urlsafe(12)
 
     def test_includes_linkedin_when_env_set(
-        self, sample_system: dict, run_opts: RunOptions, yaml_store: YamlStore,
-        mock_app_logger: MagicMock, task_builder: TaskBuilder,
+        self,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
         cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
     ):
         clean_env.setenv("LINKEDIN_SSO_USERNAME", "li@x")
         clean_env.setenv("LINKEDIN_SSO_PASSWORD", "li-pwd")
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
         creds = runner._build_credentials()
         assert creds["<linkedin_sso_email>"] == "li@x"
         assert creds["<linkedin_sso_password>"] == "li-pwd"
 
     def test_omits_linkedin_when_env_missing(
-        self, sample_system: dict, run_opts: RunOptions, yaml_store: YamlStore,
-        mock_app_logger: MagicMock, task_builder: TaskBuilder,
+        self,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
         cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
     ):
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
         creds = runner._build_credentials()
         assert "<linkedin_sso_email>" not in creds
         assert "<linkedin_sso_password>" not in creds
@@ -134,11 +230,18 @@ class TestBuildCredentials:
 
 class TestCleanStaleLocks:
     def test_removes_singleton_lock_files(
-        self, tmp_path: Path, sample_system: dict, run_opts: RunOptions,
-        yaml_store: YamlStore, mock_app_logger: MagicMock,
-        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
     ):
         # Reproduces the bug from the killed-run scenario: stale Singleton*
         # symlinks prevent Chrome from starting on a profile.
@@ -149,10 +252,17 @@ class TestCleanStaleLocks:
         (profile / "SingletonSocket").symlink_to("/tmp/dead.sock")
         (profile / "Default").mkdir()  # actual data, must NOT be deleted
 
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
         runner._clean_stale_locks(profile)
 
         assert not (profile / "SingletonLock").is_symlink()
@@ -162,18 +272,32 @@ class TestCleanStaleLocks:
         assert (profile / "Default").is_dir()
 
     def test_no_locks_present_is_noop(
-        self, tmp_path: Path, sample_system: dict, run_opts: RunOptions,
-        yaml_store: YamlStore, mock_app_logger: MagicMock,
-        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
     ):
         profile = tmp_path / "profile"
         profile.mkdir()
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
         runner._clean_stale_locks(profile)  # no exception
 
 
@@ -190,31 +314,57 @@ class TestRunAgentOutcome:
 
     @pytest.mark.asyncio
     async def test_stopped_without_done_is_a_failure(
-        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
-        yaml_store: YamlStore, mock_app_logger: MagicMock,
-        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        self,
+        tmp_app_root: Path,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
         recorder: ApplicationRecorder,
     ):
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
         with pytest.raises(AgentStoppedEarly, match="3 steps"):
             await runner._run_agent(self._agent_returning(is_done=False))
 
     @pytest.mark.asyncio
     async def test_done_returns_final_result(
-        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
-        yaml_store: YamlStore, mock_app_logger: MagicMock,
-        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        self,
+        tmp_app_root: Path,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
         recorder: ApplicationRecorder,
     ):
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
         assert await runner._run_agent(self._agent_returning(is_done=True)) == (
             "applied to 2 roles"
         )
@@ -232,11 +382,18 @@ class TestProxyWiring:
         return profile_ctor, agent_ctor
 
     def test_proxy_kwarg_passed_when_provider_set(
-        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
-        yaml_store: YamlStore, mock_app_logger: MagicMock,
-        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        self,
+        tmp_app_root: Path,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
         monkeypatch: pytest.MonkeyPatch,
     ):
         profile_ctor, _ = self._patch_browser(monkeypatch)
@@ -244,11 +401,18 @@ class TestProxyWiring:
         provider.acquire.return_value = Proxy(
             host="5.5.5.5", port=8080, username="u", password="p"
         )
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder,
-                              proxy_provider=provider)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+            proxy_provider=provider,
+        )
         runner._build_agent(task="t", credentials={})
         provider.acquire.assert_called_once_with(sample_system["name"])
         kwargs = profile_ctor.call_args.kwargs
@@ -259,28 +423,49 @@ class TestProxyWiring:
         }
 
     def test_no_proxy_kwarg_when_provider_absent(
-        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
-        yaml_store: YamlStore, mock_app_logger: MagicMock,
-        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        self,
+        tmp_app_root: Path,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
         monkeypatch: pytest.MonkeyPatch,
     ):
         profile_ctor, _ = self._patch_browser(monkeypatch)
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder,
-                              proxy_provider=None)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+            proxy_provider=None,
+        )
         runner._build_agent(task="t", credentials={})
         assert "proxy" not in profile_ctor.call_args.kwargs
 
     def test_provider_failure_propagates(
-        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
-        yaml_store: YamlStore, mock_app_logger: MagicMock,
-        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
-        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
-        recorder: ApplicationRecorder, clean_env: pytest.MonkeyPatch,
+        self,
+        tmp_app_root: Path,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
         monkeypatch: pytest.MonkeyPatch,
     ):
         # No fallbacks: a failed acquire MUST bubble up; the runner does not
@@ -288,10 +473,17 @@ class TestProxyWiring:
         self._patch_browser(monkeypatch)
         provider = MagicMock()
         provider.acquire.side_effect = RuntimeError("upstream gone")
-        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
-                              mock_app_logger=mock_app_logger, task_builder=task_builder,
-                              cred_resolver=cred_resolver, applied=applied_tracker,
-                              attempted=attempted_tracker, recorder=recorder,
-                              proxy_provider=provider)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+            proxy_provider=provider,
+        )
         with pytest.raises(RuntimeError, match="upstream gone"):
             runner._build_agent(task="t", credentials={})

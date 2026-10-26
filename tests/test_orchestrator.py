@@ -6,14 +6,18 @@ from fill import Orchestrator
 
 
 class TestSelectActive:
-    @pytest.mark.parametrize("url,is_active", [
-        ("https://acme.example.com/", True),
-        ("", False),
-        (None, False),
-        ("$WORKDAY_URL", False),  # unexpanded env var → skip
-    ])
-    def test_filters_unconfigured_urls(self, url, is_active,
-                                       monkeypatch: pytest.MonkeyPatch):
+    @pytest.mark.parametrize(
+        "url,is_active",
+        [
+            ("https://acme.example.com/", True),
+            ("", False),
+            (None, False),
+            ("$WORKDAY_URL", False),  # unexpanded env var → skip
+        ],
+    )
+    def test_filters_unconfigured_urls(
+        self, url, is_active, monkeypatch: pytest.MonkeyPatch
+    ):
         monkeypatch.delenv("WORKDAY_URL", raising=False)
         sys = {"name": "x", "url": url} if url is not None else {"name": "x"}
         active = Orchestrator._select_active([sys])

@@ -12,9 +12,11 @@ from fill import Paths, StepCallback
 
 def _png_b64() -> str:
     """1×1 transparent PNG, base64-encoded."""
-    raw = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-           b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00\x01"
-           b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82")
+    raw = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00\x01"
+        b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
     return base64.b64encode(raw).decode()
 
 
@@ -25,7 +27,10 @@ class TestActionNameExtraction:
         action.model_dump.return_value = {"click": {"index": 5}, "wait": None}
         names = StepCallback._extract_action_names(MagicMock(action=[action]))
         # `wait` is None → excluded (exclude_none in real model_dump)
-        assert names == ["click", "wait"]  # MagicMock returns full dict; we test the wiring
+        assert names == [
+            "click",
+            "wait",
+        ]  # MagicMock returns full dict; we test the wiring
 
     def test_extracts_from_dict_actions(self):
         out = MagicMock(action=[{"click": {"index": 1}, "scroll": None}])
@@ -58,10 +63,19 @@ class TestOnStepFailureIsolation:
 
         await cb.on_step(state, MagicMock(action=[]), step_num=3)
 
-        errors = [c.kwargs for c in mock_app_logger.emit.call_args_list
-                  if c.args and c.args[0] == "step_callback_error"]
-        assert errors == [{"portal": "acme", "step": 3, "error_type": "ValueError",
-                           "error": "No valid agent focus available"}]
+        errors = [
+            c.kwargs
+            for c in mock_app_logger.emit.call_args_list
+            if c.args and c.args[0] == "step_callback_error"
+        ]
+        assert errors == [
+            {
+                "portal": "acme",
+                "step": 3,
+                "error_type": "ValueError",
+                "error": "No valid agent focus available",
+            }
+        ]
 
 
 class TestOnStep:
@@ -73,7 +87,9 @@ class TestOnStep:
         state = MagicMock(spec=BrowserStateSummary)
         state.url = "https://acme/jobs"
         state.screenshot = _png_b64()
-        agent_output = MagicMock(action=[], next_goal="apply", evaluation_previous_goal="")
+        agent_output = MagicMock(
+            action=[], next_goal="apply", evaluation_previous_goal=""
+        )
 
         await cb.on_step(state, agent_output, step_num=1)
 
@@ -89,8 +105,11 @@ class TestOnStep:
         state = MagicMock(spec=BrowserStateSummary)
         state.url = "https://acme/jobs"
         state.screenshot = None
-        await cb.on_step(state, MagicMock(action=[], next_goal="", evaluation_previous_goal=""),
-                         step_num=1)
+        await cb.on_step(
+            state,
+            MagicMock(action=[], next_goal="", evaluation_previous_goal=""),
+            step_num=1,
+        )
         assert list((Paths.SCREENSHOTS / "acme").glob("*.png")) == []
 
     @pytest.mark.asyncio
@@ -101,8 +120,11 @@ class TestOnStep:
         state = MagicMock(spec=BrowserStateSummary)
         state.url = "https://acme/x"
         state.screenshot = None
-        await cb.on_step(state, MagicMock(action=[], next_goal="g", evaluation_previous_goal=""),
-                         step_num=42)
+        await cb.on_step(
+            state,
+            MagicMock(action=[], next_goal="g", evaluation_previous_goal=""),
+            step_num=42,
+        )
         mock_app_logger.emit.assert_called_once()
         kwargs = mock_app_logger.emit.call_args.kwargs
         assert kwargs["portal"] == "acme"
@@ -117,6 +139,9 @@ class TestOnStep:
         state = MagicMock(spec=BrowserStateSummary)
         state.url = None
         state.screenshot = None
-        await cb.on_step(state, MagicMock(action=[], next_goal="", evaluation_previous_goal=""),
-                         step_num=1)
+        await cb.on_step(
+            state,
+            MagicMock(action=[], next_goal="", evaluation_previous_goal=""),
+            step_num=1,
+        )
         assert mock_app_logger.emit.call_args.kwargs["url"] == "unknown"

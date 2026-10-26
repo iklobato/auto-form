@@ -1,7 +1,6 @@
 """ApplicationRecorder — slugify, JSON snapshot, INDEX.md table generation."""
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -9,14 +8,17 @@ from fill import ApplicationRecorder, Paths
 
 
 class TestSlugify:
-    @pytest.mark.parametrize("text,expected", [
-        ("Senior Backend Engineer", "senior_backend_engineer"),
-        ("Hello, World!", "hello_world"),
-        ("___leading_trailing___", "leading_trailing"),
-        ("multiple    spaces", "multiple_spaces"),
-        ("", "untitled"),
-        ("!!!", "untitled"),
-    ])
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("Senior Backend Engineer", "senior_backend_engineer"),
+            ("Hello, World!", "hello_world"),
+            ("___leading_trailing___", "leading_trailing"),
+            ("multiple    spaces", "multiple_spaces"),
+            ("", "untitled"),
+            ("!!!", "untitled"),
+        ],
+    )
     def test_basic_cases(self, text: str, expected: str):
         assert ApplicationRecorder._slugify(text) == expected
 
@@ -64,8 +66,7 @@ class TestWrite:
         self, recorder: ApplicationRecorder
     ):
         recorder.write(self._record(job_title="A"))
-        recorder.write(self._record(job_title="B",
-                                    applied_at="2026-05-13T21:40:00"))
+        recorder.write(self._record(job_title="B", applied_at="2026-05-13T21:40:00"))
         index = (Paths.APPLICATIONS / "acme" / "INDEX.md").read_text()
         assert index.count("# Applications — acme") == 1
         assert "A" in index and "B" in index
@@ -75,9 +76,7 @@ class TestWrite:
         index = (Paths.APPLICATIONS / "acme" / "INDEX.md").read_text()
         assert "Senior \\| Backend" in index
 
-    def test_em_dash_for_missing_optional_fields(
-        self, recorder: ApplicationRecorder
-    ):
+    def test_em_dash_for_missing_optional_fields(self, recorder: ApplicationRecorder):
         rec = self._record()
         rec["salary"] = ""
         rec["location"] = ""

@@ -10,21 +10,28 @@ class TestResolve:
         creds = cred_resolver.resolve({"username": "u@x", "password": "pw"})
         assert creds == {"<username>": "u@x", "<password>": "pw"}
 
-    def test_env_var_fallback(self, cred_resolver: CredentialsResolver,
-                              monkeypatch: pytest.MonkeyPatch):
+    def test_env_var_fallback(
+        self, cred_resolver: CredentialsResolver, monkeypatch: pytest.MonkeyPatch
+    ):
         monkeypatch.setenv("X_USER", "u@x")
         monkeypatch.setenv("X_PWD", "pw")
-        creds = cred_resolver.resolve({"username_env": "X_USER", "password_env": "X_PWD"})
+        creds = cred_resolver.resolve(
+            {"username_env": "X_USER", "password_env": "X_PWD"}
+        )
         assert creds == {"<username>": "u@x", "<password>": "pw"}
 
-    def test_direct_overrides_env(self, cred_resolver: CredentialsResolver,
-                                  monkeypatch: pytest.MonkeyPatch):
+    def test_direct_overrides_env(
+        self, cred_resolver: CredentialsResolver, monkeypatch: pytest.MonkeyPatch
+    ):
         monkeypatch.setenv("X_USER", "from_env")
-        creds = cred_resolver.resolve({"username": "from_yaml", "username_env": "X_USER"})
+        creds = cred_resolver.resolve(
+            {"username": "from_yaml", "username_env": "X_USER"}
+        )
         assert creds["<username>"] == "from_yaml"
 
-    def test_missing_env_skips_field(self, cred_resolver: CredentialsResolver,
-                                     monkeypatch: pytest.MonkeyPatch):
+    def test_missing_env_skips_field(
+        self, cred_resolver: CredentialsResolver, monkeypatch: pytest.MonkeyPatch
+    ):
         monkeypatch.delenv("UNSET_USER", raising=False)
         creds = cred_resolver.resolve({"username_env": "UNSET_USER"})
         assert "<username>" not in creds

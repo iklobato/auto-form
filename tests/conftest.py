@@ -8,7 +8,6 @@ import pytest
 import yaml
 from cdp_use.cdp.registry import EventRegistry
 
-import fill
 from fill import (
     Agent,
     AppLogger,
@@ -22,8 +21,8 @@ from fill import (
     YamlStore,
 )
 
-
 # ── tmp directory + path patching ────────────────────────────────────────────
+
 
 @pytest.fixture
 def tmp_app_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -62,12 +61,17 @@ def _minimal_template() -> str:
 
 # ── env ──────────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     """Strip all auto-form env vars so each test starts from a known state."""
     for key in (
-        "OPENROUTER_TOKEN", "OPENROUTER_MODEL", "ANTHROPIC_API_KEY",
-        "PORTAL_ACCOUNT_PASSWORD", "LINKEDIN_SSO_USERNAME", "LINKEDIN_SSO_PASSWORD",
+        "OPENROUTER_TOKEN",
+        "OPENROUTER_MODEL",
+        "ANTHROPIC_API_KEY",
+        "PORTAL_ACCOUNT_PASSWORD",
+        "LINKEDIN_SSO_USERNAME",
+        "LINKEDIN_SSO_PASSWORD",
         "RESUME_PATH",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -75,6 +79,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
 
 
 # ── logger ───────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def silent_logger() -> logging.Logger:
@@ -98,6 +103,7 @@ def mock_app_logger(tmp_app_root: Path) -> MagicMock:
 
 
 # ── sample data ──────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def sample_system() -> dict:
@@ -124,6 +130,7 @@ def systems_yaml_file(tmp_path: Path, sample_system: dict) -> Path:
 
 
 # ── trackers / stores ────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def applied_tracker(tmp_app_root: Path) -> JsonlTracker:
@@ -169,6 +176,7 @@ def run_opts() -> RunOptions:
 
 # ── browser_use / Agent mocks ────────────────────────────────────────────────
 
+
 class FakeRegistry:
     """Captures `@registry.action(...)` decorations so tests can invoke them by name."""
 
@@ -179,6 +187,7 @@ class FakeRegistry:
         def decorator(func):
             self.actions[func.__name__] = func
             return func
+
         return decorator
 
 
