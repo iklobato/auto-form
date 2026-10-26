@@ -27,6 +27,7 @@ import logging.handlers
 import os
 import re
 import secrets
+import socket
 import tempfile
 import time
 from dataclasses import dataclass
@@ -1955,6 +1956,10 @@ class AgentStoppedEarly(RuntimeError):
     """
 
 
+class ProfileInUse(RuntimeError):
+    """A live Chrome on this host already holds the portal's browser profile."""
+
+
 class PortalRunner:
     """Runs the apply flow for one portal end-to-end."""
 
@@ -2080,6 +2085,12 @@ class PortalRunner:
 
     def _clean_stale_locks(self, profile_dir: Path) -> None:
         """Remove Chrome SingletonLock/Cookie/Socket symlinks left by a killed run."""
+        if owner := self._live_lock_owner(profile_dir / "SingletonLock"):
+            # Two Chromes on one profile can corrupt its cookies and saved logins
+            raise ProfileInUse(
+                f"{self.name}: browser profile {profile_dir} is in use by a running "
+                f"Chrome (pid {owner}); is another fill.py run on this portal?"
+            )
         cleaned = []
         for name in self.STALE_LOCK_NAMES:
             lock = profile_dir / name
@@ -2091,6 +2102,25 @@ class PortalRunner:
                     self.plog.warning("could not remove stale lock %s: %s", name, e)
         if cleaned:
             self.plog.info("cleaned stale Chrome locks: %s", ", ".join(cleaned))
+
+    @staticmethod
+    def _live_lock_owner(lock: Path) -> int | None:
+        """PID of the Chrome on this host that holds the lock, or None if it is stale.
+
+        Chrome points SingletonLock at "<hostname>-<pid>".
+        """
+        if not lock.is_symlink():
+            return None
+        host, _, pid_text = os.readlink(lock).rpartition("-")
+        if host != socket.gethostname() or not pid_text.isdigit():
+            return None
+        try:
+            os.kill(int(pid_text), 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            pass  # alive, owned by another user
+        return int(pid_text)
 
     def _build_agent(
         self, task: str, credentials: dict[str, str], *, proxy: Proxy | None = None

@@ -1,5 +1,7 @@
 """PortalRunner — credential injection (portal_password + LinkedIn SSO)."""
 
+import os
+import socket
 import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -13,6 +15,7 @@ from fill import (
     CredentialsResolver,
     JsonlTracker,
     PortalRunner,
+    ProfileInUse,
     Proxy,
     RunOptions,
     TaskBuilder,
@@ -271,6 +274,53 @@ class TestCleanStaleLocks:
         assert not (profile / "SingletonSocket").is_symlink()
         # Real data preserved
         assert (profile / "Default").is_dir()
+
+    @pytest.mark.parametrize(
+        "lock_target, in_use",
+        [
+            (f"{socket.gethostname()}-{os.getpid()}", True),
+            (f"{socket.gethostname()}-99999999", False),
+        ],
+        ids=["live-chrome-same-host", "dead-pid-same-host"],
+    )
+    def test_only_stale_locks_are_removed(
+        self,
+        lock_target: str,
+        in_use: bool,
+        tmp_path: Path,
+        sample_system: dict,
+        run_opts: RunOptions,
+        yaml_store: YamlStore,
+        mock_app_logger: MagicMock,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        clean_env: pytest.MonkeyPatch,
+    ):
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / "SingletonLock").symlink_to(lock_target)
+        runner = _make_runner(
+            sample_system,
+            opts=run_opts,
+            yaml_store=yaml_store,
+            mock_app_logger=mock_app_logger,
+            task_builder=task_builder,
+            cred_resolver=cred_resolver,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+        )
+
+        if in_use:
+            with pytest.raises(ProfileInUse, match=str(os.getpid())):
+                runner._clean_stale_locks(profile)
+            assert (profile / "SingletonLock").is_symlink()
+        else:
+            runner._clean_stale_locks(profile)
+            assert not (profile / "SingletonLock").is_symlink()
 
     def test_no_locks_present_is_noop(
         self,
