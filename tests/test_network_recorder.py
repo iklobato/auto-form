@@ -12,6 +12,23 @@ from fill import NetworkRecorder, Paths
 
 
 class TestFiltering:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Seen in live dry runs on 2026-10-26 (Greenhouse, We Work Remotely)
+            "https://c.spl.greenhouse.io/com.snowplowanalytics.snowplow/tp2",
+            "https://bzr.openai.com/v1/sdk/events?pid=x&st=oaiq-web",
+            "https://t.co/i/adsctp",
+            "https://analytics.twitter.com/i/adsctp",
+        ],
+    )
+    def test_ignores_analytics_seen_on_job_sites(
+        self, url: str, tmp_app_root: Path, mock_app_logger: MagicMock
+    ):
+        rec = NetworkRecorder("acme", mock_app_logger)
+        rec._on_request({"requestId": "r1", "request": {"method": "POST", "url": url}})
+        assert rec.recent == []
+
     def test_ignores_get_requests(self, tmp_app_root: Path, mock_app_logger: MagicMock):
         rec = NetworkRecorder("acme", mock_app_logger)
         rec._on_request({"request": {"method": "GET", "url": "https://acme/api"}})
