@@ -442,11 +442,6 @@ class TaskBuilder:
                 f"Only consider roles whose title or description contains "
                 f'"{opts.filter_keyword}".'
             )
-        if opts.dry_run:
-            line += (
-                "\nDo NOT click Apply or submit any forms. "
-                "Only assess each role and report which ones would be a match."
-            )
         return line
 
 
