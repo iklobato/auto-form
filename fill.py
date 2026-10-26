@@ -1494,6 +1494,10 @@ class DryRunGuard:
 
     BLOCKED_METHODS = NetworkRecorder.INTERESTING_METHODS
     ERROR_REASON = "BlockedByClient"
+    # Ashby loads the job and the form through POST /api/non-user-graphql; blocking
+    # those left the application page with 0 inputs in a real-Chrome test.
+    GRAPHQL_READ = re.compile(r"\s*(query\b|\{)")
+    GRAPHQL_WRITE = re.compile(r"\b(mutation|subscription)\b")
 
     def __init__(self, portal_name: str, app_logger: AppLogger):
         self.portal_name = portal_name
@@ -1520,8 +1524,10 @@ class DryRunGuard:
         request = event.get("request", {}) or {}
         method, url = request.get("method", ""), request.get("url", "")
         params: dict[str, object] = {"requestId": event["requestId"]}
-        if method in self.BLOCKED_METHODS and not any(
-            noise in url for noise in NetworkRecorder.NOISE_FRAGMENTS
+        if (
+            method in self.BLOCKED_METHODS
+            and not any(noise in url for noise in NetworkRecorder.NOISE_FRAGMENTS)
+            and not self._is_graphql_read(request)
         ):
             params["errorReason"] = self.ERROR_REASON
             self.blocked.append(url)
@@ -1537,6 +1543,25 @@ class DryRunGuard:
         task = asyncio.create_task(command(params=params, session_id=session_id))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
+
+    @classmethod
+    def _is_graphql_read(cls, request: dict) -> bool:
+        """True only when every operation in a GraphQL body is a plain `query`.
+
+        Anything else (a mutation, a multi-operation document that names one, a
+        body we cannot parse, a body too large to inline) stays blocked.
+        """
+        try:
+            body = json.loads(request.get("postData") or "")
+        except json.JSONDecodeError:
+            return False
+        operations = body if isinstance(body, list) else [body]
+        return bool(operations) and all(
+            isinstance(op, dict)
+            and cls.GRAPHQL_READ.match(op.get("query") or "")
+            and not cls.GRAPHQL_WRITE.search(op.get("query") or "")
+            for op in operations
+        )
 
 
 # ── Per-step callback ─────────────────────────────────────────────────────────
