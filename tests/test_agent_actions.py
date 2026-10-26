@@ -421,11 +421,14 @@ class TestMarkApplied:
             recorder=recorder,
             app_logger=mock_app_logger,
         ).register_all()
-        await fake_registry.actions["mark_applied"]("u", "t")
+        result = await fake_registry.actions["mark_applied"]("u", "t")
         assert applied_tracker.load_keys() == set()
         assert not Paths.APPLICATIONS.exists() or not list(
             Paths.APPLICATIONS.glob("**/*.json")
         )
+        # The reply must read as finished, or the agent retries it in a loop
+        assert result.extracted_content.startswith("Done: t counts as handled")
+        assert "Do not call mark_applied again" in result.extracted_content
 
 
 class TestMarkAttempted:

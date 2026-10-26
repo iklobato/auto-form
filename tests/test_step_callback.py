@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -197,6 +198,60 @@ class TestDryRunGuard:
                 params={"requestId": "f1"}, session_id=None
             )
             client.send.Fetch.failRequest.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body, blocked",
+        [
+            # What Ashby sends to render the application page (seen 2026-10-26)
+            (
+                {
+                    "operationName": "ApiJobPosting",
+                    "query": "query ApiJobPosting($id: String!) { x }",
+                },
+                False,
+            ),
+            ([{"query": "query A { a }"}, {"query": "{ b }"}], False),
+            ({"operationName": "Submit", "query": "mutation Submit { submit }"}, True),
+            # A document that starts with a query but runs a named mutation
+            ({"operationName": "B", "query": "query A { a } mutation B { b }"}, True),
+            ([{"query": "query A { a }"}, {"query": "mutation B { b }"}], True),
+            (
+                {"operationName": "Persisted", "extensions": {"persistedQuery": {}}},
+                True,
+            ),
+            ("not json", True),
+        ],
+        ids=[
+            "ashby-read",
+            "batch-reads",
+            "mutation",
+            "query-then-mutation",
+            "batch-with-mutation",
+            "no-query-text",
+            "unparsable",
+        ],
+    )
+    async def test_graphql_reads_pass_writes_stay_blocked(
+        self, body, blocked: bool, tmp_app_root: Path, mock_app_logger: MagicMock
+    ):
+        guard, client = self._attached_guard(mock_app_logger)
+        post_data = body if isinstance(body, str) else json.dumps(body)
+
+        guard._on_paused(
+            {
+                "requestId": "g1",
+                "request": {
+                    "method": "POST",
+                    "url": "https://jobs.ashbyhq.com/api/non-user-graphql",
+                    "postData": post_data,
+                },
+            }
+        )
+        await asyncio.gather(*guard._pending)
+
+        assert client.send.Fetch.failRequest.await_count == (1 if blocked else 0)
+        assert client.send.Fetch.continueRequest.await_count == (0 if blocked else 1)
 
     @pytest.mark.asyncio
     async def test_attach_failure_reaches_the_agent(

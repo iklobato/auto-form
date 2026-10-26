@@ -11,6 +11,7 @@ The test loads the REAL knowledge directory (not a mock) so it reflects what the
 agent will actually see at runtime.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,16 @@ class TestRequiredFieldsCovered:
             pytest.skip("optional field — agent can leave blank")
         if field.kind == "file":
             pytest.skip("file fields are populated from RESUME_PATH env, not knowledge")
+        if field.answer_label:
+            filled_row = re.compile(
+                rf"^\|\s*{re.escape(field.answer_label)}\s*\|\s*[^|\s][^|]*\|",
+                re.MULTILINE | re.IGNORECASE,
+            )
+            assert filled_row.search(real_knowledge), (
+                f"Form {form_name!r} field {field.label!r} needs a filled "
+                f"'| {field.answer_label} | ... |' row in knowledge/00_form_answers.md."
+            )
+            return
         assert field.expect_in.lower() in real_knowledge.lower(), (
             f"Form {form_name!r} field {field.label!r} expects answer containing "
             f"{field.expect_in!r}, but the knowledge base does not contain it. "
@@ -96,7 +107,7 @@ class TestDropdownOptionsAvailable:
 
 
 class TestRequiredFieldsHaveAnExpectation:
-    """Sanity check: every fixture entry has an expect_in. Catches typos."""
+    """Sanity check: every fixture entry declares what a good answer is. Catches typos."""
 
     @pytest.mark.parametrize(
         "case",
@@ -105,4 +116,6 @@ class TestRequiredFieldsHaveAnExpectation:
     )
     def test_expect_in_is_non_empty(self, case: tuple[str, FormField]):
         _, field = case
-        assert field.expect_in, f"Field {field.label!r} declares no expected answer"
+        assert bool(field.expect_in) != bool(
+            field.answer_label
+        ), f"Field {field.label!r} needs exactly one of expect_in or answer_label"

@@ -25,9 +25,12 @@ from dataclasses import dataclass
 class FormField:
     label: str
     kind: str
-    expect_in: str
+    expect_in: str = ""
     required: bool = True
     options: tuple[str, ...] | None = None
+    # Identity fields differ per user, so instead of a value the knowledge base
+    # must hold a filled `| <answer_label> | ... |` row in 00_form_answers.md.
+    answer_label: str | None = None
 
 
 # ── Fixture 1: a representative internal-portal form ────────────────────────
@@ -40,7 +43,7 @@ SAMPLE_INTERNAL_FORM = [
         expect_in="Senior Backend Engineer",
         required=True,
     ),
-    FormField("Your full name", kind="text", expect_in="Test Candidate", required=True),
+    FormField("Your full name", kind="text", answer_label="Full name", required=True),
     FormField(
         "Experience Level",
         kind="dropdown",
@@ -74,13 +77,13 @@ SAMPLE_INTERNAL_FORM = [
 
 GREENHOUSE_FORM = [
     FormField("First Name", kind="text", expect_in="Test"),
-    FormField("Last Name", kind="text", expect_in="Candidate"),
-    FormField("Email", kind="email", expect_in="test@example.com"),
-    FormField("Phone", kind="phone", expect_in="+1"),
+    FormField("Last Name", kind="text", answer_label="Last name"),
+    FormField("Email", kind="email", answer_label="Email"),
+    FormField("Phone", kind="phone", answer_label="Phone"),
     FormField("Resume/CV", kind="file", expect_in="resume"),
     FormField("LinkedIn Profile", kind="text", expect_in="linkedin.com/in/"),
     FormField("GitHub Profile", kind="text", expect_in="github.com/"),
-    FormField("Website", kind="text", expect_in="example.com"),
+    FormField("Website", kind="text", answer_label="Portfolio / Website"),
     FormField(
         "Are you legally authorized to work in the US?",
         kind="radio",
@@ -99,9 +102,9 @@ GREENHOUSE_FORM = [
 # ── Fixture 3: Lever / Ashby-style form with cover letter ───────────────────
 
 LEVER_FORM = [
-    FormField("Full name", kind="text", expect_in="Test Candidate"),
-    FormField("Email", kind="email", expect_in="test@example.com"),
-    FormField("Current company", kind="text", expect_in="Acme"),
+    FormField("Full name", kind="text", answer_label="Full name"),
+    FormField("Email", kind="email", answer_label="Email"),
+    FormField("Current company", kind="text", answer_label="Current employer"),
     FormField("Current location", kind="text", expect_in="Remote"),
     FormField("Resume", kind="file", expect_in="resume"),
     FormField("LinkedIn URL", kind="text", expect_in="linkedin.com"),

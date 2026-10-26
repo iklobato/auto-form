@@ -38,13 +38,15 @@ class TestDryRun:
         self, task_builder: TaskBuilder, sample_system: dict
     ):
         task = task_builder.build(sample_system, "K", RunOptions(dry_run=True))
-        assert "Do NOT click Apply" in task
+        assert "do NOT click the final submit" in task
+        # One instruction only: an older "Only assess" line told the agent the opposite
+        assert "Only assess" not in task and task.count("DRY RUN") == 1
 
     def test_no_warning_when_apply_mode(
         self, task_builder: TaskBuilder, sample_system: dict
     ):
         task = task_builder.build(sample_system, "K", RunOptions(dry_run=False))
-        assert "Do NOT click Apply" not in task
+        assert "DRY RUN" not in task and "do NOT click" not in task
 
 
 class TestKeywordFilter:
