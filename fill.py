@@ -1164,6 +1164,10 @@ class NetworkRecorder:
         # both main-page and sub-frame handlers — dedup on the unique requestId.
         self._seen_request_ids: set[str] = set()
 
+    def start_job(self) -> None:
+        """Forget earlier POSTs so mark_applied's evidence covers only this job."""
+        self.recent.clear()
+
     async def attach_if_needed(self, browser_session) -> None:
         """Idempotent — call from the step callback. Subscribes to CDP Network events."""
         if browser_session is None:
@@ -1687,6 +1691,7 @@ class AgentActions:
         )
         session_visits = self._session_visits
         visit_limit = self.SESSION_VISIT_LIMIT
+        network_recorder = self.network_recorder
 
         @self.agent.tools.registry.action(
             "Check whether a specific job has already been applied to OR previously attempted-and-failed. "
@@ -1748,6 +1753,8 @@ class AgentActions:
                 result="not_applied",
                 visits=visits,
             )
+            if network_recorder:
+                network_recorder.start_job()
             return ActionResult(extracted_content="not_applied")
 
     def _register_mark_applied(self) -> None:

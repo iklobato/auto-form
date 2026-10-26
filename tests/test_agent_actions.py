@@ -9,6 +9,7 @@ from fill import (
     AgentActions,
     ApplicationRecorder,
     JsonlTracker,
+    NetworkRecorder,
     Paths,
     YamlStore,
 )
@@ -319,6 +320,51 @@ class TestMarkAttemptedDryRun:
         )
 
         assert attempted_tracker.load_keys() == set()
+
+
+class TestSubmissionEvidence:
+    @pytest.mark.asyncio
+    async def test_evidence_only_holds_posts_from_the_current_job(
+        self,
+        tmp_app_root,
+        mock_agent: MagicMock,
+        fake_registry,
+        applied_tracker: JsonlTracker,
+        attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+        mock_app_logger: MagicMock,
+    ):
+        network = NetworkRecorder("acme", mock_app_logger)
+        AgentActions(
+            mock_agent,
+            "acme",
+            dry_run=False,
+            yaml_store=None,
+            applied=applied_tracker,
+            attempted=attempted_tracker,
+            recorder=recorder,
+            app_logger=mock_app_logger,
+            network_recorder=network,
+        ).register_all()
+        actions = fake_registry.actions
+
+        def post(url: str) -> None:
+            network._on_request(
+                {"requestId": url, "request": {"method": "POST", "url": url}}
+            )
+
+        await actions["check_applied"]("https://x/job1")
+        post("https://acme/job1/submit")
+        await actions["check_applied"]("https://x/job2")
+        post("https://acme/job2/submit")
+        await actions["mark_applied"](job_url="https://x/job2", job_title="BE")
+
+        record = json.loads(
+            next((Paths.APPLICATIONS / "acme").glob("*.json")).read_text()
+        )
+        assert [p["url"] for p in record["recent_network_posts"]] == [
+            "https://acme/job2/submit"
+        ]
 
 
 class TestMarkApplied:
