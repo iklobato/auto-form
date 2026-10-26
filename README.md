@@ -71,7 +71,7 @@ $EDITOR knowledge/01_personal.md
 # ... etc
 
 # 5. dry-run a single portal
-uv run fill.py --systems systems.yaml --filter remoteok --dry-run --verbose
+uv run fill.py --systems systems.yaml --system remoteok --dry-run --verbose
 
 # 6. real run, all portals
 uv run fill.py --systems systems.yaml --all --workers 1 --headless
@@ -80,14 +80,15 @@ uv run fill.py --systems systems.yaml --all --workers 1 --headless
 ## CLI flags
 
 ```
---systems PATH       Portal list YAML (required)
+--systems PATH       Portal list YAML (default: systems.yaml)
 --all                Run every portal in the file
---filter NAME        Run only portals whose name contains NAME
+--system NAME        Run one portal, by its exact name
+--filter WORD        Only consider roles whose title or description contains WORD
 --workers N          Concurrent portals, 1 or more (default: 5; >1 needs care with CDP)
 --headless           Run Chrome without a window (required for servers)
---dry-run            Navigate + render forms but never submit
+--dry-run            Fill forms but never submit (the browser blocks every submit)
 --fast               Use a smaller/faster LLM model
---max-actions N      Cap the agent at N actions per portal
+--max-actions N      Max actions per LLM call (default: 5)
 --model NAME         Override the default LLM (e.g. anthropic/claude-sonnet-4)
 --verbose            DEBUG-level logging
 --trace              TRACE-level (every CDP event)
