@@ -20,6 +20,7 @@ class TestFiltering:
             "https://bzr.openai.com/v1/sdk/events?pid=x&st=oaiq-web",
             "https://t.co/i/adsctp",
             "https://analytics.twitter.com/i/adsctp",
+            "https://www.google.com/measurement/conversion?random=1&cv=11&tid=G-X",
         ],
     )
     def test_ignores_analytics_seen_on_job_sites(
