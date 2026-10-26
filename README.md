@@ -5,6 +5,10 @@ AI-powered job-application automation. Drives a real Chrome session through
 by default) to navigate job portals, find roles matching a profile, fill the
 apply form, upload a resume, and record what happened.
 
+Working on this code (person or AI agent)? Read
+[docs/PROJECT_STATE.md](docs/PROJECT_STATE.md) first: how a run works, behaviors to
+keep, what was learned, and open items.
+
 ## What it does
 
 For each portal listed in `systems.yaml`:
