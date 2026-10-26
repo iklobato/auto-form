@@ -382,33 +382,49 @@ class BackoffTransport(httpx.AsyncBaseTransport):
     """Wraps another transport, retrying 429/5xx with exponential backoff."""
 
     RETRY_STATUSES = (429, 500, 502, 503, 504)
+    # browser_use cancels an LLM call after llm_timeout (75s for the default gemini
+    # model). The slowest agent step in logs/events.jsonl (154 steps, May 2026) took
+    # 19.8s, so 45s of total sleep leaves ~30s for the call that finally succeeds.
+    MAX_TOTAL_WAIT_S = 45.0
 
     def __init__(self, wrapped: httpx.AsyncBaseTransport, *,
                  max_retries: int = 5, base_wait: float = 2.0, max_wait: float = 60.0,
+                 max_total_wait: float = MAX_TOTAL_WAIT_S,
                  log: logging.Logger | None = None):
         self._wrapped = wrapped
         self._max_retries = max_retries
         self._base_wait = base_wait
         self._max_wait = max_wait
+        self._max_total_wait = max_total_wait
         self._log = log or logging.getLogger("auto-form")
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        waited = 0.0
         for attempt in range(self._max_retries + 1):
             response = await self._wrapped.handle_async_request(request)
             if response.status_code not in self.RETRY_STATUSES or attempt == self._max_retries:
                 return response
             wait = self._compute_wait(response.headers.get("retry-after"), attempt)
+            if waited + wait > self._max_total_wait:
+                self._log.warning(
+                    "HTTP %d from %s: next wait %.1fs would pass the %.0fs retry budget, giving up",
+                    response.status_code, request.url, wait, self._max_total_wait,
+                )
+                return response
+            # Release the pooled connection of the response we are discarding
+            await response.aclose()
             self._log.warning(
                 "HTTP %d from %s — retrying in %.1fs (attempt %d/%d)",
                 response.status_code, request.url, wait, attempt + 1, self._max_retries,
             )
             await asyncio.sleep(wait)
+            waited += wait
         return response
 
     def _compute_wait(self, retry_after_header: str | None, attempt: int) -> float:
         if retry_after_header:
             try:
-                return float(retry_after_header)
+                return min(float(retry_after_header), self._max_wait)
             except ValueError:
                 self._log.debug("BackoffTransport: unparseable Retry-After=%r, "
                                 "using exponential backoff", retry_after_header)
