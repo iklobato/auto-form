@@ -1106,6 +1106,7 @@ class NetworkRecorder:
         "google.com/rmkt",
         "google.com/ccm",
         "google.com/pagead",
+        "google.com/measurement",
         "google.com/recaptcha",
         # SaaS analytics
         "segment.io",

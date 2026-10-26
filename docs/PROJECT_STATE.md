@@ -154,7 +154,7 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   ("Maximum 2 scrolls between listing-opens", "Re-navigating ... over and over"): in the
   visible WWR run (`events.jsonl` run `20261025_235357`) 14 of 21 logged steps were
   scroll-only, over the same short list. May 2026 runs show the same (22 of 43 in
-  `20260513_221619`).
+  `20260513_221619`). `google/gemini-2.5-flash` on the same portal: 5 of 23.
 - Public ATS APIs are the fastest way to find open roles without a browser:
   `https://boards-api.greenhouse.io/v1/boards/<co>/jobs`,
   `https://api.ashbyhq.com/posting-api/job-board/<co>`,
@@ -177,6 +177,7 @@ by these runs.
 | 2026-10-26 | weworkremotely | visible | passed Cloudflare; 28 analytics POSTs blocked and recorded as `network_post` (first since 2026-05-13); only match rejected on timezone |
 | 2026-10-26 | Supabase "SDK Engineer - Python" (Ashby, temp YAML) | headless | form filled; 24 `ApiSetFormValue` blocked; agent did not click submit; looped `mark_applied` 7+ times (fixed) |
 | 2026-10-26 | same | headless | 15 steps, `mark_applied` twice then `done`; 17 `ApiSetFormValue` and 1 `ApiCreateFileUploadHandle` blocked; agent reported the upload as an error |
+| 2026-10-26 | weworkremotely, `--model google/gemini-2.5-flash` (run `20261026_004642`) | visible | 23 logged steps, 5 scroll-only (flash-lite: 21 / 14). Accepted the Proxify role that flash-lite rejected on timezone, followed it to `talent.proxify.io/apply`, filled it and uploaded the resume; its "Next" button never enabled, so no POST went to Proxify. Blocked: WWR `job_apply_count` and a Google conversion ping |
 
 Still never seen live: the guard blocking a final submit click. The agent obeys the
 dry-run notice and never clicks it.
@@ -194,12 +195,13 @@ dry-run notice and never clicks it.
   corrected and a comment explains it.
 - PR [#3](https://github.com/iklobato/auto-form/pull/3) (merged 2026-10-26): Snowplow,
   `bzr.openai.com`, `t.co/i/adsctp`, `analytics.twitter.com` added to the noise list.
-- Branch `improve/dry-run-and-tests` (5 code commits plus this file, not pushed when this
-  file was written):
+- PR [#4](https://github.com/iklobato/auto-form/pull/4) (merged 2026-10-26, 6 commits):
   GraphQL reads pass the guard; identity form-coverage tests check that a
   `00_form_answers.md` row is filled instead of a sample value (suite fully green); one
   dry-run prompt line instead of two opposite ones; README flags match `--help`; dry-run
-  `mark_applied` reply says the job is done.
+  `mark_applied` reply says the job is done; this file and `CLAUDE.md`.
+- Follow-up after PR #4 (2026-10-26): `google.com/measurement` (Google Ads conversion
+  ping) added to the noise list; this file updated with the model comparison.
 - Measured: the guard does not slow screenshots (0.10 to 0.13 s with and without, 5 runs
   each on an Ashby page). Page loads were 1.1 to 1.5 s or about 8.2 s in both groups; the
   8 s is browser_use's own readiness timeout.
@@ -208,11 +210,11 @@ dry-run notice and never clicks it.
 
 Each item says when it is done.
 
-1. **Compare a stronger model on the scroll loop** (chosen next step). Run
-   `weworkremotely` in a visible dry run with `--model google/gemini-2.5-flash` and compare
-   logged steps and scroll-only steps against the baseline of 21 logged / 14 scroll-only
-   (count them from `events.jsonl` `step` events, `actions == ["scroll"]`). Done when both
-   numbers are recorded in section 7.
+1. **Decide the default model.** Measured on WWR (section 7): `google/gemini-2.5-flash`
+   cut scroll-only steps from 14 to 5 and reached a real form, where flash-lite did not.
+   It also judged the timezone rule differently. Cost per run was not measured. Done when
+   the OpenRouter cost of one run per model is recorded and `LLMFactory.DEFAULT_MODEL` is
+   either changed or kept on purpose.
 2. **Dry-run upload is reported as an error.** The guard correctly blocks
    `ApiCreateFileUploadHandle`, and the agent then says the upload failed. Decide whether
    the notice should tell the agent uploads are blocked in a dry run. Done when a dry run
