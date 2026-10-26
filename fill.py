@@ -1410,8 +1410,8 @@ class AgentActions:
             return ActionResult(extracted_content=f"Recorded application to {portal}: {job_title}")
 
     def _register_mark_attempted(self) -> None:
-        portal, plog, attempted, app_logger = (
-            self.portal_name, self.plog, self.attempted, self.app_logger,
+        portal, plog, attempted, app_logger, dry_run = (
+            self.portal_name, self.plog, self.attempted, self.app_logger, self.dry_run,
         )
 
         @self.agent.tools.registry.action(
@@ -1424,6 +1424,10 @@ class AgentActions:
         )
         async def mark_attempted(job_url: str, job_title: str, reason: str,
                                  notes: str = "") -> ActionResult:
+            # check_applied skips attempted URLs forever, so a dry run must not record one
+            if dry_run:
+                plog.info("DRY RUN: would mark attempted: %s (reason=%s)", job_title, reason)
+                return ActionResult(extracted_content="dry_run: not recorded. Move on to next listing.")
             record = {
                 "portal": portal, "job_url": job_url, "job_title": job_title,
                 "reason": reason, "notes": notes,

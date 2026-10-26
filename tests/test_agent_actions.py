@@ -177,6 +177,24 @@ class TestCheckApplied:
             assert r.extracted_content == "not_applied"
 
 
+class TestMarkAttemptedDryRun:
+    @pytest.mark.asyncio
+    async def test_dry_run_does_not_block_the_job_for_real_runs(
+        self, mock_agent: MagicMock, fake_registry,
+        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder, mock_app_logger: MagicMock,
+    ):
+        AgentActions(mock_agent, "acme", dry_run=True, yaml_store=None,
+                     applied=applied_tracker, attempted=attempted_tracker,
+                     recorder=recorder, app_logger=mock_app_logger).register_all()
+
+        await fake_registry.actions["mark_attempted"](
+            job_url="https://x/1", job_title="Senior BE", reason="login_required",
+        )
+
+        assert attempted_tracker.load_keys() == set()
+
+
 class TestMarkApplied:
     @pytest.mark.asyncio
     async def test_writes_record_and_appends_to_tracker(
