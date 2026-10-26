@@ -987,7 +987,10 @@ class ApplicationRecorder:
                 f.write(f"# Applications — {portal}\n\n")
                 f.write("| When | Title | Salary | Location | URL | Record |\n")
                 f.write("|------|-------|--------|----------|-----|--------|\n")
-            esc = lambda s: (s or "—").replace("|", "\\|")
+
+            def esc(s: str | None) -> str:
+                return (s or "—").replace("|", "\\|")
+
             f.write(
                 f"| {record['applied_at']} | {esc(record['job_title'])} | "
                 f"{esc(record.get('salary'))} | {esc(record.get('location'))} | "
