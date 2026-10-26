@@ -1216,7 +1216,8 @@ class NetworkRecorder:
 
         # time.strftime has no %f; the requestId keeps same-microsecond POSTs apart
         ts_compact = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        stem = f"{ts_compact}_{request_id}" if request_id else ts_compact
+        safe_id = re.sub(r"[^\w.-]", "_", request_id)
+        stem = f"{ts_compact}_{safe_id}" if safe_id else ts_compact
         path = self.captures_dir / f"{stem}_{method.lower()}.json"
         path.write_text(json.dumps(capture, ensure_ascii=False, indent=2))
         # DEBUG only — full record is on disk + attached to mark_applied. CDPDebugger

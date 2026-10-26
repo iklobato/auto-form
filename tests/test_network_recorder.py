@@ -161,6 +161,20 @@ class TestPersistence:
             "https://acme/r3",
         ]
 
+    def test_request_id_with_path_characters_stays_in_the_network_dir(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ):
+        rec = NetworkRecorder("acme", mock_app_logger)
+        rec._on_request(
+            {
+                "requestId": "../interception/1.0",
+                "request": {"method": "POST", "url": "https://acme/apply"},
+            }
+        )
+
+        files = list((Paths.APPLICATIONS / "acme" / "network").iterdir())
+        assert len(files) == 1 and files[0].name.endswith("_post.json")
+
     def test_caps_body_size(self, tmp_app_root: Path, mock_app_logger: MagicMock):
         rec = NetworkRecorder("acme", mock_app_logger)
         huge_body = "x" * 20000
