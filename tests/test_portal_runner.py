@@ -1,12 +1,13 @@
 """PortalRunner — credential injection (portal_password + LinkedIn SSO)."""
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import fill
 from fill import (
+    AgentStoppedEarly,
     ApplicationRecorder,
     CredentialsResolver,
     JsonlTracker,
@@ -152,6 +153,49 @@ class TestCleanStaleLocks:
                               cred_resolver=cred_resolver, applied=applied_tracker,
                               attempted=attempted_tracker, recorder=recorder)
         runner._clean_stale_locks(profile)  # no exception
+
+
+class TestRunAgentOutcome:
+    @staticmethod
+    def _agent_returning(*, is_done: bool) -> MagicMock:
+        history = MagicMock()
+        history.is_done.return_value = is_done
+        history.final_result.return_value = "applied to 2 roles" if is_done else None
+        history.history = [object()] * 3
+        agent = MagicMock()
+        agent.run = AsyncMock(return_value=history)
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_stopped_without_done_is_a_failure(
+        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
+        yaml_store: YamlStore, mock_app_logger: MagicMock,
+        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+    ):
+        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
+                              mock_app_logger=mock_app_logger, task_builder=task_builder,
+                              cred_resolver=cred_resolver, applied=applied_tracker,
+                              attempted=attempted_tracker, recorder=recorder)
+        with pytest.raises(AgentStoppedEarly, match="3 steps"):
+            await runner._run_agent(self._agent_returning(is_done=False))
+
+    @pytest.mark.asyncio
+    async def test_done_returns_final_result(
+        self, tmp_app_root: Path, sample_system: dict, run_opts: RunOptions,
+        yaml_store: YamlStore, mock_app_logger: MagicMock,
+        task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
+        applied_tracker: JsonlTracker, attempted_tracker: JsonlTracker,
+        recorder: ApplicationRecorder,
+    ):
+        runner = _make_runner(sample_system, opts=run_opts, yaml_store=yaml_store,
+                              mock_app_logger=mock_app_logger, task_builder=task_builder,
+                              cred_resolver=cred_resolver, applied=applied_tracker,
+                              attempted=attempted_tracker, recorder=recorder)
+        assert await runner._run_agent(self._agent_returning(is_done=True)) == (
+            "applied to 2 roles"
+        )
 
 
 class TestProxyWiring:

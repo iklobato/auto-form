@@ -1441,6 +1441,14 @@ class AgentActions:
 
 # ── Per-portal runner ─────────────────────────────────────────────────────────
 
+class AgentStoppedEarly(RuntimeError):
+    """The agent hit max_steps or max_failures without calling `done`.
+
+    browser_use returns the history instead of raising in that case, so without
+    this the portal is reported as a success and never retried.
+    """
+
+
 class PortalRunner:
     """Runs the apply flow for one portal end-to-end."""
 
@@ -1604,6 +1612,10 @@ class PortalRunner:
         self.app_logger.emit("portal_done", portal=self.name,
                              elapsed_s=round(elapsed, 1), steps=steps,
                              result_preview=final[:300])
+        if not history.is_done():
+            raise AgentStoppedEarly(
+                f"{self.name}: agent stopped after {steps} steps without calling done"
+            )
         return final
 
 
