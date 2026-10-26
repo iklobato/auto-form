@@ -1,5 +1,7 @@
 """YamlStore — load + atomic credential updates."""
 
+import asyncio
+import fcntl
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,52 @@ class TestYamlStoreLoad:
         path.write_text(yaml.dump({"sources": [{"name": "x"}]}))
         store = YamlStore(path)
         assert store.load()["sources"][0]["name"] == "x"
+
+
+class TestUpdateCredentialsSafety:
+    @pytest.mark.asyncio
+    async def test_waits_for_another_process_holding_the_lock(
+        self, systems_yaml_file: Path
+    ):
+        store = YamlStore(systems_yaml_file)
+        lock_path = systems_yaml_file.with_name(systems_yaml_file.name + ".lock")
+        with open(lock_path, "w") as other_process:
+            fcntl.flock(other_process, fcntl.LOCK_EX)
+            update = asyncio.create_task(store.update_credentials("acme", "u", "p"))
+            await asyncio.sleep(0.3)
+            assert "u" != store.load()["systems"][0].get("credentials", {}).get(
+                "username"
+            )
+            fcntl.flock(other_process, fcntl.LOCK_UN)
+        await asyncio.wait_for(update, timeout=5)
+        assert store.load()["systems"][0]["credentials"]["username"] == "u"
+
+    @pytest.mark.asyncio
+    async def test_failed_write_keeps_original_and_leaves_no_temp_file(
+        self, systems_yaml_file: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        before = systems_yaml_file.read_text()
+        systems_yaml_file.chmod(0o640)
+
+        def disk_full(fd):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("fill.os.fsync", disk_full)
+        with pytest.raises(OSError):
+            await YamlStore(systems_yaml_file).update_credentials("acme", "u", "p")
+
+        assert systems_yaml_file.read_text() == before
+        assert [
+            p.name
+            for p in systems_yaml_file.parent.iterdir()
+            if p.name.startswith(".systems.yaml.")
+        ] == []
+
+    @pytest.mark.asyncio
+    async def test_keeps_file_permissions(self, systems_yaml_file: Path):
+        systems_yaml_file.chmod(0o600)
+        await YamlStore(systems_yaml_file).update_credentials("acme", "u", "p")
+        assert systems_yaml_file.stat().st_mode & 0o777 == 0o600
 
 
 class TestUpdateCredentials:
@@ -44,10 +92,21 @@ class TestUpdateCredentials:
     @pytest.mark.asyncio
     async def test_removes_env_pointers_when_setting_direct(self, tmp_path: Path):
         path = tmp_path / "s.yaml"
-        path.write_text(yaml.dump({"systems": [{
-            "name": "x",
-            "credentials": {"username_env": "X_USER", "password_env": "X_PWD"},
-        }]}))
+        path.write_text(
+            yaml.dump(
+                {
+                    "systems": [
+                        {
+                            "name": "x",
+                            "credentials": {
+                                "username_env": "X_USER",
+                                "password_env": "X_PWD",
+                            },
+                        }
+                    ]
+                }
+            )
+        )
         store = YamlStore(path)
         await store.update_credentials("x", "u@x", "pw")
         creds = store.load()["systems"][0]["credentials"]

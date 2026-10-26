@@ -1,7 +1,6 @@
 """LLMFactory — token check, model resolution, env hygiene."""
 
-import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -39,6 +38,7 @@ class TestCreate:
         clean_env.setenv("OPENROUTER_TOKEN", "token")
         clean_env.setenv("ANTHROPIC_API_KEY", "leaked-key")
         import os
+
         with patch("fill.ChatOpenRouter"):
             LLMFactory.create()
         assert "ANTHROPIC_API_KEY" not in os.environ

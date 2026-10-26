@@ -17,18 +17,23 @@ class TestLoadKeys:
     def test_extracts_default_key(self, tmp_path: Path):
         f = tmp_path / "x.jsonl"
         f.write_text(
-            json.dumps({"job_url": "https://a"}) + "\n"
-            + json.dumps({"job_url": "https://b"}) + "\n"
+            json.dumps({"job_url": "https://a"})
+            + "\n"
+            + json.dumps({"job_url": "https://b"})
+            + "\n"
         )
         assert JsonlTracker(f).load_keys() == {"https://a", "https://b"}
 
     def test_skips_malformed_lines(self, tmp_path: Path):
         f = tmp_path / "x.jsonl"
         f.write_text(
-            json.dumps({"job_url": "https://a"}) + "\n"
+            json.dumps({"job_url": "https://a"})
+            + "\n"
             + "not-json\n"
-            + json.dumps({"missing_key": "x"}) + "\n"
-            + json.dumps({"job_url": "https://b"}) + "\n"
+            + json.dumps({"missing_key": "x"})
+            + "\n"
+            + json.dumps({"job_url": "https://b"})
+            + "\n"
         )
         assert JsonlTracker(f).load_keys() == {"https://a", "https://b"}
 

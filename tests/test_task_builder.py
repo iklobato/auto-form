@@ -12,9 +12,7 @@ class TestPrimaryUrlSelection:
         task = task_builder.build(sample_system, "K", RunOptions())
         assert "URL=https://acme.example.com/jobs?q=python" in task
 
-    def test_falls_back_to_url_when_no_search_url(
-        self, task_builder: TaskBuilder
-    ):
+    def test_falls_back_to_url_when_no_search_url(self, task_builder: TaskBuilder):
         sys = {"name": "x", "url": "https://x.example.com/"}
         task = task_builder.build(sys, "K", RunOptions())
         assert "URL=https://x.example.com/" in task
@@ -36,24 +34,33 @@ class TestLoginLine:
 
 
 class TestDryRun:
-    def test_appends_dry_run_warning(self, task_builder: TaskBuilder, sample_system: dict):
+    def test_appends_dry_run_warning(
+        self, task_builder: TaskBuilder, sample_system: dict
+    ):
         task = task_builder.build(sample_system, "K", RunOptions(dry_run=True))
         assert "Do NOT click Apply" in task
 
-    def test_no_warning_when_apply_mode(self, task_builder: TaskBuilder, sample_system: dict):
+    def test_no_warning_when_apply_mode(
+        self, task_builder: TaskBuilder, sample_system: dict
+    ):
         task = task_builder.build(sample_system, "K", RunOptions(dry_run=False))
         assert "Do NOT click Apply" not in task
 
 
 class TestKeywordFilter:
-    def test_filter_keyword_renders(self, task_builder: TaskBuilder, sample_system: dict):
-        task = task_builder.build(sample_system, "K", RunOptions(filter_keyword="backend"))
+    def test_filter_keyword_renders(
+        self, task_builder: TaskBuilder, sample_system: dict
+    ):
+        task = task_builder.build(
+            sample_system, "K", RunOptions(filter_keyword="backend")
+        )
         assert "backend" in task and "Only consider roles" in task
 
 
 class TestEnvExpansion:
-    def test_expands_env_vars_in_url(self, task_builder: TaskBuilder,
-                                     monkeypatch: pytest.MonkeyPatch):
+    def test_expands_env_vars_in_url(
+        self, task_builder: TaskBuilder, monkeypatch: pytest.MonkeyPatch
+    ):
         monkeypatch.setenv("ACME_URL", "https://expanded.example.com/")
         sys = {"name": "x", "url": "$ACME_URL"}
         task = task_builder.build(sys, "K", RunOptions())
@@ -61,14 +68,27 @@ class TestEnvExpansion:
 
 
 class TestResume:
-    def test_resume_path_threaded_through(self, task_builder: TaskBuilder, sample_system: dict):
-        task = task_builder.build(sample_system, "K",
-                                  RunOptions(resume_path="/tmp/cv.pdf"))
+    def test_resume_path_threaded_through(
+        self, task_builder: TaskBuilder, sample_system: dict
+    ):
+        task = task_builder.build(
+            sample_system, "K", RunOptions(resume_path="/tmp/cv.pdf")
+        )
         assert "/tmp/cv.pdf" in task
 
-    def test_default_inner_when_no_resume(self, task_builder: TaskBuilder, sample_system: dict):
+    def test_default_inner_when_no_resume(
+        self, task_builder: TaskBuilder, sample_system: dict
+    ):
         task = task_builder.build(sample_system, "K", RunOptions())
         assert "no resume path configured" in task
+
+    def test_dry_run_tells_the_agent_not_to_submit(
+        self, task_builder: TaskBuilder, sample_system: dict
+    ):
+        dry = task_builder.build(sample_system, "K", RunOptions(dry_run=True))
+        real = task_builder.build(sample_system, "K", RunOptions())
+        assert dry.startswith("DRY RUN.") and "do NOT click the final submit" in dry
+        assert "DRY RUN" not in real
 
 
 class TestKnowledgeInjection:

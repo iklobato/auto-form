@@ -18,8 +18,8 @@ import pytest
 from fill import KnowledgeBase
 from tests.fixtures.forms import ALL_FORMS, FormField
 
-
 # Module-level fixture: real on-disk knowledge base, loaded once per session.
+
 
 @pytest.fixture(scope="module")
 def real_knowledge() -> str:
@@ -53,7 +53,9 @@ class TestRequiredFieldsCovered:
     """For every required field, the expected answer must appear in the knowledge base."""
 
     @pytest.mark.parametrize(
-        "case", _flatten_forms(), ids=_id,
+        "case",
+        _flatten_forms(),
+        ids=_id,
     )
     def test_required_field_answer_in_knowledge(
         self, case: tuple[str, FormField], real_knowledge: str
@@ -75,16 +77,17 @@ class TestDropdownOptionsAvailable:
     one of the offered options (substring match)."""
 
     @pytest.mark.parametrize(
-        "case", _flatten_forms(), ids=_id,
+        "case",
+        _flatten_forms(),
+        ids=_id,
     )
-    def test_expected_answer_matches_an_option(
-        self, case: tuple[str, FormField]
-    ):
+    def test_expected_answer_matches_an_option(self, case: tuple[str, FormField]):
         _, field = case
         if field.kind not in ("dropdown", "radio") or not field.options:
             pytest.skip("free-form or no options declared")
-        matching = [opt for opt in field.options
-                    if field.expect_in.lower() in opt.lower()]
+        matching = [
+            opt for opt in field.options if field.expect_in.lower() in opt.lower()
+        ]
         assert matching, (
             f"Field {field.label!r}: no option in {field.options!r} contains "
             f"the expected answer {field.expect_in!r}. The fixture is wrong, or "
@@ -96,7 +99,9 @@ class TestRequiredFieldsHaveAnExpectation:
     """Sanity check: every fixture entry has an expect_in. Catches typos."""
 
     @pytest.mark.parametrize(
-        "case", _flatten_forms(), ids=_id,
+        "case",
+        _flatten_forms(),
+        ids=_id,
     )
     def test_expect_in_is_non_empty(self, case: tuple[str, FormField]):
         _, field = case

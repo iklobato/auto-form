@@ -20,15 +20,21 @@ import argparse
 import asyncio
 import base64
 import fcntl
+import inspect
 import json
 import logging
 import logging.handlers
 import os
+import re
 import secrets
+import socket
+import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 import yaml
@@ -44,8 +50,10 @@ load_dotenv()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
+
 class Paths:
     """All filesystem locations the app reads or writes."""
+
     ROOT = Path(__file__).parent
     KNOWLEDGE = ROOT / "knowledge"
     TASK_TEMPLATE = ROOT / "prompts" / "task.md"
@@ -60,9 +68,11 @@ class Paths:
 
 # ── Options ───────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class RunOptions:
     """Per-run knobs passed from the CLI down to PortalRunner."""
+
     dry_run: bool = False
     headless: bool = False
     fast: bool = False
@@ -71,8 +81,17 @@ class RunOptions:
     note: str = ""
     resume_path: str = ""
 
+    def resume_for(self, system: dict) -> str:
+        """A portal's own resume_path overrides the run-wide one.
+
+        The prompt and the upload allowlist must agree, or the agent is told to
+        upload a file browser_use then refuses.
+        """
+        return expand_env(system.get("resume_path", "")) or self.resume_path
+
 
 # ── Logging ───────────────────────────────────────────────────────────────────
+
 
 class _SuppressFilter(logging.Filter):
     """Drops log records whose message contains any of the given substrings."""
@@ -94,8 +113,15 @@ class AppLogger:
         "CDP request ax_tree failed",
         "Exception in background task [get_ax_tree]",
     )
-    QUIET_LIBS = ("browser_use", "BrowserSession", "Agent", "utils",
-                  "httpx", "asyncio", "playwright")
+    QUIET_LIBS = (
+        "browser_use",
+        "BrowserSession",
+        "Agent",
+        "utils",
+        "httpx",
+        "asyncio",
+        "playwright",
+    )
     FILTERED_LIBS = ("Agent", "browser_use", "BrowserSession", "utils")
 
     def __init__(self, run_id: str | None = None):
@@ -144,17 +170,28 @@ class AppLogger:
     def set_trace(self) -> None:
         """Maximum verbosity: DEBUG everywhere, including browser_use internals."""
         self._console.setLevel(logging.DEBUG)
-        for lib in ("browser_use", "BrowserSession", "Agent", "utils",
-                    "httpx", "playwright"):
+        for lib in (
+            "browser_use",
+            "BrowserSession",
+            "Agent",
+            "utils",
+            "httpx",
+            "playwright",
+        ):
             logging.getLogger(lib).setLevel(logging.DEBUG)
 
     def emit(self, event_type: str, **kwargs) -> None:
-        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": event_type, **kwargs}
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "event": event_type,
+            **kwargs,
+        }
         with open(self.events_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def expand_env(value: str) -> str:
     """Expand ${VARS} in a string. Empty input returns empty string."""
@@ -162,6 +199,7 @@ def expand_env(value: str) -> str:
 
 
 # ── YAML I/O ──────────────────────────────────────────────────────────────────
+
 
 class YamlStore:
     """Read + atomic write of a systems YAML file (works for both `systems:` and `sources:` schemas)."""
@@ -174,8 +212,22 @@ class YamlStore:
     def load(self) -> dict:
         return yaml.safe_load(self.path.read_text())
 
-    async def update_credentials(self, system_name: str, username: str, password: str) -> None:
+    async def update_credentials(
+        self, system_name: str, username: str, password: str
+    ) -> None:
         async with self._lock:
+            await asyncio.to_thread(
+                self._update_credentials, system_name, username, password
+            )
+
+    def _update_credentials(
+        self, system_name: str, username: str, password: str
+    ) -> None:
+        # The asyncio lock only covers this process; flock also serializes
+        # separate `fill.py --system X` runs sharing the same yaml.
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
             raw = self.load()
             key = "systems" if "systems" in raw else "sources"
             for system in raw.get(key) or []:
@@ -186,19 +238,41 @@ class YamlStore:
                     creds.pop("username_env", None)
                     creds.pop("password_env", None)
                     break
-            self.path.write_text(yaml.dump(
-                raw, allow_unicode=True, sort_keys=False,
-                default_flow_style=False, width=120,
-            ))
+            self._replace(
+                yaml.dump(
+                    raw,
+                    allow_unicode=True,
+                    sort_keys=False,
+                    default_flow_style=False,
+                    width=120,
+                )
+            )
+
+    def _replace(self, text: str) -> None:
+        """Write to a sibling temp file, then rename, so a crash never truncates the yaml."""
+        mode = self.path.stat().st_mode & 0o777
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.name}.")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, mode)
+            os.replace(tmp, self.path)
+        except BaseException:
+            os.unlink(tmp)
+            raise
 
 
 # ── Knowledge base ────────────────────────────────────────────────────────────
 
+
 class KnowledgeBase:
     """Concatenates all .md files in the knowledge directory into one prompt section."""
 
-    def __init__(self, dir_path: Path = Paths.KNOWLEDGE,
-                 log: logging.Logger | None = None):
+    def __init__(
+        self, dir_path: Path = Paths.KNOWLEDGE, log: logging.Logger | None = None
+    ):
         self.dir = dir_path
         self.log = log or logging.getLogger("auto-form")
         self._cache: str | None = None
@@ -214,12 +288,16 @@ class KnowledgeBase:
             self.log.debug("  knowledge file: %s (%d chars)", f.name, len(content))
             sections.append(content)
         self._cache = "\n\n---\n\n".join(sections)
-        self.log.info("Knowledge base ready — %d total chars across %d files",
-                      len(self._cache), len(files))
+        self.log.info(
+            "Knowledge base ready — %d total chars across %d files",
+            len(self._cache),
+            len(files),
+        )
         return self._cache
 
 
 # ── Credentials ───────────────────────────────────────────────────────────────
+
 
 class CredentialsResolver:
     """Resolves portal credentials. Direct yaml values take priority over env-var refs."""
@@ -264,8 +342,20 @@ DEFAULT_FILTER_NOTES = (
 class TaskBuilder:
     """Renders the task.md prompt template for one portal."""
 
-    def __init__(self, template_path: Path = Paths.TASK_TEMPLATE,
-                 log: logging.Logger | None = None):
+    # The browser blocks submits in a dry run anyway (DryRunGuard); this keeps the
+    # agent from burning steps retrying a submit that can never go through.
+    DRY_RUN_NOTICE = (
+        "DRY RUN. This is a test run. Fill each application form completely, but do "
+        "NOT click the final submit/apply/send button, and do not create accounts. "
+        "Any submit is blocked by the browser and will fail. When a form is filled, "
+        "call mark_applied for it (nothing is recorded in a dry run) and move on."
+    )
+
+    def __init__(
+        self,
+        template_path: Path = Paths.TASK_TEMPLATE,
+        log: logging.Logger | None = None,
+    ):
         self.template_path = template_path
         self.log = log or logging.getLogger("auto-form")
 
@@ -278,10 +368,11 @@ class TaskBuilder:
         login_line = self._login_line(system, login_url, url, primary_url)
         search_url_line = (
             f"Start your search at: {search_url}\n"
-            if search_url and search_url != primary_url else ""
+            if search_url and search_url != primary_url
+            else ""
         )
         filter_line = self._filter_line(opts)
-        effective_resume = expand_env(system.get("resume_path", "")) or opts.resume_path
+        effective_resume = opts.resume_for(system)
 
         substitutions = {
             "url": primary_url,
@@ -289,19 +380,25 @@ class TaskBuilder:
             "login_line": login_line,
             "search_url_line": search_url_line,
             "best_for_line": self._best_for_line(system),
-            "search_instructions": system.get("search_instructions",
-                                              "Browse all listed roles.").strip(),
+            "search_instructions": system.get(
+                "search_instructions", "Browse all listed roles."
+            ).strip(),
             "filter_notes_line": self._filter_notes_line(system),
             "application_notes_line": self._application_notes_line(system),
             "account_line": self._account_line(system),
-            "form_hints": system.get("form_hints",
-                                     "Fill every visible field using my profile.").strip(),
+            "form_hints": system.get(
+                "form_hints", "Fill every visible field using my profile."
+            ).strip(),
             "filter_line": filter_line,
             "note_line": f"Note: {opts.note}" if opts.note else "",
-            "resume_line": f"Resume upload: {effective_resume}" if effective_resume else "",
+            "resume_line": (
+                f"Resume upload: {effective_resume}" if effective_resume else ""
+            ),
             "resume_line_inner": effective_resume or "no resume path configured",
         }
         task = self.template_path.read_text().format(**substitutions).strip()
+        if opts.dry_run:
+            task = f"{self.DRY_RUN_NOTICE}\n\n{task}"
         self.log.debug("  task built — %d chars", len(task))
         return task
 
@@ -341,51 +438,91 @@ class TaskBuilder:
     def _filter_line(opts: RunOptions) -> str:
         line = ""
         if opts.filter_keyword:
-            line = (f'Only consider roles whose title or description contains '
-                    f'"{opts.filter_keyword}".')
+            line = (
+                f"Only consider roles whose title or description contains "
+                f'"{opts.filter_keyword}".'
+            )
         if opts.dry_run:
-            line += ("\nDo NOT click Apply or submit any forms. "
-                     "Only assess each role and report which ones would be a match.")
+            line += (
+                "\nDo NOT click Apply or submit any forms. "
+                "Only assess each role and report which ones would be a match."
+            )
         return line
 
 
 # ── HTTP backoff transport ────────────────────────────────────────────────────
 
+
 class BackoffTransport(httpx.AsyncBaseTransport):
     """Wraps another transport, retrying 429/5xx with exponential backoff."""
 
     RETRY_STATUSES = (429, 500, 502, 503, 504)
+    # browser_use cancels an LLM call after llm_timeout (75s for the default gemini
+    # model). The slowest agent step in logs/events.jsonl (154 steps, May 2026) took
+    # 19.8s, so 45s of total sleep leaves ~30s for the call that finally succeeds.
+    MAX_TOTAL_WAIT_S = 45.0
 
-    def __init__(self, wrapped: httpx.AsyncBaseTransport, *,
-                 max_retries: int = 5, base_wait: float = 2.0, max_wait: float = 60.0,
-                 log: logging.Logger | None = None):
+    def __init__(
+        self,
+        wrapped: httpx.AsyncBaseTransport,
+        *,
+        max_retries: int = 5,
+        base_wait: float = 2.0,
+        max_wait: float = 60.0,
+        max_total_wait: float = MAX_TOTAL_WAIT_S,
+        log: logging.Logger | None = None,
+    ):
         self._wrapped = wrapped
         self._max_retries = max_retries
         self._base_wait = base_wait
         self._max_wait = max_wait
+        self._max_total_wait = max_total_wait
         self._log = log or logging.getLogger("auto-form")
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        waited = 0.0
         for attempt in range(self._max_retries + 1):
             response = await self._wrapped.handle_async_request(request)
-            if response.status_code not in self.RETRY_STATUSES or attempt == self._max_retries:
+            if (
+                response.status_code not in self.RETRY_STATUSES
+                or attempt == self._max_retries
+            ):
                 return response
             wait = self._compute_wait(response.headers.get("retry-after"), attempt)
+            if waited + wait > self._max_total_wait:
+                self._log.warning(
+                    "HTTP %d from %s: next wait %.1fs would pass the %.0fs retry budget, giving up",
+                    response.status_code,
+                    request.url,
+                    wait,
+                    self._max_total_wait,
+                )
+                return response
+            # Release the pooled connection of the response we are discarding
+            await response.aclose()
             self._log.warning(
                 "HTTP %d from %s — retrying in %.1fs (attempt %d/%d)",
-                response.status_code, request.url, wait, attempt + 1, self._max_retries,
+                response.status_code,
+                request.url,
+                wait,
+                attempt + 1,
+                self._max_retries,
             )
             await asyncio.sleep(wait)
+            waited += wait
         return response
 
     def _compute_wait(self, retry_after_header: str | None, attempt: int) -> float:
         if retry_after_header:
             try:
-                return float(retry_after_header)
+                return min(float(retry_after_header), self._max_wait)
             except ValueError:
-                self._log.debug("BackoffTransport: unparseable Retry-After=%r, "
-                                "using exponential backoff", retry_after_header)
-        return min(self._base_wait * (2 ** attempt), self._max_wait)
+                self._log.debug(
+                    "BackoffTransport: unparseable Retry-After=%r, "
+                    "using exponential backoff",
+                    retry_after_header,
+                )
+        return min(self._base_wait * (2**attempt), self._max_wait)
 
     async def aclose(self) -> None:
         await self._wrapped.aclose()
@@ -393,14 +530,16 @@ class BackoffTransport(httpx.AsyncBaseTransport):
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 
+
 class LLMFactory:
     """Creates configured ChatOpenRouter clients with HTTP backoff."""
 
     DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
 
     @classmethod
-    def create(cls, model: str | None = None,
-               log: logging.Logger | None = None) -> ChatOpenRouter:
+    def create(
+        cls, model: str | None = None, log: logging.Logger | None = None
+    ) -> ChatOpenRouter:
         log = log or logging.getLogger("auto-form")
         token = os.getenv("OPENROUTER_TOKEN")
         if not token:
@@ -413,15 +552,18 @@ class LLMFactory:
             transport=transport,
             timeout=httpx.Timeout(connect=30.0, read=300.0, write=60.0, pool=10.0),
         )
-        return ChatOpenRouter(model=chosen, api_key=token,
-                              http_client=client, max_retries=0)
+        return ChatOpenRouter(
+            model=chosen, api_key=token, http_client=client, max_retries=0
+        )
 
 
 # ── Proxy providers ──────────────────────────────────────────────────────────
 
+
 @dataclass(frozen=True)
 class Proxy:
-    """One HTTP/SOCKS proxy. Value object — providers mint these, runner consumes."""
+    """One HTTP/SOCKS proxy. Value object: providers mint these, runner consumes."""
+
     host: str
     port: int
     username: str | None = None
@@ -429,8 +571,15 @@ class Proxy:
     scheme: str = "http"
     label: str = ""
 
+    def __post_init__(self):
+        if self.scheme.startswith("socks") and (self.username or self.password):
+            raise ValueError(
+                f"{self.label or 'proxy'}: Chrome cannot authenticate to SOCKS proxies; "
+                "use an http proxy or an IP-allowlisted SOCKS one"
+            )
+
     def to_browser_profile(self) -> dict:
-        """Adapter to browser_use ProxySettings — keeps providers framework-agnostic."""
+        """Adapter to browser_use ProxySettings, keeps providers framework-agnostic."""
         return {
             "server": f"{self.scheme}://{self.host}:{self.port}",
             "username": self.username,
@@ -445,16 +594,28 @@ class ProxyProvider(Protocol):
 
 
 class StaticProxyProvider:
-    """Single fixed proxy from yaml/env — cheapest path, useful for self-hosted gateways."""
+    """Single fixed proxy from yaml/env: cheapest path, useful for self-hosted gateways."""
 
-    def __init__(self, *, host: str, port: int, scheme: str = "http",
-                 username: str | None = None, password: str | None = None,
-                 label: str = "static"):
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        scheme: str = "http",
+        username: str | None = None,
+        password: str | None = None,
+        label: str = "static",
+    ):
         if not host:
             raise ValueError("StaticProxyProvider requires a host")
-        self._proxy = Proxy(host=host, port=int(port), scheme=scheme,
-                            username=username or None, password=password or None,
-                            label=label)
+        self._proxy = Proxy(
+            host=host,
+            port=int(port),
+            scheme=scheme,
+            username=username or None,
+            password=password or None,
+            label=label,
+        )
 
     def acquire(self, portal: str) -> Proxy:
         return self._proxy
@@ -465,7 +626,8 @@ class ProxyListProvider:
 
     def __init__(self, *, path: Path, scheme: str = "http"):
         raw = path.read_text().splitlines()
-        lines = [l.strip() for l in raw if l.strip() and not l.startswith("#")]
+        stripped = (line.strip() for line in raw)
+        lines = [line for line in stripped if line and not line.startswith("#")]
         if not lines:
             raise ValueError(f"ProxyListProvider: no entries in {path}")
         self._proxies = [self._parse(line, scheme) for line in lines]
@@ -473,14 +635,21 @@ class ProxyListProvider:
 
     @staticmethod
     def _parse(line: str, scheme: str) -> Proxy:
-        parts = line.split(":")
+        # maxsplit keeps a ':' inside the password
+        parts = line.split(":", 3)
         if len(parts) == 2:
             host, port = parts
             return Proxy(host=host, port=int(port), scheme=scheme, label="list")
         if len(parts) == 4:
             host, port, user, pwd = parts
-            return Proxy(host=host, port=int(port), scheme=scheme,
-                         username=user, password=pwd, label="list")
+            return Proxy(
+                host=host,
+                port=int(port),
+                scheme=scheme,
+                username=user,
+                password=pwd,
+                label="list",
+            )
         raise ValueError(
             f"ProxyListProvider: bad line {line!r}; expected host:port or host:port:user:pass"
         )
@@ -492,66 +661,102 @@ class ProxyListProvider:
 
 
 class WebshareProvider:
-    """Webshare.io paid provider — pulls the first usable proxy from the v2 API."""
+    """Webshare.io paid provider: round-robins over the valid proxies from the v2 API."""
 
     API_URL = "https://proxy.webshare.io/api/v2/proxy/list/"
+    PAGE_SIZE = 100
 
-    def __init__(self, *, token: str, mode: str = "direct",
-                 country: str | None = None, scheme: str = "http",
-                 http: httpx.Client | None = None):
+    def __init__(
+        self,
+        *,
+        token: str,
+        mode: str = "direct",
+        country: str | None = None,
+        scheme: str = "http",
+        http: httpx.Client | None = None,
+    ):
         if not token:
             raise ValueError("WebshareProvider requires a token")
+        if mode == "backbone":
+            # backbone entries carry proxy_address=null; the endpoint is a shared gateway
+            raise ValueError(
+                "WebshareProvider supports mode 'direct' only, not 'backbone'"
+            )
         self._token = token
         self._mode = mode
         self._country = country
         self._scheme = scheme
         self._http = http or httpx.Client(timeout=15.0)
+        self._cursor = 0
 
     def acquire(self, portal: str) -> Proxy:
-        params: dict[str, object] = {"mode": self._mode, "page_size": 1}
+        params: dict[str, object] = {"mode": self._mode, "page_size": self.PAGE_SIZE}
         if self._country:
             params["country_code__in"] = self._country
         r = self._http.get(
-            self.API_URL, params=params,
+            self.API_URL,
+            params=params,
             headers={"Authorization": f"Token {self._token}"},
         )
         r.raise_for_status()
-        results = r.json().get("results") or []
+        results = [
+            p
+            for p in r.json().get("results") or []
+            if p.get("valid", True) and p.get("proxy_address")
+        ]
         if not results:
-            raise RuntimeError(f"Webshare returned no proxies for portal={portal}")
-        p = results[0]
+            raise RuntimeError(
+                f"Webshare returned no valid proxies for portal={portal}"
+            )
+        p = results[self._cursor % len(results)]
+        self._cursor += 1
         return Proxy(
-            host=p["proxy_address"], port=int(p["port"]),
-            username=p["username"], password=p["password"],
+            host=p["proxy_address"],
+            port=int(p["port"]),
+            username=p["username"],
+            password=p["password"],
             scheme=self._scheme,
             label=f"webshare:{p.get('country_code', '?')}",
         )
 
 
 class BrightDataProvider:
-    """Bright Data residential/datacenter gateway — fixed host, per-zone composite username."""
+    """Bright Data residential/datacenter gateway: fixed host, per-zone composite username."""
 
     DEFAULT_HOST = "brd.superproxy.io"
     DEFAULT_PORT = 22225
 
-    def __init__(self, *, customer: str, zone: str, password: str,
-                 host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
-                 country: str | None = None, scheme: str = "http"):
+    def __init__(
+        self,
+        *,
+        customer: str,
+        zone: str,
+        password: str,
+        host: str = DEFAULT_HOST,
+        port: int = DEFAULT_PORT,
+        country: str | None = None,
+        scheme: str = "http",
+    ):
         if not (customer and zone and password):
             raise ValueError("BrightDataProvider requires customer, zone, password")
         user = f"brd-customer-{customer}-zone-{zone}"
         if country:
             user += f"-country-{country}"
-        self._proxy = Proxy(host=host, port=port, scheme=scheme,
-                            username=user, password=password,
-                            label=f"brightdata:{zone}")
+        self._proxy = Proxy(
+            host=host,
+            port=port,
+            scheme=scheme,
+            username=user,
+            password=password,
+            label=f"brightdata:{zone}",
+        )
 
     def acquire(self, portal: str) -> Proxy:
         return self._proxy
 
 
 class LoggingProxyProvider:
-    """Decorator — logs every acquire so we know which proxy a portal got."""
+    """Decorator: logs every acquire so we know which proxy a portal got."""
 
     def __init__(self, inner: ProxyProvider, log: logging.Logger):
         self._inner = inner
@@ -559,16 +764,20 @@ class LoggingProxyProvider:
 
     def acquire(self, portal: str) -> Proxy:
         proxy = self._inner.acquire(portal)
-        self._log.info("proxy: portal=%s label=%s endpoint=%s:%d",
-                       portal, proxy.label, proxy.host, proxy.port)
+        self._log.info(
+            "proxy: portal=%s label=%s endpoint=%s:%d",
+            portal,
+            proxy.label,
+            proxy.host,
+            proxy.port,
+        )
         return proxy
 
 
 class CachingProxyProvider:
-    """Decorator — re-uses the last acquired proxy per portal for ttl_s seconds."""
+    """Decorator: re-uses the last acquired proxy per portal for ttl_s seconds."""
 
-    def __init__(self, inner: ProxyProvider, *, ttl_s: float,
-                 clock=time.monotonic):
+    def __init__(self, inner: ProxyProvider, *, ttl_s: float, clock=time.monotonic):
         if ttl_s <= 0:
             raise ValueError("CachingProxyProvider ttl_s must be > 0")
         self._inner = inner
@@ -586,12 +795,14 @@ class CachingProxyProvider:
         return proxy
 
 
+UNSET_ENV_REF = re.compile(r"\$\{?[A-Za-z_]\w*\}?")
+
+
 class ProxyProviderFactory:
-    """Builds a ProxyProvider from a config dict. Unknown kinds raise — no fallbacks."""
+    """Builds a ProxyProvider from a config dict. Unknown kinds raise, no fallbacks."""
 
     @classmethod
-    def build(cls, config: dict | None, *,
-              log: logging.Logger) -> ProxyProvider | None:
+    def build(cls, config: dict | None, *, log: logging.Logger) -> ProxyProvider | None:
         if not config:
             return None
         kind = config.get("kind")
@@ -604,9 +815,7 @@ class ProxyProviderFactory:
             "brightdata": cls._brightdata,
         }
         if kind not in builders:
-            raise ValueError(
-                f"Unknown proxy kind {kind!r}; known: {sorted(builders)}"
-            )
+            raise ValueError(f"Unknown proxy kind {kind!r}; known: {sorted(builders)}")
         provider: ProxyProvider = builders[kind](config)
         if config.get("cache_s"):
             provider = CachingProxyProvider(provider, ttl_s=float(config["cache_s"]))
@@ -617,16 +826,21 @@ class ProxyProviderFactory:
         port_raw = cfg.get("port")
         if port_raw is None:
             raise ValueError("static proxy requires 'port'")
-        username = (
-            expand_env(cfg.get("username", ""))
-            or (os.getenv(cfg["username_env"]) if cfg.get("username_env") else None)
+        username = expand_env(cfg.get("username", "")) or (
+            os.getenv(cfg["username_env"]) if cfg.get("username_env") else None
         )
-        password = (
-            expand_env(cfg.get("password", ""))
-            or (os.getenv(cfg["password_env"]) if cfg.get("password_env") else None)
+        password = expand_env(cfg.get("password", "")) or (
+            os.getenv(cfg["password_env"]) if cfg.get("password_env") else None
         )
+        host = expand_env(cfg.get("host", ""))
+        # expandvars leaves an unset ${VAR} as literal text, which Chrome would then use
+        if "$" in host:
+            raise ValueError(f"static proxy host references an unset env var: {host!r}")
+        for field, value in (("username", username), ("password", password)):
+            if value and UNSET_ENV_REF.fullmatch(value):
+                raise ValueError(f"static proxy {field} references an unset env var")
         return StaticProxyProvider(
-            host=expand_env(cfg.get("host", "")),
+            host=host,
             port=int(expand_env(str(port_raw)) or port_raw),
             scheme=cfg.get("scheme", "http"),
             username=username or None,
@@ -647,7 +861,8 @@ class ProxyProviderFactory:
         if not token:
             raise RuntimeError(f"{env_name} not set in env")
         return WebshareProvider(
-            token=token, mode=cfg.get("mode", "direct"),
+            token=token,
+            mode=cfg.get("mode", "direct"),
             country=cfg.get("country"),
             scheme=cfg.get("scheme", "http"),
         )
@@ -664,12 +879,65 @@ class ProxyProviderFactory:
                 f"BrightData requires {customer_env}, {password_env}, and zone"
             )
         return BrightDataProvider(
-            customer=customer, zone=zone, password=password,
+            customer=customer,
+            zone=zone,
+            password=password,
             country=cfg.get("country"),
         )
 
 
+def portal_proxy_provider(
+    system: dict, default: ProxyProvider | None, *, log: logging.Logger
+) -> ProxyProvider | None:
+    """A portal's own `proxy:` block overrides the run default. None = direct connection."""
+    if "proxy" in system:
+        return ProxyProviderFactory.build(system["proxy"], log=log)
+    return default
+
+
 # ── JSONL trackers ────────────────────────────────────────────────────────────
+
+TRACKING_QUERY_PARAMS = frozenset(
+    {
+        "gh_src",
+        "lever-source",
+        "lever-origin",
+        "ref",
+        "referrer",
+        "source",
+        "src",
+        "fbclid",
+        "gclid",
+        "mc_cid",
+        "mc_eid",
+        "trk",
+        "trackingid",
+        "refid",
+        "_ga",
+    }
+)
+
+
+def job_url_key(url: str) -> str:
+    """Key for "is this the same job" checks.
+
+    Ignores scheme, host case, a leading www., a trailing slash, the fragment and
+    tracking params, so a listing reached through a utm link still matches.
+    Job-id params (Greenhouse gh_jid, Workday ?jobId=) are kept.
+    """
+    parts = urlsplit(url.strip())
+    host = parts.netloc.lower().removeprefix("www.")
+    query = urlencode(
+        [
+            (k, v)
+            for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if k.lower() not in TRACKING_QUERY_PARAMS
+            and not k.lower().startswith("utm_")
+        ]
+    )
+    key = f"{host}{parts.path.rstrip('/')}"
+    return f"{key}?{query}" if query else key
+
 
 class JsonlTracker:
     """Thread-safe append-only JSONL store with shared/exclusive file locking."""
@@ -696,20 +964,36 @@ class JsonlTracker:
                         record = json.loads(line)
                     except json.JSONDecodeError as e:
                         skipped_malformed += 1
-                        self._log.warning("JsonlTracker: skipping malformed line %d in %s: %s",
-                                          lineno, self.path.name, e)
+                        self._log.warning(
+                            "JsonlTracker: skipping malformed line %d in %s: %s",
+                            lineno,
+                            self.path.name,
+                            e,
+                        )
                         continue
                     if key not in record:
                         skipped_missing_key += 1
-                        self._log.warning("JsonlTracker: line %d in %s missing key %r",
-                                          lineno, self.path.name, key)
+                        self._log.warning(
+                            "JsonlTracker: line %d in %s missing key %r",
+                            lineno,
+                            self.path.name,
+                            key,
+                        )
                         continue
                     out.add(record[key])
             finally:
                 fcntl.flock(f, fcntl.LOCK_UN)
-        self._log.debug("JsonlTracker.%s: loaded %d keys (skipped %d malformed, %d missing key)",
-                        self.path.name, len(out), skipped_malformed, skipped_missing_key)
+        self._log.debug(
+            "JsonlTracker.%s: loaded %d keys (skipped %d malformed, %d missing key)",
+            self.path.name,
+            len(out),
+            skipped_malformed,
+            skipped_missing_key,
+        )
         return out
+
+    def has_job(self, job_url: str) -> bool:
+        return job_url_key(job_url) in {job_url_key(u) for u in self.load_keys()}
 
     async def append(self, record: dict) -> None:
         line = json.dumps(record, ensure_ascii=False) + "\n"
@@ -722,11 +1006,13 @@ class JsonlTracker:
                     os.fsync(f.fileno())
                 finally:
                     fcntl.flock(f, fcntl.LOCK_UN)
-        self._log.debug("JsonlTracker.%s: appended record (%d bytes)",
-                        self.path.name, len(line))
+        self._log.debug(
+            "JsonlTracker.%s: appended record (%d bytes)", self.path.name, len(line)
+        )
 
 
 # ── Application records ───────────────────────────────────────────────────────
+
 
 class ApplicationRecorder:
     """Writes per-portal application JSON snapshots and updates an INDEX.md table."""
@@ -754,7 +1040,9 @@ class ApplicationRecorder:
         return json_path
 
     @staticmethod
-    def _append_index(portal_dir: Path, portal: str, record: dict, json_name: str) -> None:
+    def _append_index(
+        portal_dir: Path, portal: str, record: dict, json_name: str
+    ) -> None:
         index = portal_dir / "INDEX.md"
         new = not index.exists()
         with open(index, "a", encoding="utf-8") as f:
@@ -762,7 +1050,10 @@ class ApplicationRecorder:
                 f.write(f"# Applications — {portal}\n\n")
                 f.write("| When | Title | Salary | Location | URL | Record |\n")
                 f.write("|------|-------|--------|----------|-----|--------|\n")
-            esc = lambda s: (s or "—").replace("|", "\\|")
+
+            def esc(s: str | None) -> str:
+                return (s or "—").replace("|", "\\|")
+
             f.write(
                 f"| {record['applied_at']} | {esc(record['job_title'])} | "
                 f"{esc(record.get('salary'))} | {esc(record.get('location'))} | "
@@ -771,6 +1062,36 @@ class ApplicationRecorder:
 
 
 # ── Network capture ───────────────────────────────────────────────────────────
+
+
+def add_cdp_handler(cdp_client, method: str, callback) -> None:
+    """Subscribe `callback` to a CDP event without evicting other subscribers.
+
+    cdp_use keeps exactly one handler per event name, shared by every session on
+    the client, so a plain `register.X.y(cb)` silently replaces browser_use's own
+    watchdogs (dialog auto-accept, downloads) and our other recorders.
+    """
+    registry = cdp_client._event_registry
+    existing = registry._handlers.get(method)
+    callbacks = list(getattr(existing, "callbacks", [existing] if existing else []))
+    if callback in callbacks:
+        return
+    callbacks.append(callback)
+
+    async def fan_out(event, session_id=None):
+        for cb in callbacks:
+            try:
+                result = cb(event, session_id)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # one bad subscriber must not starve the others
+                logging.getLogger("auto-form").exception(
+                    "CDP handler failed for %s", method
+                )
+
+    fan_out.callbacks = callbacks
+    registry.register(method, fan_out)
+
 
 class NetworkRecorder:
     """Captures POST/PUT/PATCH HTTP requests via CDP for audit purposes.
@@ -784,27 +1105,60 @@ class NetworkRecorder:
 
     NOISE_FRAGMENTS = (
         # Google analytics/ads
-        "google-analytics", "googletagmanager", "doubleclick.net",
-        "google.com/rmkt", "google.com/ccm", "google.com/pagead",
+        "google-analytics",
+        "googletagmanager",
+        "doubleclick.net",
+        "google.com/rmkt",
+        "google.com/ccm",
+        "google.com/pagead",
         "google.com/recaptcha",
         # SaaS analytics
-        "segment.io", "segment.com", "mixpanel.com", "sentry.io",
-        "amplitude", "fullstory", "hotjar", "posthog.com",
+        "segment.io",
+        "segment.com",
+        "mixpanel.com",
+        "sentry.io",
+        "amplitude",
+        "fullstory",
+        "hotjar",
+        "posthog.com",
         # Error / RUM
-        "datadoghq", "newrelic", "rollbar", "bam.nr-data.net",
+        "datadoghq",
+        "newrelic",
+        "rollbar",
+        "bam.nr-data.net",
         # Social / ad pixels
-        "facebook.com/tr", "fbcdn.net", "px.ads.linkedin.com",
-        "analytics.tiktok.com", "analytics-ipv6.tiktokw", "tiktokw.us",
-        "adroll.com", "criteo.com", "taboola.com",
+        "facebook.com/tr",
+        "fbcdn.net",
+        "px.ads.linkedin.com",
+        "analytics.tiktok.com",
+        "analytics-ipv6.tiktokw",
+        "tiktokw.us",
+        "adroll.com",
+        "criteo.com",
+        "taboola.com",
         # Cloudflare anti-bot / insights / challenge
-        "cdn-cgi/rum", "cdn-cgi/challenge", "cloudflareinsights", "cloudflare-analytics",
+        "cdn-cgi/rum",
+        "cdn-cgi/challenge",
+        "cloudflareinsights",
+        "cloudflare-analytics",
         "perimeterx",
         # Marketing / chat widgets
-        "convertkit.com", "hubspot.com", "drift.com", "tawk.to",
-        "qualified.com", "autopilothq.com", "intercom", "zendesk",
+        "convertkit.com",
+        "hubspot.com",
+        "drift.com",
+        "tawk.to",
+        "qualified.com",
+        "autopilothq.com",
+        "intercom",
+        "zendesk",
         # Generic patterns
-        "/beacon", "/telemetry", "/heartbeat", "/collect", "/track/",
-        "/pixel", "/enrich_ipv6",
+        "/beacon",
+        "/telemetry",
+        "/heartbeat",
+        "/collect",
+        "/track/",
+        "/pixel",
+        "/enrich_ipv6",
     )
     INTERESTING_METHODS = ("POST", "PUT", "PATCH")
     BODY_CAP_BYTES = 8192
@@ -822,6 +1176,10 @@ class NetworkRecorder:
         # both main-page and sub-frame handlers — dedup on the unique requestId.
         self._seen_request_ids: set[str] = set()
 
+    def start_job(self) -> None:
+        """Forget earlier POSTs so mark_applied's evidence covers only this job."""
+        self.recent.clear()
+
     async def attach_if_needed(self, browser_session) -> None:
         """Idempotent — call from the step callback. Subscribes to CDP Network events."""
         if browser_session is None:
@@ -831,7 +1189,9 @@ class NetworkRecorder:
         if sid in self._attached_session_ids:
             return
         await cdp_session.cdp_client.send.Network.enable(session_id=sid)
-        cdp_session.cdp_client.register.Network.requestWillBeSent(self._on_request)
+        add_cdp_handler(
+            cdp_session.cdp_client, "Network.requestWillBeSent", self._on_request
+        )
         self._attached_session_ids.add(sid)
         self.plog.debug("NetworkRecorder attached to CDP session %s", sid[:12])
 
@@ -859,30 +1219,43 @@ class NetworkRecorder:
             "body": body[: self.BODY_CAP_BYTES],
             "body_truncated": len(body) > self.BODY_CAP_BYTES,
             "body_size": len(body),
-            "headers": {k: v for k, v in headers.items()
-                        if k.lower() in ("content-type", "origin", "referer")},
+            "headers": {
+                k: v
+                for k, v in headers.items()
+                if k.lower() in ("content-type", "origin", "referer")
+            },
             "parsed": self._parse_body(body, headers),
         }
         self.recent.append(capture)
         if len(self.recent) > self.RING_BUFFER_SIZE:
             self.recent.pop(0)
 
-        ts_compact = time.strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        path = self.captures_dir / f"{ts_compact}_{method.lower()}.json"
+        # time.strftime has no %f; the requestId keeps same-microsecond POSTs apart
+        ts_compact = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        safe_id = re.sub(r"[^\w.-]", "_", request_id)
+        stem = f"{ts_compact}_{safe_id}" if safe_id else ts_compact
+        path = self.captures_dir / f"{stem}_{method.lower()}.json"
         path.write_text(json.dumps(capture, ensure_ascii=False, indent=2))
         # DEBUG only — full record is on disk + attached to mark_applied. CDPDebugger
         # surfaces the response status of these POSTs at WARNING when 4xx/5xx.
         self.plog.debug("NETWORK %s %s (body %d bytes)", method, url[:80], len(body))
-        self.app_logger.emit("network_post", portal=self.portal_name,
-                             method=method, url=url, body_size=len(body),
-                             content_type=capture["headers"].get("content-type", ""))
+        self.app_logger.emit(
+            "network_post",
+            portal=self.portal_name,
+            method=method,
+            url=url,
+            body_size=len(body),
+            content_type=capture["headers"].get("content-type", ""),
+        )
 
     @staticmethod
     def _parse_body(body: str, headers: dict) -> dict | list | None:
         """Try JSON or form-urlencoded parsing. Returns None on any failure."""
         if not body:
             return None
-        ctype = (headers.get("Content-Type") or headers.get("content-type") or "").lower()
+        ctype = (
+            headers.get("Content-Type") or headers.get("content-type") or ""
+        ).lower()
         if "json" in ctype:
             try:
                 return json.loads(body)
@@ -890,6 +1263,7 @@ class NetworkRecorder:
                 return None
         if "form-urlencoded" in ctype:
             from urllib.parse import parse_qs
+
             try:
                 return parse_qs(body)
             except (ValueError, UnicodeDecodeError):
@@ -898,6 +1272,7 @@ class NetworkRecorder:
 
 
 # ── CDP debug logger ──────────────────────────────────────────────────────────
+
 
 class CDPDebugger:
     """Subscribes to extra CDP event streams for debugging visibility:
@@ -914,11 +1289,14 @@ class CDPDebugger:
     for offline inspection.
     """
 
-    INTERESTING_STATUS = (400, 401, 403, 404, 405, 408, 429,
-                          500, 502, 503, 504)
+    INTERESTING_STATUS = (400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504)
 
-    def __init__(self, portal_name: str, app_logger: AppLogger,
-                 noise_fragments: tuple[str, ...] = ()):
+    def __init__(
+        self,
+        portal_name: str,
+        app_logger: AppLogger,
+        noise_fragments: tuple[str, ...] = (),
+    ):
         self.portal_name = portal_name
         self.app_logger = app_logger
         self.plog = app_logger.portal(portal_name)
@@ -943,16 +1321,20 @@ class CDPDebugger:
         await client.send.Page.enable(session_id=sid)
         await client.send.Runtime.enable(session_id=sid)
         await client.send.Target.setDiscoverTargets(
-            params={"discover": True}, session_id=sid,
+            params={"discover": True},
+            session_id=sid,
         )
 
-        client.register.Network.requestWillBeSent(self._on_request_index)
-        client.register.Network.responseReceived(self._on_response)
-        client.register.Network.loadingFailed(self._on_loading_failed)
-        client.register.Page.frameNavigated(self._on_navigated)
-        client.register.Target.targetCreated(self._on_target_created)
-        client.register.Runtime.exceptionThrown(self._on_exception)
-        client.register.Page.javascriptDialogOpening(self._on_dialog)
+        for method, callback in (
+            ("Network.requestWillBeSent", self._on_request_index),
+            ("Network.responseReceived", self._on_response),
+            ("Network.loadingFailed", self._on_loading_failed),
+            ("Page.frameNavigated", self._on_navigated),
+            ("Target.targetCreated", self._on_target_created),
+            ("Runtime.exceptionThrown", self._on_exception),
+            ("Page.javascriptDialogOpening", self._on_dialog),
+        ):
+            add_cdp_handler(client, method, callback)
 
         self._attached_session_ids.add(sid)
         self.plog.debug("CDPDebugger attached to session %s", sid[:12])
@@ -980,14 +1362,21 @@ class CDPDebugger:
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "kind": "response",
-            "method": method, "url": url, "status": status,
+            "method": method,
+            "url": url,
+            "status": status,
             "mime_type": resp.get("mimeType", ""),
         }
         self._persist(record)
         if status in self.INTERESTING_STATUS:
             self.plog.warning("HTTP %d %s %s", status, method, url[:80])
-            self.app_logger.emit("http_error", portal=self.portal_name,
-                                 method=method, url=url, status=status)
+            self.app_logger.emit(
+                "http_error",
+                portal=self.portal_name,
+                method=method,
+                url=url,
+                status=status,
+            )
         else:
             self.plog.debug("HTTP %d %s %s", status, method, url[:80])
 
@@ -1001,13 +1390,21 @@ class CDPDebugger:
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "kind": "loading_failed",
-            "method": method, "url": url, "error": error, "canceled": canceled,
+            "method": method,
+            "url": url,
+            "error": error,
+            "canceled": canceled,
         }
         self._persist(record)
         if not canceled:
             self.plog.warning("NET FAIL %s %s — %s", method, url[:60], error)
-            self.app_logger.emit("network_failure", portal=self.portal_name,
-                                 method=method, url=url, error=error)
+            self.app_logger.emit(
+                "network_failure",
+                portal=self.portal_name,
+                method=method,
+                url=url,
+                error=error,
+            )
 
     def _on_navigated(self, event: dict, session_id: str | None = None) -> None:
         frame = event.get("frame", {}) or {}
@@ -1016,7 +1413,8 @@ class CDPDebugger:
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "kind": "frame_navigated",
-            "url": url, "is_main_frame": is_main,
+            "url": url,
+            "is_main_frame": is_main,
         }
         self._persist(record)
         if is_main:
@@ -1029,13 +1427,15 @@ class CDPDebugger:
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "kind": "target_created",
-            "target_type": ttype, "url": url,
+            "target_type": ttype,
+            "url": url,
         }
         self._persist(record)
         if ttype in ("page", "popup"):
             self.plog.info("→ NEW %s %s", ttype.upper(), url[:80])
-            self.app_logger.emit("popup_created", portal=self.portal_name,
-                                 target_type=ttype, url=url)
+            self.app_logger.emit(
+                "popup_created", portal=self.portal_name, target_type=ttype, url=url
+            )
 
     def _on_exception(self, event: dict, session_id: str | None = None) -> None:
         details = event.get("exceptionDetails", {}) or {}
@@ -1044,31 +1444,99 @@ class CDPDebugger:
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "kind": "js_exception",
-            "text": text, "description": exception_obj[:500],
+            "text": text,
+            "description": exception_obj[:500],
         }
         self._persist(record)
         self.plog.warning("JS ERROR %s — %s", text, exception_obj[:200])
-        self.app_logger.emit("js_exception", portal=self.portal_name,
-                             text=text, description=exception_obj[:500])
+        self.app_logger.emit(
+            "js_exception",
+            portal=self.portal_name,
+            text=text,
+            description=exception_obj[:500],
+        )
 
     def _on_dialog(self, event: dict, session_id: str | None = None) -> None:
         dtype = event.get("type", "")
         message = event.get("message", "")
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "kind": "js_dialog", "dialog_type": dtype, "message": message,
+            "kind": "js_dialog",
+            "dialog_type": dtype,
+            "message": message,
         }
         self._persist(record)
         self.plog.warning("JS DIALOG %s: %s", dtype, message[:100])
-        self.app_logger.emit("js_dialog", portal=self.portal_name,
-                             dialog_type=dtype, message=message)
+        self.app_logger.emit(
+            "js_dialog", portal=self.portal_name, dialog_type=dtype, message=message
+        )
 
     def _persist(self, record: dict) -> None:
         with open(self.events_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+# ── Dry-run guard ─────────────────────────────────────────────────────────────
+
+
+class DryRunGuard:
+    """Makes --dry-run unable to submit anything, whatever the agent decides.
+
+    Pauses every request browser-wide through CDP Fetch and fails each POST, PUT
+    or PATCH that is not analytics noise. Fetch is enabled on the browser target,
+    not on a page session: a page-session Fetch let a POST from a cross-origin
+    iframe (how Greenhouse embeds its form) reach the server in a real-Chrome test.
+    """
+
+    BLOCKED_METHODS = NetworkRecorder.INTERESTING_METHODS
+    ERROR_REASON = "BlockedByClient"
+
+    def __init__(self, portal_name: str, app_logger: AppLogger):
+        self.portal_name = portal_name
+        self.app_logger = app_logger
+        self.plog = app_logger.portal(portal_name)
+        self.blocked: list[str] = []
+        self._client = None
+        self._pending: set[asyncio.Task] = set()
+
+    async def attach_if_needed(self, browser_session) -> None:
+        if self._client is not None:
+            return
+        if browser_session is None:
+            raise RuntimeError("dry-run guard: no browser session to protect yet")
+        client = browser_session.cdp_client
+        add_cdp_handler(client, "Fetch.requestPaused", self._on_paused)
+        await client.send.Fetch.enable(
+            params={"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}
+        )
+        self._client = client
+        self.plog.info("DRY RUN: browser-wide submit block is on")
+
+    def _on_paused(self, event: dict, session_id: str | None = None) -> None:
+        request = event.get("request", {}) or {}
+        method, url = request.get("method", ""), request.get("url", "")
+        params: dict[str, object] = {"requestId": event["requestId"]}
+        if method in self.BLOCKED_METHODS and not any(
+            noise in url for noise in NetworkRecorder.NOISE_FRAGMENTS
+        ):
+            params["errorReason"] = self.ERROR_REASON
+            self.blocked.append(url)
+            self.plog.warning("DRY RUN: blocked %s %s", method, url[:100])
+            self.app_logger.emit(
+                "dry_run_blocked", portal=self.portal_name, method=method, url=url
+            )
+            command = self._client.send.Fetch.failRequest
+        else:
+            command = self._client.send.Fetch.continueRequest
+        # Never await a CDP command inside an event handler: its reply arrives on
+        # the same read loop that is running this handler.
+        task = asyncio.create_task(command(params=params, session_id=session_id))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+
 # ── Per-step callback ─────────────────────────────────────────────────────────
+
 
 class StepCallback:
     """Async per-step hook: logs the step + persists a screenshot.
@@ -1079,9 +1547,15 @@ class StepCallback:
               elapsed since previous step
     """
 
-    def __init__(self, portal_name: str, app_logger: AppLogger,
-                 network_recorder: "NetworkRecorder | None" = None,
-                 cdp_debugger: "CDPDebugger | None" = None):
+    def __init__(
+        self,
+        portal_name: str,
+        app_logger: AppLogger,
+        network_recorder: "NetworkRecorder | None" = None,
+        cdp_debugger: "CDPDebugger | None" = None,
+        dry_run_guard: DryRunGuard | None = None,
+    ):
+        self.dry_run_guard = dry_run_guard
         self.portal_name = portal_name
         self.app_logger = app_logger
         self.plog = app_logger.portal(portal_name)
@@ -1093,8 +1567,37 @@ class StepCallback:
         self.agent_ref = None  # set by PortalRunner after agent build
 
     async def on_step(self, browser_state, agent_output, step_num: int) -> None:
+        # browser_use runs this hook between the LLM reply and executing its actions,
+        # and an exception here makes it drop that step's actions. Logging and
+        # screenshots must never cost the agent a step.
+        if self.dry_run_guard:
+            # Outside the try on purpose: if the guard cannot attach, dropping the
+            # step's actions is exactly right, a dry run must not act unguarded.
+            session = getattr(self.agent_ref, "browser_session", None)
+            await self.dry_run_guard.attach_if_needed(session)
+        try:
+            await self._record_step(browser_state, agent_output, step_num)
+        except Exception as exc:
+            self.plog.warning(
+                "step %04d: step callback failed, agent continues: %s: %s",
+                step_num,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            self.app_logger.emit(
+                "step_callback_error",
+                portal=self.portal_name,
+                step=step_num,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
+    async def _record_step(self, browser_state, agent_output, step_num: int) -> None:
         # Lazy CDP attach — runs once on first step when browser_session exists
-        session = getattr(self.agent_ref, "browser_session", None) if self.agent_ref else None
+        session = (
+            getattr(self.agent_ref, "browser_session", None) if self.agent_ref else None
+        )
         if self.network_recorder:
             await self.network_recorder.attach_if_needed(session)
         if self.cdp_debugger:
@@ -1112,15 +1615,21 @@ class StepCallback:
 
         # INFO — single-line summary
         timing = f"{elapsed:5.1f}s" if elapsed is not None else "  ----"
-        self.plog.info("step %04d [%s] | %-60s | %s",
-                       step_num, timing, url[:60], ", ".join(actions) or "—")
+        self.plog.info(
+            "step %04d [%s] | %-60s | %s",
+            step_num,
+            timing,
+            url[:60],
+            ", ".join(actions) or "—",
+        )
 
         # DEBUG — full detail (only visible with --verbose)
         self.plog.debug("  full url    : %s", url)
         if action_details:
             for name, params in action_details:
-                self.plog.debug("  action      : %s(%s)", name,
-                                self._format_params(params))
+                self.plog.debug(
+                    "  action      : %s(%s)", name, self._format_params(params)
+                )
         if next_goal:
             self.plog.debug("  → next_goal : %s", next_goal)
         if eval_prev:
@@ -1135,15 +1644,22 @@ class StepCallback:
             screenshot_path.write_bytes(base64.b64decode(browser_state.screenshot))
             self.plog.debug("  screenshot  : %s", screenshot_path.name)
 
-        self.app_logger.emit("step", portal=self.portal_name, step=step_num,
-                             url=url, actions=actions,
-                             action_details=[
-                                 {"name": n, "params": self._sanitize_params(p)}
-                                 for n, p in action_details
-                             ],
-                             next_goal=next_goal, eval_prev=eval_prev,
-                             memory=memory, elapsed_s=round(elapsed, 2) if elapsed else None,
-                             screenshot=screenshot_path.name if screenshot_path else None)
+        self.app_logger.emit(
+            "step",
+            portal=self.portal_name,
+            step=step_num,
+            url=url,
+            actions=actions,
+            action_details=[
+                {"name": n, "params": self._sanitize_params(p)}
+                for n, p in action_details
+            ],
+            next_goal=next_goal,
+            eval_prev=eval_prev,
+            memory=memory,
+            elapsed_s=round(elapsed, 2) if elapsed else None,
+            screenshot=screenshot_path.name if screenshot_path else None,
+        )
 
     @staticmethod
     def _extract_action_names(agent_output) -> list[str]:
@@ -1167,7 +1683,9 @@ class StepCallback:
             else:
                 continue
             for name, params in d.items():
-                details.append((name, params if isinstance(params, dict) else {"value": params}))
+                details.append(
+                    (name, params if isinstance(params, dict) else {"value": params})
+                )
         return details
 
     @staticmethod
@@ -1194,18 +1712,29 @@ class StepCallback:
 
 # ── Custom agent actions ──────────────────────────────────────────────────────
 
+
 class AgentActions:
     """Registers all custom @tools.registry.action handlers for one portal."""
 
     _notes_lock = asyncio.Lock()
 
-    SESSION_VISIT_LIMIT = 2  # max times a URL can be visited in this session before auto-bail
+    SESSION_VISIT_LIMIT = (
+        2  # max times a URL can be visited in this session before auto-bail
+    )
 
-    def __init__(self, agent: Agent, portal_name: str, *, dry_run: bool,
-                 yaml_store: YamlStore | None,
-                 applied: JsonlTracker, attempted: JsonlTracker,
-                 recorder: ApplicationRecorder, app_logger: AppLogger,
-                 network_recorder: "NetworkRecorder | None" = None):
+    def __init__(
+        self,
+        agent: Agent,
+        portal_name: str,
+        *,
+        dry_run: bool,
+        yaml_store: YamlStore | None,
+        applied: JsonlTracker,
+        attempted: JsonlTracker,
+        recorder: ApplicationRecorder,
+        app_logger: AppLogger,
+        network_recorder: "NetworkRecorder | None" = None,
+    ):
         self.agent = agent
         self.portal_name = portal_name
         self.dry_run = dry_run
@@ -1232,10 +1761,15 @@ class AgentActions:
 
     def _register_check_applied(self) -> None:
         portal, plog, applied, attempted, app_logger = (
-            self.portal_name, self.plog, self.applied, self.attempted, self.app_logger,
+            self.portal_name,
+            self.plog,
+            self.applied,
+            self.attempted,
+            self.app_logger,
         )
         session_visits = self._session_visits
         visit_limit = self.SESSION_VISIT_LIMIT
+        network_recorder = self.network_recorder
 
         @self.agent.tools.registry.action(
             "Check whether a specific job has already been applied to OR previously attempted-and-failed. "
@@ -1252,13 +1786,17 @@ class AgentActions:
             # Always count the visit FIRST — applies even if the URL is already in
             # applied.jsonl or attempted.jsonl. This catches the sub-loop where the
             # agent re-checks the same URL repeatedly and ignores the skip signal.
-            session_visits[job_url] = session_visits.get(job_url, 0) + 1
-            visits = session_visits[job_url]
+            visit_key = job_url_key(job_url)
+            session_visits[visit_key] = session_visits.get(visit_key, 0) + 1
+            visits = session_visits[visit_key]
 
             if visits > visit_limit:
-                plog.warning("HARD-SKIP (checked %d× this session): %s", visits, job_url)
-                app_logger.emit("session_loop_detected", portal=portal,
-                                url=job_url, visits=visits)
+                plog.warning(
+                    "HARD-SKIP (checked %d× this session): %s", visits, job_url
+                )
+                app_logger.emit(
+                    "session_loop_detected", portal=portal, url=job_url, visits=visits
+                )
                 return ActionResult(
                     extracted_content=(
                         f"loop_detected — you have called check_applied on this exact URL "
@@ -1268,25 +1806,43 @@ class AgentActions:
                     )
                 )
 
-            if job_url in applied.load_keys():
+            if applied.has_job(job_url):
                 plog.info("SKIP (already applied) [visit %d]: %s", visits, job_url)
-                app_logger.emit("already_applied", portal=portal, url=job_url, visits=visits)
+                app_logger.emit(
+                    "already_applied", portal=portal, url=job_url, visits=visits
+                )
                 return ActionResult(extracted_content="already_applied")
 
-            if job_url in attempted.load_keys():
-                plog.info("SKIP (already attempted, did not complete) [visit %d]: %s",
-                          visits, job_url)
-                app_logger.emit("already_attempted", portal=portal, url=job_url, visits=visits)
+            if attempted.has_job(job_url):
+                plog.info(
+                    "SKIP (already attempted, did not complete) [visit %d]: %s",
+                    visits,
+                    job_url,
+                )
+                app_logger.emit(
+                    "already_attempted", portal=portal, url=job_url, visits=visits
+                )
                 return ActionResult(extracted_content="already_attempted")
 
-            app_logger.emit("check_applied", portal=portal, url=job_url,
-                            result="not_applied", visits=visits)
+            app_logger.emit(
+                "check_applied",
+                portal=portal,
+                url=job_url,
+                result="not_applied",
+                visits=visits,
+            )
+            if network_recorder:
+                network_recorder.start_job()
             return ActionResult(extracted_content="not_applied")
 
     def _register_mark_applied(self) -> None:
         portal, plog, applied, recorder, app_logger, dry_run = (
-            self.portal_name, self.plog, self.applied,
-            self.recorder, self.app_logger, self.dry_run,
+            self.portal_name,
+            self.plog,
+            self.applied,
+            self.recorder,
+            self.app_logger,
+            self.dry_run,
         )
         network_recorder = self.network_recorder
 
@@ -1296,19 +1852,30 @@ class AgentActions:
             "Pass as much context as the job page provided."
         )
         async def mark_applied(
-            job_url: str, job_title: str,
-            salary: str = "", location: str = "", seniority: str = "",
-            employment_type: str = "", key_requirements: str = "",
-            cover_letter_used: str = "", notes: str = "",
+            job_url: str,
+            job_title: str,
+            salary: str = "",
+            location: str = "",
+            seniority: str = "",
+            employment_type: str = "",
+            key_requirements: str = "",
+            cover_letter_used: str = "",
+            notes: str = "",
         ) -> ActionResult:
             if dry_run:
                 plog.info("DRY RUN — would mark applied: %s", job_title)
                 return ActionResult(extracted_content="dry_run — not recorded")
             record = {
-                "portal": portal, "job_url": job_url, "job_title": job_title,
-                "salary": salary, "location": location, "seniority": seniority,
-                "employment_type": employment_type, "key_requirements": key_requirements,
-                "cover_letter_used": cover_letter_used, "notes": notes,
+                "portal": portal,
+                "job_url": job_url,
+                "job_title": job_title,
+                "salary": salary,
+                "location": location,
+                "seniority": seniority,
+                "employment_type": employment_type,
+                "key_requirements": key_requirements,
+                "cover_letter_used": cover_letter_used,
+                "notes": notes,
                 "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }
             # Attach the most recent network captures so the application file
@@ -1317,15 +1884,33 @@ class AgentActions:
                 record["recent_network_posts"] = network_recorder.recent[-10:]
             await applied.append(record)
             recorder.write(record)
-            plog.info("APPLIED: %s — %s [%s | %s]", job_title, job_url,
-                      salary or "no salary", location or "no location")
-            app_logger.emit("applied", portal=portal, url=job_url, title=job_title,
-                            salary=salary, location=location, seniority=seniority)
-            return ActionResult(extracted_content=f"Recorded application to {portal}: {job_title}")
+            plog.info(
+                "APPLIED: %s — %s [%s | %s]",
+                job_title,
+                job_url,
+                salary or "no salary",
+                location or "no location",
+            )
+            app_logger.emit(
+                "applied",
+                portal=portal,
+                url=job_url,
+                title=job_title,
+                salary=salary,
+                location=location,
+                seniority=seniority,
+            )
+            return ActionResult(
+                extracted_content=f"Recorded application to {portal}: {job_title}"
+            )
 
     def _register_mark_attempted(self) -> None:
-        portal, plog, attempted, app_logger = (
-            self.portal_name, self.plog, self.attempted, self.app_logger,
+        portal, plog, attempted, app_logger, dry_run = (
+            self.portal_name,
+            self.plog,
+            self.attempted,
+            self.app_logger,
+            self.dry_run,
         )
 
         @self.agent.tools.registry.action(
@@ -1336,22 +1921,45 @@ class AgentActions:
             "Reasons: 'external_redirect', 'captcha', 'email_verification', 'broken_form', "
             "'login_required', 'form_too_complex', 'other'."
         )
-        async def mark_attempted(job_url: str, job_title: str, reason: str,
-                                 notes: str = "") -> ActionResult:
+        async def mark_attempted(
+            job_url: str, job_title: str, reason: str, notes: str = ""
+        ) -> ActionResult:
+            # check_applied skips attempted URLs forever, so a dry run must not record one
+            if dry_run:
+                plog.info(
+                    "DRY RUN: would mark attempted: %s (reason=%s)", job_title, reason
+                )
+                return ActionResult(
+                    extracted_content="dry_run: not recorded. Move on to next listing."
+                )
             record = {
-                "portal": portal, "job_url": job_url, "job_title": job_title,
-                "reason": reason, "notes": notes,
+                "portal": portal,
+                "job_url": job_url,
+                "job_title": job_title,
+                "reason": reason,
+                "notes": notes,
                 "attempted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }
             await attempted.append(record)
             plog.info("ATTEMPTED (gave up): %s — reason=%s", job_title, reason)
-            app_logger.emit("attempted", portal=portal, url=job_url, title=job_title,
-                            reason=reason, notes=notes)
-            return ActionResult(extracted_content=f"Recorded attempt (reason: {reason}). Move on to next listing.")
+            app_logger.emit(
+                "attempted",
+                portal=portal,
+                url=job_url,
+                title=job_title,
+                reason=reason,
+                notes=notes,
+            )
+            return ActionResult(
+                extracted_content=f"Recorded attempt (reason: {reason}). Move on to next listing."
+            )
 
     def _register_screenshot(self) -> None:
         portal, plog, app_logger, shot_dir = (
-            self.portal_name, self.plog, self.app_logger, self.shot_dir,
+            self.portal_name,
+            self.plog,
+            self.app_logger,
+            self.shot_dir,
         )
 
         @self.agent.tools.registry.action(
@@ -1368,7 +1976,9 @@ class AgentActions:
             b64_data = await page.screenshot(format="png")
             path.write_bytes(base64.b64decode(b64_data))
             plog.info("PRE-SUBMIT screenshot → %s", path.name)
-            app_logger.emit("screenshot", portal=portal, path=str(path), trigger="submit")
+            app_logger.emit(
+                "screenshot", portal=portal, path=str(path), trigger="submit"
+            )
             return ActionResult(extracted_content=f"Screenshot saved: {path}")
 
     def _register_note(self) -> None:
@@ -1390,7 +2000,10 @@ class AgentActions:
 
     def _register_save_credentials(self) -> None:
         portal, plog, app_logger, yaml_store = (
-            self.portal_name, self.plog, self.app_logger, self.yaml_store,
+            self.portal_name,
+            self.plog,
+            self.app_logger,
+            self.yaml_store,
         )
 
         @self.agent.tools.registry.action(
@@ -1400,12 +2013,29 @@ class AgentActions:
         async def save_credentials(username: str, password: str) -> ActionResult:
             plog.info("CREDENTIALS saved for %s (user=%s)", portal, username)
             await yaml_store.update_credentials(portal, username, password)
-            app_logger.emit("credentials_saved", portal=portal,
-                            yaml=str(yaml_store.path), username=username)
+            app_logger.emit(
+                "credentials_saved",
+                portal=portal,
+                yaml=str(yaml_store.path),
+                username=username,
+            )
             return ActionResult(extracted_content=f"Credentials saved for {portal}.")
 
 
 # ── Per-portal runner ─────────────────────────────────────────────────────────
+
+
+class AgentStoppedEarly(RuntimeError):
+    """The agent hit max_steps or max_failures without calling `done`.
+
+    browser_use returns the history instead of raising in that case, so without
+    this the portal is reported as a success and never retried.
+    """
+
+
+class ProfileInUse(RuntimeError):
+    """A live Chrome on this host already holds the portal's browser profile."""
+
 
 class PortalRunner:
     """Runs the apply flow for one portal end-to-end."""
@@ -1418,12 +2048,22 @@ class PortalRunner:
     # process is dead. Killed runs leave them behind — clean up before launch.
     STALE_LOCK_NAMES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 
-    def __init__(self, system: dict, *, knowledge: str, llm: ChatOpenRouter,
-                 opts: RunOptions, yaml_store: YamlStore | None,
-                 task_builder: TaskBuilder, cred_resolver: CredentialsResolver,
-                 applied: JsonlTracker, attempted: JsonlTracker,
-                 recorder: ApplicationRecorder, app_logger: AppLogger,
-                 proxy_provider: ProxyProvider | None = None):
+    def __init__(
+        self,
+        system: dict,
+        *,
+        knowledge: str,
+        llm: ChatOpenRouter,
+        opts: RunOptions,
+        yaml_store: YamlStore | None,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied: JsonlTracker,
+        attempted: JsonlTracker,
+        recorder: ApplicationRecorder,
+        app_logger: AppLogger,
+        proxy_provider: ProxyProvider | None = None,
+    ):
         self.system = system
         self.name = system["name"]
         self.url = expand_env(system.get("url", ""))
@@ -1443,20 +2083,32 @@ class PortalRunner:
 
     async def run(self) -> str:
         mode = "DRY RUN" if self.opts.dry_run else "APPLY"
-        self.app_logger.main().info("━━ [%s] starting — mode=%s url=%s",
-                                    self.name, mode, self.url)
+        self.app_logger.main().info(
+            "━━ [%s] starting — mode=%s url=%s", self.name, mode, self.url
+        )
         self.app_logger.emit("portal_start", portal=self.name, mode=mode, url=self.url)
 
         credentials = self._build_credentials()
         task = self.task_builder.build(self.system, self.knowledge, self.opts)
         self.plog.info("task ready — %d chars", len(task))
 
-        agent = self._build_agent(task, credentials)
+        # Providers may do a blocking HTTP call (Webshare); keep it off the event loop
+        # so the other portals' agents keep running.
+        proxy = (
+            await asyncio.to_thread(self.proxy_provider.acquire, self.name)
+            if self.proxy_provider is not None
+            else None
+        )
+        agent = self._build_agent(task, credentials, proxy=proxy)
         AgentActions(
-            agent, self.name, dry_run=self.opts.dry_run,
+            agent,
+            self.name,
+            dry_run=self.opts.dry_run,
             yaml_store=self.yaml_store,
-            applied=self.applied, attempted=self.attempted,
-            recorder=self.recorder, app_logger=self.app_logger,
+            applied=self.applied,
+            attempted=self.attempted,
+            recorder=self.recorder,
+            app_logger=self.app_logger,
             network_recorder=self._network_recorder,
         ).register_all()
 
@@ -1468,10 +2120,12 @@ class PortalRunner:
             self.plog.info("loading credentials")
             creds = self.cred_resolver.resolve(self.system["credentials"])
 
-        portal_pwd_source = "PORTAL_ACCOUNT_PASSWORD env" if os.getenv(self.PORTAL_PWD_ENV) else "generated"
-        creds["<portal_password>"] = (
-            os.getenv(self.PORTAL_PWD_ENV) or secrets.token_urlsafe(12)
+        portal_pwd_source = (
+            "PORTAL_ACCOUNT_PASSWORD env"
+            if os.getenv(self.PORTAL_PWD_ENV)
+            else "generated"
         )
+        creds["<portal_password>"] = self._portal_password()
         self.plog.debug("portal password: source=%s", portal_pwd_source)
 
         linkedin_user = os.getenv(self.LINKEDIN_USER_ENV, "")
@@ -1487,8 +2141,33 @@ class PortalRunner:
         self.plog.debug("sensitive_data placeholders: %s", sorted(creds.keys()))
         return creds
 
+    def _portal_password(self) -> str:
+        """Password for accounts the agent creates on this portal.
+
+        Without the env var it is generated once and kept on disk before the agent
+        sees it, so every run and retry uses the same one and an account created
+        without a save_credentials call is not lost.
+        """
+        if from_env := os.getenv(self.PORTAL_PWD_ENV):
+            return from_env
+        path = Paths.PROFILES / self.name / "portal_password"
+        if path.exists():
+            return path.read_text().strip()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        password = secrets.token_urlsafe(12)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(password)
+        return password
+
     def _clean_stale_locks(self, profile_dir: Path) -> None:
         """Remove Chrome SingletonLock/Cookie/Socket symlinks left by a killed run."""
+        if owner := self._live_lock_owner(profile_dir / "SingletonLock"):
+            # Two Chromes on one profile can corrupt its cookies and saved logins
+            raise ProfileInUse(
+                f"{self.name}: browser profile {profile_dir} is in use by a running "
+                f"Chrome (pid {owner}); is another fill.py run on this portal?"
+            )
         cleaned = []
         for name in self.STALE_LOCK_NAMES:
             lock = profile_dir / name
@@ -1501,48 +2180,91 @@ class PortalRunner:
         if cleaned:
             self.plog.info("cleaned stale Chrome locks: %s", ", ".join(cleaned))
 
-    def _build_agent(self, task: str, credentials: dict[str, str]) -> Agent:
+    @staticmethod
+    def _live_lock_owner(lock: Path) -> int | None:
+        """PID of the Chrome on this host that holds the lock, or None if it is stale.
+
+        Chrome points SingletonLock at "<hostname>-<pid>".
+        """
+        if not lock.is_symlink():
+            return None
+        host, _, pid_text = os.readlink(lock).rpartition("-")
+        if host != socket.gethostname() or not pid_text.isdigit():
+            return None
+        try:
+            os.kill(int(pid_text), 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            pass  # alive, owned by another user
+        return int(pid_text)
+
+    def _build_agent(
+        self, task: str, credentials: dict[str, str], *, proxy: Proxy | None = None
+    ) -> Agent:
         portal_profile = Paths.PROFILES / self.name
         portal_profile.mkdir(parents=True, exist_ok=True)
         self._clean_stale_locks(portal_profile)
         is_first = not any(portal_profile.iterdir())
-        self.plog.info("browser profile: %s (%s)", portal_profile,
-                       "fresh" if is_first else "reusing saved session")
-        self.plog.info("browser mode: %s",
-                       "headless" if self.opts.headless else "visible")
-        self.app_logger.emit("browser_start", portal=self.name,
-                             profile=str(portal_profile),
-                             session="fresh" if is_first else "reused",
-                             headless=self.opts.headless)
+        self.plog.info(
+            "browser profile: %s (%s)",
+            portal_profile,
+            "fresh" if is_first else "reusing saved session",
+        )
+        self.plog.info(
+            "browser mode: %s", "headless" if self.opts.headless else "visible"
+        )
+        self.app_logger.emit(
+            "browser_start",
+            portal=self.name,
+            profile=str(portal_profile),
+            session="fresh" if is_first else "reused",
+            headless=self.opts.headless,
+        )
 
         network_recorder = NetworkRecorder(self.name, self.app_logger)
-        cdp_debugger = CDPDebugger(self.name, self.app_logger,
-                                   noise_fragments=NetworkRecorder.NOISE_FRAGMENTS)
-        callback = StepCallback(self.name, self.app_logger,
-                                network_recorder=network_recorder,
-                                cdp_debugger=cdp_debugger)
+        cdp_debugger = CDPDebugger(
+            self.name, self.app_logger, noise_fragments=NetworkRecorder.NOISE_FRAGMENTS
+        )
+        if self.opts.dry_run and proxy is not None and proxy.username:
+            # browser_use's proxy-auth handler continues every paused request,
+            # which would let submits through the dry-run guard
+            raise ValueError(
+                f"{self.name}: --dry-run cannot run with an authenticated proxy"
+            )
+        callback = StepCallback(
+            self.name,
+            self.app_logger,
+            network_recorder=network_recorder,
+            cdp_debugger=cdp_debugger,
+            dry_run_guard=(
+                DryRunGuard(self.name, self.app_logger) if self.opts.dry_run else None
+            ),
+        )
         # Files the agent is allowed to upload via browser_use's upload_file action.
         # Without this whitelist, EVERY upload attempt fails with
         # "File path X is not available." — observed as the root cause of
         # earlier Reveleer/WWR apply failures.
         allowed_uploads: list[str] = []
-        resume_path = self.opts.resume_path or self.system.get("resume_path", "")
+        resume_path = self.opts.resume_for(self.system)
         if resume_path and os.path.exists(resume_path):
             allowed_uploads.append(resume_path)
             self.plog.debug("file uploads allowed: %s", allowed_uploads)
         elif resume_path:
-            self.plog.warning("RESUME_PATH=%s does not exist — uploads will fail", resume_path)
+            self.plog.warning(
+                "RESUME_PATH=%s does not exist — uploads will fail", resume_path
+            )
 
         profile_kwargs: dict[str, object] = {
             "headless": self.opts.headless,
             "user_data_dir": str(portal_profile),
         }
-        if self.proxy_provider is not None:
-            proxy = self.proxy_provider.acquire(self.name)
+        if proxy is not None:
             profile_kwargs["proxy"] = proxy.to_browser_profile()
 
         agent = Agent(
-            task=task, llm=self.llm,
+            task=task,
+            llm=self.llm,
             browser_profile=BrowserProfile(**profile_kwargs),
             sensitive_data=credentials,
             available_file_paths=allowed_uploads or None,
@@ -1558,8 +2280,11 @@ class PortalRunner:
 
     async def _run_agent(self, agent: Agent) -> str:
         t0 = time.monotonic()
-        self.plog.info("agent running… (flash_mode=%s, max_actions_per_step=%d)",
-                       self.opts.fast, self.opts.max_actions)
+        self.plog.info(
+            "agent running… (flash_mode=%s, max_actions_per_step=%d)",
+            self.opts.fast,
+            self.opts.max_actions,
+        )
         history = await agent.run()
         elapsed = time.monotonic() - t0
 
@@ -1567,26 +2292,45 @@ class PortalRunner:
         steps = len(history.history) if hasattr(history, "history") else "?"
         self.plog.info("finished in %.1fs — %s steps", elapsed, steps)
         self.plog.info("final result:\n%s", final)
-        self.app_logger.emit("portal_done", portal=self.name,
-                             elapsed_s=round(elapsed, 1), steps=steps,
-                             result_preview=final[:300])
+        self.app_logger.emit(
+            "portal_done",
+            portal=self.name,
+            elapsed_s=round(elapsed, 1),
+            steps=steps,
+            result_preview=final[:300],
+        )
+        if not history.is_done():
+            raise AgentStoppedEarly(
+                f"{self.name}: agent stopped after {steps} steps without calling done"
+            )
         return final
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
+
 
 class Orchestrator:
     """Runs N portals concurrently with a worker semaphore + retry on failure."""
 
     RETRY_BACKOFF_SECONDS = 5
 
-    def __init__(self, systems: list[dict], *, knowledge: str, llm: ChatOpenRouter,
-                 opts: RunOptions, max_workers: int,
-                 yaml_store: YamlStore | None, task_builder: TaskBuilder,
-                 cred_resolver: CredentialsResolver,
-                 applied: JsonlTracker, attempted: JsonlTracker,
-                 recorder: ApplicationRecorder, app_logger: AppLogger,
-                 default_proxy_provider: ProxyProvider | None = None):
+    def __init__(
+        self,
+        systems: list[dict],
+        *,
+        knowledge: str,
+        llm: ChatOpenRouter,
+        opts: RunOptions,
+        max_workers: int,
+        yaml_store: YamlStore | None,
+        task_builder: TaskBuilder,
+        cred_resolver: CredentialsResolver,
+        applied: JsonlTracker,
+        attempted: JsonlTracker,
+        recorder: ApplicationRecorder,
+        app_logger: AppLogger,
+        default_proxy_provider: ProxyProvider | None = None,
+    ):
         self.systems = systems
         self.knowledge = knowledge
         self.llm = llm
@@ -1603,6 +2347,13 @@ class Orchestrator:
         self.log = app_logger.main()
         self.active = self._select_active(systems)
         self.skipped_count = len(systems) - len(self.active)
+        # Built once, up front: a bad proxy block fails before any browser starts,
+        # and a retry reuses the same provider (list cursor, cache) instead of a fresh one.
+        self._proxy_providers = {
+            s["name"]: portal_proxy_provider(s, default_proxy_provider, log=self.log)
+            for s in self.active
+        }
+        self._crashed: dict[str, Exception] = {}
 
     @staticmethod
     def _select_active(systems: list[dict]) -> list[dict]:
@@ -1614,23 +2365,35 @@ class Orchestrator:
         return active
 
     async def run(self) -> None:
-        self.log.info("Running %d portal(s) — workers=%d skipped=%d fast=%s max_actions=%d",
-                      len(self.active), self.max_workers, self.skipped_count,
-                      self.opts.fast, self.opts.max_actions)
+        self.log.info(
+            "Running %d portal(s) — workers=%d skipped=%d fast=%s max_actions=%d",
+            len(self.active),
+            self.max_workers,
+            self.skipped_count,
+            self.opts.fast,
+            self.opts.max_actions,
+        )
         if self.opts.resume_path:
             self.log.info("Resume PDF: %s", self.opts.resume_path)
-        self.app_logger.emit("run_start",
-                             portals=[s["name"] for s in self.active],
-                             workers=self.max_workers, dry_run=self.opts.dry_run)
+        self.app_logger.emit(
+            "run_start",
+            portals=[s["name"] for s in self.active],
+            workers=self.max_workers,
+            dry_run=self.opts.dry_run,
+        )
 
         results = await self._run_batch(self.active, "pass 1")
         results = await self._retry_failures(results)
         self._summarise(results)
+        if self._crashed:
+            raise next(iter(self._crashed.values()))
 
     async def _retry_failures(
         self, results: list[tuple[str, str | Exception]]
     ) -> list[tuple[str, str | Exception]]:
-        failed = {n for n, r in results if isinstance(r, Exception)}
+        failed = {
+            n for n, r in results if isinstance(r, Exception) and n not in self._crashed
+        }
         if not failed:
             return results
         self.log.info("Retrying %d failed portal(s): %s", len(failed), sorted(failed))
@@ -1646,13 +2409,17 @@ class Orchestrator:
         self.log.info("━━━━━━━━━━━━━━━━━━━━ all portals done ━━━━━━━━━━━━━━━━━━━━")
         self.log.info("  succeeded: %d — %s", len(ok), ok)
         self.log.info("  failed:    %d — %s", len(failed), failed)
+        if self._crashed:
+            self.log.info("  crashed:   %s (bug, not retried)", sorted(self._crashed))
         if self.skipped_count:
             self.log.info("  skipped:   %d (URL not configured)", self.skipped_count)
-        self.app_logger.emit("run_done", succeeded=ok, failed=failed,
-                             skipped=self.skipped_count)
+        self.app_logger.emit(
+            "run_done", succeeded=ok, failed=failed, skipped=self.skipped_count
+        )
 
-    async def _run_batch(self, batch: list[dict],
-                         label: str) -> list[tuple[str, str | Exception]]:
+    async def _run_batch(
+        self, batch: list[dict], label: str
+    ) -> list[tuple[str, str | Exception]]:
         sem = asyncio.Semaphore(self.max_workers)
         results: list[tuple[str, str | Exception]] = []
         completed = 0
@@ -1661,8 +2428,9 @@ class Orchestrator:
         # - browser_use's own runtime errors (wrapped in their own classes)
         # - Browser/CDP connection issues (TimeoutError, OSError, asyncio.CancelledError)
         # - Network errors from the LLM (httpx.HTTPError)
-        # Real bugs (TypeError/AttributeError/KeyError from our code) are NOT caught —
-        # let them crash so they don't get hidden behind a "portal failed" log line.
+        # Real bugs (TypeError/AttributeError/KeyError from our code) are not retried
+        # and still crash the run, but only after the other portals finish and the
+        # summary is printed, so one bug does not cancel browsers mid-application.
         recoverable = (TimeoutError, OSError, RuntimeError, httpx.HTTPError)
 
         async def run_one(system: dict) -> tuple[str, str | Exception]:
@@ -1671,10 +2439,35 @@ class Orchestrator:
                 try:
                     return (name, await self._make_runner(system).run())
                 except recoverable as exc:
-                    self.log.error("[%s] failed (recoverable): %s: %s",
-                                   name, type(exc).__name__, exc, exc_info=True)
-                    self.app_logger.emit("portal_error", portal=name,
-                                         error_type=type(exc).__name__, error=str(exc))
+                    self.log.error(
+                        "[%s] failed (recoverable): %s: %s",
+                        name,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=True,
+                    )
+                    self.app_logger.emit(
+                        "portal_error",
+                        portal=name,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    return (name, exc)
+                except Exception as exc:
+                    self.log.critical(
+                        "[%s] crashed (bug): %s: %s",
+                        name,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=True,
+                    )
+                    self.app_logger.emit(
+                        "portal_crash",
+                        portal=name,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    self._crashed[name] = exc
                     return (name, exc)
 
         tasks = [asyncio.create_task(run_one(s)) for s in batch]
@@ -1682,35 +2475,43 @@ class Orchestrator:
             name, result = await coro
             completed += 1
             status = "✓" if not isinstance(result, Exception) else "✗"
-            self.log.info("━━ [%d/%d] %s %s  (%s)",
-                          completed, len(self.active), status, name, label)
+            self.log.info(
+                "━━ [%d/%d] %s %s  (%s)",
+                completed,
+                len(batch),
+                status,
+                name,
+                label,
+            )
             results.append((name, result))
         return results
 
     def _make_runner(self, system: dict) -> PortalRunner:
         return PortalRunner(
-            system, knowledge=self.knowledge, llm=self.llm, opts=self.opts,
-            yaml_store=self.yaml_store, task_builder=self.task_builder,
+            system,
+            knowledge=self.knowledge,
+            llm=self.llm,
+            opts=self.opts,
+            yaml_store=self.yaml_store,
+            task_builder=self.task_builder,
             cred_resolver=self.cred_resolver,
-            applied=self.applied, attempted=self.attempted,
-            recorder=self.recorder, app_logger=self.app_logger,
-            proxy_provider=self._proxy_for(system),
+            applied=self.applied,
+            attempted=self.attempted,
+            recorder=self.recorder,
+            app_logger=self.app_logger,
+            proxy_provider=self._proxy_providers[system["name"]],
         )
-
-    def _proxy_for(self, system: dict) -> ProxyProvider | None:
-        """Portal-level proxy overrides default. None = direct connection."""
-        if "proxy" in system:
-            return ProxyProviderFactory.build(system["proxy"], log=self.log)
-        return self.default_proxy_provider
 
 
 # ── Reports ──────────────────────────────────────────────────────────────────
 
+
 class SummaryReporter:
     """Prints a per-portal application summary from disk."""
 
-    def __init__(self, root: Path = Paths.APPLICATIONS,
-                 log: logging.Logger | None = None):
+    def __init__(
+        self, root: Path = Paths.APPLICATIONS, log: logging.Logger | None = None
+    ):
         self.root = root
         self.log = log or logging.getLogger("auto-form")
 
@@ -1730,30 +2531,47 @@ class SummaryReporter:
             records = sorted(portal_dir.glob("*.json"))
             if not records:
                 continue
-            self.log.info("\n● %s (%d application%s) — %s",
-                          portal_dir.name, len(records),
-                          "" if len(records) == 1 else "s",
-                          descs.get(portal_dir.name, ""))
+            self.log.info(
+                "\n● %s (%d application%s) — %s",
+                portal_dir.name,
+                len(records),
+                "" if len(records) == 1 else "s",
+                descs.get(portal_dir.name, ""),
+            )
             for rec_path in records:
                 try:
                     rec = json.loads(rec_path.read_text())
                 except json.JSONDecodeError as e:
-                    self.log.warning("   skipping malformed record %s: %s", rec_path.name, e)
+                    self.log.warning(
+                        "   skipping malformed record %s: %s", rec_path.name, e
+                    )
                     continue
                 except OSError as e:
                     self.log.warning("   could not read %s: %s", rec_path.name, e)
                     continue
-                self.log.info("   %s  %-50s  %-20s  %s",
-                              rec.get("applied_at", "")[:16],
-                              (rec.get("job_title") or "")[:50],
-                              (rec.get("salary") or "—")[:20],
-                              rec.get("location") or "—")
+                self.log.info(
+                    "   %s  %-50s  %-20s  %s",
+                    rec.get("applied_at", "")[:16],
+                    (rec.get("job_title") or "")[:50],
+                    (rec.get("salary") or "—")[:20],
+                    rec.get("location") or "—",
+                )
                 total += 1
-        self.log.info("\n━━ TOTAL: %d applications across %d portals ━━",
-                      total, len(portal_dirs))
+        self.log.info(
+            "\n━━ TOTAL: %d applications across %d portals ━━", total, len(portal_dirs)
+        )
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def positive_int(value: str) -> int:
+    """argparse type: --workers 0 would make Semaphore(0) and hang the run forever."""
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {number}")
+    return number
+
 
 class CLI:
     """Argparse-based command-line entrypoint and composition root."""
@@ -1764,30 +2582,68 @@ class CLI:
         group = p.add_mutually_exclusive_group(required=True)
         group.add_argument("--all", action="store_true", help="Run every portal")
         group.add_argument("--system", help="Run a single portal by name")
-        group.add_argument("--list", action="store_true", help="List registered portals")
-        group.add_argument("--summary", action="store_true",
-                           help="Print a per-portal application summary from applications/")
-        p.add_argument("--dry-run", action="store_true",
-                       help="Assess matches but do not submit applications")
-        p.add_argument("--filter", dest="filter_keyword", default="",
-                       help="Only consider roles containing this keyword")
+        group.add_argument(
+            "--list", action="store_true", help="List registered portals"
+        )
+        group.add_argument(
+            "--summary",
+            action="store_true",
+            help="Print a per-portal application summary from applications/",
+        )
+        p.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Assess matches but do not submit applications",
+        )
+        p.add_argument(
+            "--filter",
+            dest="filter_keyword",
+            default="",
+            help="Only consider roles containing this keyword",
+        )
         p.add_argument("--note", default="", help="Extra context for this run")
-        p.add_argument("--workers", type=int, default=5,
-                       help="Max parallel browser sessions when using --all (default: 5)")
-        p.add_argument("--systems", default="systems.yaml",
-                       help="YAML file listing portals (default: systems.yaml)")
-        p.add_argument("--headless", action="store_true",
-                       help="Run browser in headless mode (default: visible)")
-        p.add_argument("--verbose", "-v", action="store_true",
-                       help="DEBUG-level logs for auto-form (full URLs, action params, agent reasoning)")
-        p.add_argument("--trace", "-vv", action="store_true",
-                       help="MAX verbosity: includes browser_use, httpx, playwright internals")
-        p.add_argument("--fast", action="store_true",
-                       help="Enable flash_mode (skips agent self-eval/thinking, ~30%% faster)")
-        p.add_argument("--max-actions", type=int, default=5,
-                       help="Max actions per LLM call (default 5; raise to 8–12)")
-        p.add_argument("--model",
-                       help="OpenRouter model id (overrides OPENROUTER_MODEL env)")
+        p.add_argument(
+            "--workers",
+            type=positive_int,
+            default=5,
+            help="Max parallel browser sessions when using --all (default: 5)",
+        )
+        p.add_argument(
+            "--systems",
+            default="systems.yaml",
+            help="YAML file listing portals (default: systems.yaml)",
+        )
+        p.add_argument(
+            "--headless",
+            action="store_true",
+            help="Run browser in headless mode (default: visible)",
+        )
+        p.add_argument(
+            "--verbose",
+            "-v",
+            action="store_true",
+            help="DEBUG-level logs for auto-form (full URLs, action params, agent reasoning)",
+        )
+        p.add_argument(
+            "--trace",
+            "-vv",
+            action="store_true",
+            help="MAX verbosity: includes browser_use, httpx, playwright internals",
+        )
+        p.add_argument(
+            "--fast",
+            action="store_true",
+            help="Enable flash_mode (skips agent self-eval/thinking, ~30%% faster)",
+        )
+        p.add_argument(
+            "--max-actions",
+            type=int,
+            default=5,
+            help="Max actions per LLM call (default 5; raise to 8–12)",
+        )
+        p.add_argument(
+            "--model", help="OpenRouter model id (overrides OPENROUTER_MODEL env)"
+        )
         return p
 
     @classmethod
@@ -1797,7 +2653,9 @@ class CLI:
         log = app_logger.main()
         if args.trace:
             app_logger.set_trace()
-            log.info("TRACE mode enabled — DEBUG everywhere including browser_use internals")
+            log.info(
+                "TRACE mode enabled — DEBUG everywhere including browser_use internals"
+            )
         elif args.verbose:
             app_logger.set_verbose()
             log.info("Verbose mode enabled — DEBUG for auto-form loggers")
@@ -1822,26 +2680,37 @@ class CLI:
 
         deps = cls._build_deps(args, log, app_logger, yaml_store, opts)
         deps["default_proxy_provider"] = ProxyProviderFactory.build(
-            default_proxy_cfg, log=log,
+            default_proxy_cfg,
+            log=log,
         )
-        app_logger.emit("startup", run_id=app_logger.run_id,
-                        systems_file=str(yaml_store.path),
-                        dry_run=args.dry_run, headless=args.headless,
-                        workers=args.workers, resume=opts.resume_path,
-                        model=deps["model_id"],
-                        proxy_kind=(default_proxy_cfg or {}).get("kind") or "none")
+        app_logger.emit(
+            "startup",
+            run_id=app_logger.run_id,
+            systems_file=str(yaml_store.path),
+            dry_run=args.dry_run,
+            headless=args.headless,
+            workers=args.workers,
+            resume=opts.resume_path,
+            model=deps["model_id"],
+            proxy_kind=(default_proxy_cfg or {}).get("kind") or "none",
+        )
 
         if args.all:
             cls._run_all(systems, args.workers, opts, yaml_store, deps, app_logger, log)
         else:
-            cls._run_single(args.system, systems, opts, yaml_store, deps, app_logger, log)
+            cls._run_single(
+                args.system, systems, opts, yaml_store, deps, app_logger, log
+            )
 
     @staticmethod
     def _build_opts(args: argparse.Namespace) -> RunOptions:
         return RunOptions(
-            dry_run=args.dry_run, headless=args.headless,
-            fast=args.fast, max_actions=args.max_actions,
-            filter_keyword=args.filter_keyword, note=args.note,
+            dry_run=args.dry_run,
+            headless=args.headless,
+            fast=args.fast,
+            max_actions=args.max_actions,
+            filter_keyword=args.filter_keyword,
+            note=args.note,
             resume_path=os.getenv("RESUME_PATH", ""),
         )
 
@@ -1855,8 +2724,9 @@ class CLI:
             "applied": JsonlTracker(Paths.APPLIED),
             "attempted": JsonlTracker(Paths.ATTEMPTED),
             "recorder": ApplicationRecorder(),
-            "model_id": (args.model or os.getenv("OPENROUTER_MODEL")
-                         or LLMFactory.DEFAULT_MODEL),
+            "model_id": (
+                args.model or os.getenv("OPENROUTER_MODEL") or LLMFactory.DEFAULT_MODEL
+            ),
         }
 
     @staticmethod
@@ -1866,45 +2736,68 @@ class CLI:
             url = expand_env(s.get("url", ""))
             configured = "✓" if url and not url.startswith("$") else "⚠ URL not set"
             creds = "🔐" if s.get("credentials") else "  "
-            log.info("  %s %s %-20s — %s  [%s]",
-                     creds, configured, s["name"], s.get("description", ""), url)
+            log.info(
+                "  %s %s %-20s — %s  [%s]",
+                creds,
+                configured,
+                s["name"],
+                s.get("description", ""),
+                url,
+            )
 
     @staticmethod
-    def _run_all(systems, workers, opts, yaml_store, deps,
-                 app_logger, log) -> None:
+    def _run_all(systems, workers, opts, yaml_store, deps, app_logger, log) -> None:
         log.info("Mode: ALL portals (%d)", len(systems))
-        asyncio.run(Orchestrator(
-            systems, knowledge=deps["knowledge"], llm=deps["llm"], opts=opts,
-            max_workers=workers, yaml_store=yaml_store,
-            task_builder=deps["task_builder"], cred_resolver=deps["cred_resolver"],
-            applied=deps["applied"], attempted=deps["attempted"],
-            recorder=deps["recorder"], app_logger=app_logger,
-            default_proxy_provider=deps["default_proxy_provider"],
-        ).run())
+        asyncio.run(
+            Orchestrator(
+                systems,
+                knowledge=deps["knowledge"],
+                llm=deps["llm"],
+                opts=opts,
+                max_workers=workers,
+                yaml_store=yaml_store,
+                task_builder=deps["task_builder"],
+                cred_resolver=deps["cred_resolver"],
+                applied=deps["applied"],
+                attempted=deps["attempted"],
+                recorder=deps["recorder"],
+                app_logger=app_logger,
+                default_proxy_provider=deps["default_proxy_provider"],
+            ).run()
+        )
 
     @staticmethod
-    def _run_single(system_name, systems, opts, yaml_store, deps,
-                    app_logger, log) -> None:
+    def _run_single(
+        system_name, systems, opts, yaml_store, deps, app_logger, log
+    ) -> None:
         matches = [s for s in systems if s["name"] == system_name]
         if not matches:
-            log.error("Unknown system %r. Available: %s",
-                      system_name, [s["name"] for s in systems])
+            log.error(
+                "Unknown system %r. Available: %s",
+                system_name,
+                [s["name"] for s in systems],
+            )
             raise SystemExit(1)
         system = matches[0]
         url = expand_env(system.get("url", ""))
         if not url or url.startswith("$"):
             log.error("[%s] URL not configured — set the env var in .env", system_name)
             raise SystemExit(1)
-        proxy_provider = (
-            ProxyProviderFactory.build(system["proxy"], log=log)
-            if "proxy" in system else deps["default_proxy_provider"]
+        proxy_provider = portal_proxy_provider(
+            system, deps["default_proxy_provider"], log=log
         )
         runner = PortalRunner(
-            system, knowledge=deps["knowledge"], llm=deps["llm"], opts=opts,
-            yaml_store=yaml_store, task_builder=deps["task_builder"],
+            system,
+            knowledge=deps["knowledge"],
+            llm=deps["llm"],
+            opts=opts,
+            yaml_store=yaml_store,
+            task_builder=deps["task_builder"],
             cred_resolver=deps["cred_resolver"],
-            applied=deps["applied"], attempted=deps["attempted"],
-            recorder=deps["recorder"], app_logger=app_logger,
+            applied=deps["applied"],
+            attempted=deps["attempted"],
+            recorder=deps["recorder"],
+            app_logger=app_logger,
             proxy_provider=proxy_provider,
         )
         asyncio.run(runner.run())

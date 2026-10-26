@@ -83,7 +83,7 @@ uv run fill.py --systems systems.yaml --all --workers 1 --headless
 --systems PATH       Portal list YAML (required)
 --all                Run every portal in the file
 --filter NAME        Run only portals whose name contains NAME
---workers N          Concurrent portals (default: 1; >1 needs care with CDP)
+--workers N          Concurrent portals, 1 or more (default: 5; >1 needs care with CDP)
 --headless           Run Chrome without a window (required for servers)
 --dry-run            Navigate + render forms but never submit
 --fast               Use a smaller/faster LLM model

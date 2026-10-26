@@ -4,7 +4,6 @@ import json
 import logging
 from pathlib import Path
 
-import pytest
 
 from fill import Paths, SummaryReporter
 
@@ -25,14 +24,20 @@ class TestPrint:
     def test_lists_applications_per_portal(self, tmp_app_root: Path, caplog):
         portal_dir = Paths.APPLICATIONS / "acme"
         portal_dir.mkdir(parents=True)
-        (portal_dir / "20260513_213833_a.json").write_text(json.dumps({
-            "applied_at": "2026-05-13T21:38:33",
-            "job_title": "Senior BE",
-            "salary": "$120k",
-            "location": "Remote",
-        }))
+        (portal_dir / "20260513_213833_a.json").write_text(
+            json.dumps(
+                {
+                    "applied_at": "2026-05-13T21:38:33",
+                    "job_title": "Senior BE",
+                    "salary": "$120k",
+                    "location": "Remote",
+                }
+            )
+        )
         with caplog.at_level(logging.INFO, logger="auto-form"):
-            SummaryReporter(root=Paths.APPLICATIONS).print([{"name": "acme", "description": "Acme Inc"}])
+            SummaryReporter(root=Paths.APPLICATIONS).print(
+                [{"name": "acme", "description": "Acme Inc"}]
+            )
         msg = "\n".join(r.message for r in caplog.records)
         assert "acme" in msg
         assert "Senior BE" in msg
