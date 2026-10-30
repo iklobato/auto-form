@@ -171,6 +171,11 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   the step callback are cleared before the next LLM call, and `Agent.add_new_task`
   replaces the task. A browser_use upgrade can break this: `tests/test_scroll_loop_brake.py`
   checks it against the real `MessageManager`.
+- browser_use drops actions past `max_actions_per_step` without telling the model
+  (`agent/service.py`, `parsed.action[: max_actions_per_step]`); its memory then says the
+  form is filled. With the default 5, flash-lite left 10 of 14 fields empty.
+- browser_use's `input` action has `clear` (`'1=clear, 0=append'`); flash-lite sent
+  `clear: False` when it typed into a field again, so the value went in twice.
 - The editor quality hook runs `ruff --fix` and `black` on every edited file and deletes
   imports that are unused at that moment: add an import in the same edit as its first use.
 
@@ -192,6 +197,18 @@ by these runs.
 | 2026-10-26 | weworkremotely, cost run, flash (run `20261026_010014`) | visible | **US$ 0.0800** (461.298752735 to 461.378750505), 27 steps, 6 scroll-only, 178 s, no form |
 | 2026-10-30 | Supabase "SDK Engineer - Python" (Ashby, temp YAML), new upload notice | headless | 15 steps, one `upload_file`, not retried; 1 `ApiCreateFileUploadHandle` blocked; final result: "the resume upload was attempted (and failed, as expected in a dry run)" |
 | 2026-10-30 | weworkremotely, flash-lite, `ScrollLoopBrake` (run `20261030_114910`) | visible | 29 logged steps, 7 scroll-only; the brake fired twice and the next step was a click both times; reached the Bitovi form on `applytojob.com`, filled it, uploaded the resume, `done`. Cost not measured |
+
+Local end-to-end runs (2026-10-30, not dry, submits went only to a local server on
+`127.0.0.1:8765` that serves two forms built from `tests/fixtures/forms.py`; the app ran
+from a sandbox dir with links to `fill.py`, `prompts`, `.env` and `knowledge`, so the
+real trackers were not touched; submitted fields compared with `00_form_answers.md`):
+
+| Model | `--max-actions` | Result |
+|---|---|---|
+| flash-lite | 5 (default) | 4 of 14 fields filled; browser validation blocked the submit; agent said `done` with success; no POST |
+| flash-lite | 12 | job 1 sent; phone, LinkedIn and website sent twice (it typed again with `clear: False`); Gender, Veteran, Disability wrong; no `mark_applied`; job 2 never opened |
+| flash | 12 | both jobs sent; job 1: 12 of 14 right (Veteran and Disability "I prefer not to answer"); job 2: all fields right; `mark_applied` passed the form URL for job 2 |
+| flash, same trackers again | 12 | job 1 skipped (`already_applied`); job 2 **sent a second time** (fixed since, see section 9) |
 
 Cost runs are read from `GET https://openrouter.ai/api/v1/key` (`data.usage`, USD) before and
 after one run; `/api/v1/activity` needs a management key. Usage also rose US$ 0.0027
@@ -254,11 +271,18 @@ Each item says when it is done.
    the same way in `CLI._run_single` and `Orchestrator._make_runner`;
    `NetworkRecorder._seen_request_ids` and `CDPDebugger._request_index` grow without
    limit over a run. Done when each is fixed or dropped on purpose.
-5. **Same job on two portals** is not detected (different URLs). Done when there is a
+5. **Open from the local end-to-end runs:** typing twice with `clear: False` sends the
+   value twice (fix idea: force `clear=True` on `input` in `StepCallback`); the default
+   `--max-actions 5` cuts form fills short (fix idea: raise it, warn when actions are cut);
+   both models answered Veteran/Disability "I prefer not to answer" although the profile
+   says otherwise; records written before 2026-10-30 with a form URL as `job_url` still
+   do not match their listing URL. Done when each is fixed or dropped on purpose, measured
+   with the local portal.
+6. **Same job on two portals** is not detected (different URLs). Done when there is a
    cross-portal key (for example company plus title) or an explicit decision not to.
-6. **Screenshot timeouts on WWR** (`Clean screenshot timed out after 6 seconds`, 3 times)
+7. **Screenshot timeouts on WWR** (`Clean screenshot timed out after 6 seconds`, 3 times)
    are not explained. Not caused by the guard on the Ashby page; never measured on WWR.
-7. `knowledge/README.md` lists files that no longer exist (it is git-ignored, the user's
+8. `knowledge/README.md` lists files that no longer exist (it is git-ignored, the user's
    copy). Tell the user, do not edit their profile.
 
 ## 10. Rules for agents working here
