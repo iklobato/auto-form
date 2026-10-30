@@ -2150,6 +2150,12 @@ class AgentActions:
                 record["recent_network_posts"] = network_recorder.recent[-10:]
             if job_url_key(job_url) != job_url_key(listing_url):
                 record["apply_url"] = job_url
+            if network_recorder:
+                # False: no POST since the job started, so the form likely never went
+                # out (browser validation can block it); left for a person to check
+                record["submit_seen"] = bool(network_recorder.recent)
+                if not record["submit_seen"]:
+                    plog.warning("mark_applied with no POST seen: %s", listing_url)
             await applied.append(record)
             if network_recorder:
                 network_recorder.start_job()

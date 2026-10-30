@@ -778,3 +778,31 @@ class TestSubmitWithoutMark:
         await dry.actions.finish_job()
 
         assert attempted_tracker.load_keys() == set()
+
+
+class TestSubmitSeen:
+    # Live run 2026-10-30: flash-lite called mark_applied for a form that never
+    # went out (browser validation blocked it), so the job was recorded as sent.
+    async def test_mark_applied_without_any_post_is_flagged(
+        self,
+        real_run: RecordedRun,
+        runs: RecordedRuns,
+        applied_tracker: JsonlTracker,
+    ) -> None:
+        await runs.tools()["mark_applied"](FORM_PAGE, "Python Engineer")
+
+        assert [record["submit_seen"] for record in applied_tracker.records()] == [
+            False
+        ]
+
+    async def test_mark_applied_after_a_post_is_not_flagged(
+        self,
+        real_run: RecordedRun,
+        runs: RecordedRuns,
+        applied_tracker: JsonlTracker,
+    ) -> None:
+        await real_run.browser_posts("https://jobs.acme.example/1001/apply")
+
+        await runs.tools()["mark_applied"](FORM_PAGE, "Python Engineer")
+
+        assert [record["submit_seen"] for record in applied_tracker.records()] == [True]
