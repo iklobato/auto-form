@@ -592,3 +592,60 @@ class TestDryRunWritesNoState:
 
         assert Paths.NOTES.read_text() == ""
         assert reply.extracted_content.startswith("dry_run: not saved")
+
+
+LISTING_URL = "http://127.0.0.1:8765/jobs/1002"
+APPLY_FORM_URL = "http://127.0.0.1:8765/jobs/1002/apply"
+
+
+class RealRunSessions:
+    """Builds the tools of one real (not dry) run; each call is a new run session."""
+
+    def __init__(self, request: pytest.FixtureRequest) -> None:
+        self.request = request
+
+    def start(self) -> FakeRegistry:
+        fixture = self.request.getfixturevalue
+        AgentActions(
+            fixture("mock_agent"),
+            "acme",
+            dry_run=False,
+            yaml_store=None,
+            applied=fixture("applied_tracker"),
+            attempted=fixture("attempted_tracker"),
+            recorder=fixture("recorder"),
+            app_logger=fixture("mock_app_logger"),
+        ).register_all()
+        return fixture("fake_registry")
+
+
+@pytest.fixture
+def sessions(request: pytest.FixtureRequest) -> RealRunSessions:
+    return RealRunSessions(request)
+
+
+class TestApplyFormUrl:
+    # Live run 2026-10-30: the agent checked the listing URL, applied, then passed
+    # the form URL to mark_applied. The next run checked the listing again, got
+    # not_applied and sent the same application a second time.
+    async def test_next_session_skips_the_listing_after_marking_the_form_url(
+        self, sessions: RealRunSessions
+    ) -> None:
+        first = sessions.start()
+        await first.actions["check_applied"](LISTING_URL)
+        await first.actions["mark_applied"](APPLY_FORM_URL, "Python Engineer")
+
+        reply = await sessions.start().actions["check_applied"](LISTING_URL)
+
+        assert reply.extracted_content == "already_applied"
+
+    # Without a check_applied first, only the URL the agent passed is known.
+    async def test_a_listing_never_checked_is_matched_by_its_form_url(
+        self, sessions: RealRunSessions
+    ) -> None:
+        first = sessions.start()
+        await first.actions["mark_applied"](APPLY_FORM_URL, "Python Engineer")
+
+        reply = await sessions.start().actions["check_applied"](APPLY_FORM_URL)
+
+        assert reply.extracted_content == "already_applied"

@@ -990,53 +990,54 @@ class JsonlTracker:
         self._lock = asyncio.Lock()
         self._log = log or logging.getLogger("auto-form")
 
-    def load_keys(self, key: str = "job_url") -> set[str]:
+    JOB_URL_FIELDS = ("job_url", "apply_url")
+
+    def records(self) -> list[dict]:
+        """Every well-formed record in the file; malformed lines are logged and skipped."""
         if not self.path.exists():
-            return set()
-        out: set[str] = set()
-        skipped_malformed = 0
-        skipped_missing_key = 0
-        with open(self.path, "r") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
-                for lineno, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError as e:
-                        skipped_malformed += 1
-                        self._log.warning(
-                            "JsonlTracker: skipping malformed line %d in %s: %s",
-                            lineno,
-                            self.path.name,
-                            e,
-                        )
-                        continue
-                    if key not in record:
-                        skipped_missing_key += 1
-                        self._log.warning(
-                            "JsonlTracker: line %d in %s missing key %r",
-                            lineno,
-                            self.path.name,
-                            key,
-                        )
-                        continue
-                    out.add(record[key])
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-        self._log.debug(
-            "JsonlTracker.%s: loaded %d keys (skipped %d malformed, %d missing key)",
-            self.path.name,
-            len(out),
-            skipped_malformed,
-            skipped_missing_key,
+            return []
+        with open(self.path, "r") as handle:
+            fcntl.flock(handle, fcntl.LOCK_SH)  # released when the file closes
+            lines = handle.read().splitlines()
+        parsed = (
+            self._parse(number, line)
+            for number, line in enumerate(lines, 1)
+            if line.strip()
         )
+        return [record for record in parsed if record is not None]
+
+    def _parse(self, lineno: int, line: str) -> dict | None:
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError as exc:
+            self._log.warning(
+                "JsonlTracker: skipping malformed line %d in %s: %s",
+                lineno,
+                self.path.name,
+                exc,
+            )
+            return None
+
+    def load_keys(self, key: str = "job_url") -> set[str]:
+        out: set[str] = set()
+        for record in self.records():
+            if key not in record:
+                self._log.warning(
+                    "JsonlTracker: record in %s missing key %r", self.path.name, key
+                )
+                continue
+            out.add(record[key])
         return out
 
     def has_job(self, job_url: str) -> bool:
-        return job_url_key(job_url) in {job_url_key(u) for u in self.load_keys()}
+        """True when a record's job_url or apply_url is the same job as `job_url`."""
+        wanted = job_url_key(job_url)
+        return any(
+            job_url_key(record[field]) == wanted
+            for record in self.records()
+            for field in self.JOB_URL_FIELDS
+            if record.get(field)
+        )
 
     async def append(self, record: dict) -> None:
         line = json.dumps(record, ensure_ascii=False) + "\n"
@@ -1863,6 +1864,9 @@ class AgentActions:
         self.shot_dir.mkdir(parents=True, exist_ok=True)
         # In-session visit counter — auto-bails when the agent revisits the same URL.
         self._session_visits: dict[str, int] = {}
+        # Listing URL that check_applied cleared last; mark_applied records it, since
+        # the agent often passes the apply-form URL instead (a different key).
+        self._checked_job: dict[str, str] = {}
 
     def register_all(self) -> None:
         self._register_check_applied()
@@ -1884,6 +1888,7 @@ class AgentActions:
         session_visits = self._session_visits
         visit_limit = self.SESSION_VISIT_LIMIT
         network_recorder = self.network_recorder
+        checked_job = self._checked_job
 
         @self.agent.tools.registry.action(
             "Check whether a specific job has already been applied to OR previously attempted-and-failed. "
@@ -1947,6 +1952,7 @@ class AgentActions:
             )
             if network_recorder:
                 network_recorder.start_job()
+            checked_job["url"] = job_url
             return ActionResult(extracted_content="not_applied")
 
     def _register_mark_applied(self) -> None:
@@ -1959,6 +1965,7 @@ class AgentActions:
             self.dry_run,
         )
         network_recorder = self.network_recorder
+        checked_job = self._checked_job
 
         @self.agent.tools.registry.action(
             "Record that an application was successfully submitted. "
@@ -1987,9 +1994,10 @@ class AgentActions:
                         "listing, or call done if there is none."
                     )
                 )
+            listing_url = checked_job.pop("url", job_url)
             record = {
                 "portal": portal,
-                "job_url": job_url,
+                "job_url": listing_url,
                 "job_title": job_title,
                 "salary": salary,
                 "location": location,
@@ -2004,6 +2012,8 @@ class AgentActions:
             # contains evidence of what was actually POSTed during the apply flow.
             if network_recorder:
                 record["recent_network_posts"] = network_recorder.recent[-10:]
+            if job_url_key(job_url) != job_url_key(listing_url):
+                record["apply_url"] = job_url
             await applied.append(record)
             recorder.write(record)
             plog.info(
