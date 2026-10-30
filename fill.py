@@ -45,6 +45,7 @@ from browser_use.agent.views import ActionResult
 from browser_use.browser import BrowserSession
 from browser_use.browser.profile import BrowserProfile
 from browser_use.llm.openrouter.chat import ChatOpenRouter
+from cdp_use.client import CDPClient
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -1137,6 +1138,54 @@ def add_cdp_handler(cdp_client, method: str, callback) -> None:
     registry.register(method, fan_out)
 
 
+class FrameSessions:
+    """Turns on Network/Page events in each cross-site iframe's own CDP session.
+
+    browser_use auto-attaches every iframe in its own process (flatten, same client),
+    but events only flow from sessions that enabled the domain, so a form in a
+    cross-site iframe (a company page embedding Greenhouse) was never recorded.
+    """
+
+    # ponytail: covers iframes attached after attach_if_needed (the first step runs
+    # before any job page loads) and misses requests sent before enable returns.
+    IFRAME = "iframe"
+    ID_CHARS = 8
+
+    def __init__(
+        self, cdp_client: CDPClient, frame_urls: dict[str, str], plog: logging.Logger
+    ) -> None:
+        self.cdp_client = cdp_client
+        self.frame_urls = frame_urls
+        self.plog = plog
+        self._pending: dict[asyncio.Task, None] = {}
+
+    def on_attached(self, event: dict, session_id: str | None = None) -> None:
+        if (event.get("targetInfo") or {}).get("type") != self.IFRAME:
+            return
+        # Never await a CDP command inside an event handler (same read loop)
+        task = asyncio.create_task(self.enable(event["sessionId"]))
+        self._pending[task] = None
+        task.add_done_callback(self.forget)
+
+    def forget(self, task: asyncio.Task) -> None:
+        self._pending.pop(task, None)
+
+    async def enable(self, session_id: str) -> None:
+        try:
+            await self.cdp_client.send.Network.enable(session_id=session_id)
+            await self.cdp_client.send.Page.enable(session_id=session_id)
+            # Its first navigation came before Page events were on
+            tree = await self.cdp_client.send.Page.getFrameTree(session_id=session_id)
+        except (RuntimeError, ConnectionError) as exc:
+            # short-lived iframes detach before this runs
+            self.plog.debug(
+                "iframe session %s not enabled: %s", session_id[: self.ID_CHARS], exc
+            )
+            return
+        frame = tree["frameTree"]["frame"]
+        self.frame_urls.setdefault(frame["id"], frame.get("url", ""))
+
+
 class FrameUrls:
     """URL each frame shows now, so a request can be tied to the page that sent it.
 
@@ -1265,16 +1314,17 @@ class NetworkRecorder:
             return
         await cdp_session.cdp_client.send.Network.enable(session_id=sid)
         await cdp_session.cdp_client.send.Page.enable(session_id=sid)
-        add_cdp_handler(
-            cdp_session.cdp_client, "Network.requestWillBeSent", self._on_request
-        )
-        add_cdp_handler(
-            cdp_session.cdp_client,
-            "Page.frameNavigated",
-            FrameUrls(self._frame_urls).on_navigated,
-        )
+        self._subscribe(cdp_session.cdp_client)
         self._attached_session_ids.add(sid)
         self.plog.debug("NetworkRecorder attached to CDP session %s", sid[:12])
+
+    def _subscribe(self, cdp_client: CDPClient) -> None:
+        add_cdp_handler(cdp_client, "Network.requestWillBeSent", self._on_request)
+        add_cdp_handler(
+            cdp_client, "Page.frameNavigated", FrameUrls(self._frame_urls).on_navigated
+        )
+        frames = FrameSessions(cdp_client, self._frame_urls, self.plog)
+        add_cdp_handler(cdp_client, "Target.attachedToTarget", frames.on_attached)
 
     def _on_request(self, event: dict, session_id: str | None = None) -> None:
         request_id = event.get("requestId", "")
