@@ -210,6 +210,15 @@ real trackers were not touched; submitted fields compared with `00_form_answers.
 | flash | 12 | both jobs sent; job 1: 12 of 14 right (Veteran and Disability "I prefer not to answer"); job 2: all fields right; `mark_applied` passed the form URL for job 2 |
 | flash, same trackers again | 12 | job 1 skipped (`already_applied`); job 2 **sent a second time** (fixed since, see section 9) |
 
+After the duplicate fix (same day, fresh sandbox trackers, cost from the key `usage`):
+
+| Run | Result | Cost |
+|---|---|---|
+| A: flash, `--max-actions 12` | 16 steps; both jobs sent; records keep the listing URL as `job_url` and the form URL as `apply_url`; no field sent twice; Veteran "I am not a veteran", Disability "No" | US$ 0.172 |
+| B: same again | 8 steps; both jobs `already_applied`, **no POST** | US$ 0.068 |
+| C: flash, `--dry-run`, fresh trackers | 48 steps; both forms filled; **no POST**, nothing in `applied.jsonl`, notes file unchanged (md5); the agent never clicked submit, so the guard had nothing to block | US$ 0.569 |
+| D: flash-lite, `--max-actions 12` | 8 steps; job 1 sent, but no `check_applied` and no `mark_applied`, so nothing recorded; job 2 never opened | US$ 0.020 |
+
 Cost runs are read from `GET https://openrouter.ai/api/v1/key` (`data.usage`, USD) before and
 after one run; `/api/v1/activity` needs a management key. Usage also rose US$ 0.0027
 between the two runs with nothing of ours running, so each number is good to about
@@ -274,8 +283,9 @@ Each item says when it is done.
 5. **Open from the local end-to-end runs:** typing twice with `clear: False` sends the
    value twice (fix idea: force `clear=True` on `input` in `StepCallback`); the default
    `--max-actions 5` cuts form fills short (fix idea: raise it, warn when actions are cut);
-   both models answered Veteran/Disability "I prefer not to answer" although the profile
-   says otherwise; records written before 2026-10-30 with a form URL as `job_url` still
+   Veteran/Disability came back "I prefer not to answer" in 2 of 3 runs although the
+   profile says otherwise; flash-lite can submit without `mark_applied`, so the job is not
+   recorded and the next run applies again (run D); records written before 2026-10-30 with a form URL as `job_url` still
    do not match their listing URL. Done when each is fixed or dropped on purpose, measured
    with the local portal.
 6. **Same job on two portals** is not detected (different URLs). Done when there is a
