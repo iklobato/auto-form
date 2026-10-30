@@ -4,6 +4,10 @@ Read this first if you are an agent (or a person) picking up this repo. It says 
 code does today, what was learned the hard way, what was done, and what is still open.
 Last updated: 2026-10-30.
 
+Work of one session, with its evidence, lives in `docs/sessions/<date>.md`:
+[2026-10-30](sessions/2026-10-30.md) (retries, dry-run safety, duplicate applications,
+submit capture, local end-to-end test).
+
 This repo is public. Never put personal data here (names, emails, phone, resume file
 names, anything from `knowledge/`, `systems*.yaml` or `.env`).
 
@@ -37,10 +41,11 @@ uv run python fill.py --summary                   # applications on disk
 
 | Path | Tracked | What it is |
 |---|---|---|
-| `fill.py` | yes | the whole app (about 2,800 lines) |
+| `fill.py` | yes | the whole app (about 3,100 lines) |
 | `prompts/task.md` | yes | task template; `TaskBuilder` fills `{placeholders}` |
 | `tests/` | yes | pytest suite; `tests/fixtures/forms.py` has form fixtures |
 | `README.md` | yes | user docs and CLI flags |
+| `docs/` | yes | this file and `sessions/<date>.md` (one file per work session) |
 | `.env.example` | yes | env template |
 | `.env` | no | secrets: `OPENROUTER_TOKEN`, `RESUME_PATH`, `PORTAL_ACCOUNT_PASSWORD`, `LINKEDIN_SSO_*`, per-portal `*_USERNAME/_PASSWORD` |
 | `systems.yaml` | no | default portal list (55 entries). Holds plaintext portal passwords |
@@ -141,11 +146,15 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   as `portal_crash`, not retried, the batch and summary finish, then it is re-raised.
 - `StepCallback` errors (other than the guard) are logged as `step_callback_error` and
   never reach the agent.
-- `BackoffTransport` retries 429/5xx, caps `Retry-After` at `max_wait`, stops when the
+- `BackoffTransport` retries 429/5xx and `httpx.TransportError` (one `RetryBudget` per
+  request), caps `Retry-After` at `max_wait`, stops when the
   next sleep would pass 45 s in total (browser_use cancels an LLM call after 75 s for the
   default gemini model; slowest logged step was 19.8 s), and closes each discarded response.
 - `PortalRunner._clean_stale_locks` raises `ProfileInUse` if the profile's `SingletonLock`
   points at a live Chrome on this host; it only removes locks from dead or foreign pids.
+  `Orchestrator` does not retry `ProfileInUse`.
+- `ScrollLoopBrake` (called from `StepCallback`) adds a note to the agent history after
+  every 3rd scroll-only step in a row (see section 6 for why it uses a private API).
 
 ## 6. Things learned (read before debugging)
 
@@ -202,8 +211,10 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
 
 ## 7. Live test record
 
-All runs were `--dry-run`. Nothing was ever written to `applied.jsonl` or `attempted.jsonl`
-by these runs.
+The real-site runs below were all `--dry-run`; nothing was written to the user's
+`applied.jsonl` or `attempted.jsonl`. The local end-to-end runs further down were not dry,
+but every submit went only to a local test server and they ran from a sandbox dir with
+its own trackers (how: [sessions/2026-10-30.md](sessions/2026-10-30.md), section 8).
 
 | Date | Portal | Mode | Result |
 |---|---|---|---|
@@ -272,15 +283,9 @@ server records the POST, with it the server records nothing.
   `mark_applied` reply says the job is done; this file and `CLAUDE.md`.
 - Follow-up after PR #4 (2026-10-26): `google.com/measurement` (Google Ads conversion
   ping) added to the noise list; this file updated with the model comparison.
-- Branch `fix/retry-upload-guard-scroll` (2026-10-30, one commit each, all with tests):
-  LLM network errors retried within the 45 s budget (`RetryBudget`); dry-run notice says a
-  blocked upload is expected; real-Chrome guard test; `ScrollLoopBrake`; `save_credentials`
-  and `save_note` write nothing in a dry run; every 4xx/5xx logged as `http_error`;
-  `--max-actions` must be 1 or more; stale comments and `check_applied` tool text fixed;
-  E741 lint fixed; three more analytics hosts in the noise list; `save_credentials` for a
-  portal missing from the YAML replies "not saved" and leaves the file alone; one
-  `systems`/`sources` rule (`YamlStore.systems_key`); `ProfileInUse` is not retried;
-  `browser_start` says `fresh` for a new profile.
+- Branch `fix/retry-upload-guard-scroll` (2026-10-30, one commit per change, each with its test):
+  every change, the evidence and the commit for each is in
+  [sessions/2026-10-30.md](sessions/2026-10-30.md), section 3.
 - Measured: the guard does not slow screenshots (0.10 to 0.13 s with and without, 5 runs
   each on an Ashby page). Page loads were 1.1 to 1.5 s or about 8.2 s in both groups; the
   8 s is browser_use's own readiness timeout.
@@ -296,22 +301,18 @@ Each item says when it is done.
    flash-lite stalls. Reopen if more runs show flash-lite missing real matches.
 2. **Closed 2026-10-30:** dry-run upload error (notice changed, see section 7), guard on
    a real submit (real-Chrome test), LLM network-error retry, E741 lint.
-3. **Scroll brake effect.** Fired and was followed by a click in 1 WWR run (section 7).
-   Done when 3 or more flash-lite WWR runs are compared with the earlier ones.
-4. **Review findings not fixed yet (2026-10-30):** `StepCallback` extracts the actions
-   twice (`_extract_action_names` and `_extract_action_details`); `PortalRunner` is built
-   the same way in `CLI._run_single` and `Orchestrator._make_runner`;
-   `NetworkRecorder._seen_request_ids` and `CDPDebugger._request_index` grow without
-   limit over a run. Done when each is fixed or dropped on purpose.
-5. **Open from the local end-to-end runs:** typing twice with `clear: False` sends the
-   value twice (fix idea: force `clear=True` on `input` in `StepCallback`); the default
-   `--max-actions 5` cuts form fills short (fix idea: raise it, warn when actions are cut);
-   Veteran/Disability came back "I prefer not to answer" in 2 of 3 runs although the
-   profile says otherwise; flash-lite can submit without `mark_applied`, so the job is not
-   recorded and the next run applies again (run D); it can also call `mark_applied` when no POST went
-   out (run E), now flagged `submit_seen: false` but still recorded as applied; records written before 2026-10-30 with a form URL as `job_url` still
-   do not match their listing URL. Done when each is fixed or dropped on purpose, measured
-   with the local portal.
+3. **Open from 2026-10-30** (details, fix ideas and "done when" for each in
+   [sessions/2026-10-30.md](sessions/2026-10-30.md), section 6): `clear: False` sends a
+   value twice; the default `--max-actions 5` cuts form fills short (no form was sent in
+   the default local run); `mark_applied` with no POST is still recorded as applied
+   (`submit_seen: false`); an agent that skips `check_applied` can still apply twice;
+   Veteran/Disability answers; scroll brake measured once; Greenhouse in a cross-site
+   iframe and the guard on an agent's submit click not seen live; three review findings.
+4. **Records written before 2026-10-30** with a form URL as `job_url` do not match their
+   listing URL. The user's `applied.jsonl` did not exist on 2026-10-30, so nothing to fix
+   there today.
+5. **What to watch in real runs:** [sessions/2026-10-30.md](sessions/2026-10-30.md),
+   section 9 (`submit_seen: false`, `submitted_not_marked`, brake log lines, dry-run cost).
 6. **Same job on two portals** is not detected (different URLs). Done when there is a
    cross-portal key (for example company plus title) or an explicit decision not to.
 7. **Screenshot timeouts on WWR** (`Clean screenshot timed out after 6 seconds`, 3 times)
