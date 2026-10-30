@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fill import Orchestrator
+from fill import Orchestrator, ProfileInUse
 
 
 class TestSelectActive:
@@ -122,3 +122,31 @@ class TestCrashIsolation:
         ]
         assert run_done[0]["succeeded"] == ["fine"]
         assert run_done[0]["failed"] == ["buggy"]
+
+
+RUN_PLUS_ONE_RETRY = 2
+
+
+class TestProfileInUse:
+    # A live Chrome holding the profile is still there 5 s later; a retry only
+    # repeats the proxy acquire and fails the same way.
+    async def test_is_not_retried_but_other_failures_are(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        orch = TestProxyProviders._orchestrator(
+            [
+                {"name": "locked", "url": "https://a.example.com/"},
+                {"name": "flaky", "url": "https://b.example.com/"},
+            ]
+        )
+        locked = AsyncMock(side_effect=ProfileInUse("Chrome pid 1 holds it"))
+        flaky = AsyncMock(side_effect=[TimeoutError("cdp"), "applied"])
+        runs = {"locked": locked, "flaky": flaky}
+        monkeypatch.setattr(
+            orch, "_make_runner", lambda system: MagicMock(run=runs[system["name"]])
+        )
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        await orch.run()
+
+        assert (locked.await_count, flaky.await_count) == (1, RUN_PLUS_ONE_RETRY)

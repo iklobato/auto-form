@@ -2527,8 +2527,13 @@ class Orchestrator:
     async def _retry_failures(
         self, results: list[tuple[str, str | Exception]]
     ) -> list[tuple[str, str | Exception]]:
+        # A profile held by a live Chrome is still held 5 s later
         failed = {
-            n for n, r in results if isinstance(r, Exception) and n not in self._crashed
+            n
+            for n, r in results
+            if isinstance(r, Exception)
+            and not isinstance(r, ProfileInUse)
+            and n not in self._crashed
         }
         if not failed:
             return results
