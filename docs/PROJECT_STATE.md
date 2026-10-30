@@ -218,6 +218,8 @@ After the duplicate fix (same day, fresh sandbox trackers, cost from the key `us
 | B: same again | 8 steps; both jobs `already_applied`, **no POST** | US$ 0.068 |
 | C: flash, `--dry-run`, fresh trackers | 48 steps; both forms filled; **no POST**, nothing in `applied.jsonl`, notes file unchanged (md5); the agent never clicked submit, so the guard had nothing to block | US$ 0.569 |
 | D: flash-lite, `--max-actions 12` | 8 steps; job 1 sent, but no `check_applied` and no `mark_applied`, so nothing recorded; job 2 never opened | US$ 0.020 |
+| E: flash-lite, fresh trackers, after the unmarked-submit fix | 13 steps; job 1 sent and marked; job 2 **marked applied with no POST** (the form never went out), so it is recorded as applied and will be skipped forever | not reliable (key usage also rose from other use) |
+| F: same again | job 1 `already_applied`; job 2 opened and left; no POST | same |
 
 Cost runs are read from `GET https://openrouter.ai/api/v1/key` (`data.usage`, USD) before and
 after one run; `/api/v1/activity` needs a management key. Usage also rose US$ 0.0027
@@ -285,7 +287,8 @@ Each item says when it is done.
    `--max-actions 5` cuts form fills short (fix idea: raise it, warn when actions are cut);
    Veteran/Disability came back "I prefer not to answer" in 2 of 3 runs although the
    profile says otherwise; flash-lite can submit without `mark_applied`, so the job is not
-   recorded and the next run applies again (run D); records written before 2026-10-30 with a form URL as `job_url` still
+   recorded and the next run applies again (run D); it can also call `mark_applied` when no POST went
+   out (run E), which records a job that was never sent; records written before 2026-10-30 with a form URL as `job_url` still
    do not match their listing URL. Done when each is fixed or dropped on purpose, measured
    with the local portal.
 6. **Same job on two portals** is not detected (different URLs). Done when there is a
