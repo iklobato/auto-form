@@ -66,3 +66,11 @@ class TestWorkersArg:
 
     def test_accepts_one(self):
         assert CLI._build_parser().parse_args(["--all", "--workers", "1"]).workers == 1
+
+
+class TestMaxActionsArg:
+    # browser_use keeps action[:max_actions_per_step]: 0 runs nothing, -1 drops `done`
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_rejects_less_than_one(self, value: str) -> None:
+        with pytest.raises(SystemExit):
+            CLI._build_parser().parse_args(["--all", "--max-actions", value])

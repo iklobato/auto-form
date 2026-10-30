@@ -2688,7 +2688,11 @@ class SummaryReporter:
 
 
 def positive_int(value: str) -> int:
-    """argparse type: --workers 0 would make Semaphore(0) and hang the run forever."""
+    """argparse type for counts that must be at least 1.
+
+    --workers 0 would make Semaphore(0) and hang the run; --max-actions 0 would make
+    every step run no action.
+    """
     number = int(value)
     if number < 1:
         raise argparse.ArgumentTypeError(f"must be 1 or more, got {number}")
@@ -2759,7 +2763,7 @@ class CLI:
         )
         p.add_argument(
             "--max-actions",
-            type=int,
+            type=positive_int,
             default=5,
             help="Max actions per LLM call (default 5; raise to 8–12)",
         )
