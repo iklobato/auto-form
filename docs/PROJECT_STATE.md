@@ -228,7 +228,10 @@ server records the POST, with it the server records nothing.
   blocked upload is expected; real-Chrome guard test; `ScrollLoopBrake`; `save_credentials`
   and `save_note` write nothing in a dry run; every 4xx/5xx logged as `http_error`;
   `--max-actions` must be 1 or more; stale comments and `check_applied` tool text fixed;
-  E741 lint fixed.
+  E741 lint fixed; three more analytics hosts in the noise list; `save_credentials` for a
+  portal missing from the YAML replies "not saved" and leaves the file alone; one
+  `systems`/`sources` rule (`YamlStore.systems_key`); `ProfileInUse` is not retried;
+  `browser_start` says `fresh` for a new profile.
 - Measured: the guard does not slow screenshots (0.10 to 0.13 s with and without, 5 runs
   each on an Ashby page). Page loads were 1.1 to 1.5 s or about 8.2 s in both groups; the
   8 s is browser_use's own readiness timeout.
@@ -246,15 +249,11 @@ Each item says when it is done.
    a real submit (real-Chrome test), LLM network-error retry, E741 lint.
 3. **Scroll brake effect.** Fired and was followed by a click in 1 WWR run (section 7).
    Done when 3 or more flash-lite WWR runs are compared with the earlier ones.
-4. **Review findings not fixed yet (2026-10-30):** an unknown portal name in
-   `YamlStore.update_credentials` still rewrites the YAML and replies "saved" (a test
-   locks that in); `CLI.run` and `YamlStore` read `systems`/`sources` differently;
-   `ProfileInUse` is a `RuntimeError`, so it is retried; the `browser_start` log always says
-   "reused" (the `portal_password` file is in the profile dir); `StepCallback` extracts
-   actions twice; `PortalRunner` is built the same way in two places; two request-id sets
-   grow without limit; the analytics hosts `esp.aptrinsic.com`,
-   `pagead2.googlesyndication.com` and WWR `listing_ads/.../impression` are not in the
-   noise list yet.
+4. **Review findings not fixed yet (2026-10-30):** `StepCallback` extracts the actions
+   twice (`_extract_action_names` and `_extract_action_details`); `PortalRunner` is built
+   the same way in `CLI._run_single` and `Orchestrator._make_runner`;
+   `NetworkRecorder._seen_request_ids` and `CDPDebugger._request_index` grow without
+   limit over a run. Done when each is fixed or dropped on purpose.
 5. **Same job on two portals** is not detected (different URLs). Done when there is a
    cross-portal key (for example company plus title) or an explicit decision not to.
 6. **Screenshot timeouts on WWR** (`Clean screenshot timed out after 6 seconds`, 3 times)
