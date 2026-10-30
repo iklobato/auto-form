@@ -2,7 +2,7 @@
 
 Read this first if you are an agent (or a person) picking up this repo. It says what the
 code does today, what was learned the hard way, what was done, and what is still open.
-Last updated: 2026-10-26.
+Last updated: 2026-10-30.
 
 This repo is public. Never put personal data here (names, emails, phone, resume file
 names, anything from `knowledge/`, `systems*.yaml` or `.env`).
@@ -90,6 +90,9 @@ uv run python fill.py --summary                   # applications on disk
 - The prompt gets one `TaskBuilder.DRY_RUN_NOTICE`: fill, do not submit, call
   `mark_applied`, move on. In a dry run `mark_applied` and `mark_attempted` write nothing,
   and `mark_applied` replies that the job is done (a "not recorded" reply caused a loop).
+  `save_credentials` (the sign-up POST was blocked, so the account does not exist) and
+  `save_note` (`knowledge/*.md` goes into every prompt) also write nothing. The notice
+  says a failed upload is expected, so the agent does not report it as an error.
 - Known cost: sites that use POST for reads other than GraphQL queries (for example Algolia
   search) may show nothing in a dry run.
 
@@ -161,6 +164,13 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   `https://api.lever.co/v0/postings/<co>?mode=json`.
 - GitGuardian scans every commit of a PR; it flagged a made-up test password. Keep test
   secrets short or built at runtime (`"x$y"`), not password-looking literals.
+- browser_use has its own loop detector, but its nudges start at 5 repeats and say to
+  carry on if making progress; flash-lite scrolled through them. `ScrollLoopBrake` adds a
+  note after every 3rd scroll-only step in a row. It writes to
+  `agent._message_manager.state.agent_history_items` because context messages added in
+  the step callback are cleared before the next LLM call, and `Agent.add_new_task`
+  replaces the task. A browser_use upgrade can break this: `tests/test_scroll_loop_brake.py`
+  checks it against the real `MessageManager`.
 - The editor quality hook runs `ruff --fix` and `black` on every edited file and deletes
   imports that are unused at that moment: add an import in the same edit as its first use.
 
@@ -180,14 +190,18 @@ by these runs.
 | 2026-10-26 | weworkremotely, `--model google/gemini-2.5-flash` (run `20261026_004642`) | visible | 23 logged steps, 5 scroll-only (flash-lite: 21 / 14). Accepted the Proxify role that flash-lite rejected on timezone, followed it to `talent.proxify.io/apply`, filled it and uploaded the resume; its "Next" button never enabled, so no POST went to Proxify. Blocked: WWR `job_apply_count` and a Google conversion ping |
 | 2026-10-26 | weworkremotely, cost run, flash-lite (run `20261026_005544`) | visible | **US$ 0.0117** (key `usage` 461.284374135 to 461.296102585), 9 steps, 5 scroll-only, 244 s, no form |
 | 2026-10-26 | weworkremotely, cost run, flash (run `20261026_010014`) | visible | **US$ 0.0800** (461.298752735 to 461.378750505), 27 steps, 6 scroll-only, 178 s, no form |
+| 2026-10-30 | Supabase "SDK Engineer - Python" (Ashby, temp YAML), new upload notice | headless | 15 steps, one `upload_file`, not retried; 1 `ApiCreateFileUploadHandle` blocked; final result: "the resume upload was attempted (and failed, as expected in a dry run)" |
+| 2026-10-30 | weworkremotely, flash-lite, `ScrollLoopBrake` (run `20261030_114910`) | visible | 29 logged steps, 7 scroll-only; the brake fired twice and the next step was a click both times; reached the Bitovi form on `applytojob.com`, filled it, uploaded the resume, `done`. Cost not measured |
 
 Cost runs are read from `GET https://openrouter.ai/api/v1/key` (`data.usage`, USD) before and
 after one run; `/api/v1/activity` needs a management key. Usage also rose US$ 0.0027
 between the two runs with nothing of ours running, so each number is good to about
 US$ 0.003. One run per model is a small sample.
 
-Still never seen live: the guard blocking a final submit click. The agent obeys the
-dry-run notice and never clicks it.
+The agent obeys the dry-run notice and never clicks a final submit, so that click is
+covered by `tests/test_dry_run_guard_chrome.py` instead: a real headless Chrome clicks a
+form's submit button and sends a `fetch` POST to a local server; without the guard the
+server records the POST, with it the server records nothing.
 
 ## 8. Done so far
 
@@ -209,6 +223,12 @@ dry-run notice and never clicks it.
   `mark_applied` reply says the job is done; this file and `CLAUDE.md`.
 - Follow-up after PR #4 (2026-10-26): `google.com/measurement` (Google Ads conversion
   ping) added to the noise list; this file updated with the model comparison.
+- Branch `fix/retry-upload-guard-scroll` (2026-10-30, one commit each, all with tests):
+  LLM network errors retried within the 45 s budget (`RetryBudget`); dry-run notice says a
+  blocked upload is expected; real-Chrome guard test; `ScrollLoopBrake`; `save_credentials`
+  and `save_note` write nothing in a dry run; every 4xx/5xx logged as `http_error`;
+  `--max-actions` must be 1 or more; stale comments and `check_applied` tool text fixed;
+  E741 lint fixed.
 - Measured: the guard does not slow screenshots (0.10 to 0.13 s with and without, 5 runs
   each on an Ashby page). Page loads were 1.1 to 1.5 s or about 8.2 s in both groups; the
   8 s is browser_use's own readiness timeout.
@@ -222,23 +242,25 @@ Each item says when it is done.
    2.3 times per step), and its better behavior (fewer scroll-only steps, reached a form)
    showed in 1 of 2 runs. Use `--model google/gemini-2.5-flash` for a portal where
    flash-lite stalls. Reopen if more runs show flash-lite missing real matches.
-2. **Dry-run upload is reported as an error.** The guard correctly blocks
-   `ApiCreateFileUploadHandle`, and the agent then says the upload failed. Decide whether
-   the notice should tell the agent uploads are blocked in a dry run. Done when a dry run
-   on an Ashby form ends without an upload error in the final result.
-3. **Guard on a real final submit.** Never observed live (see section 7). Done when a dry
-   run log shows a blocked submit mutation or form POST after a submit click.
-4. **No retry for LLM network errors.** `ChatOpenRouter(max_retries=0)` plus
-   `BackoffTransport` retries only status codes, so `ConnectError`/`ReadTimeout` fail the
-   step at once. Done when a transport-level error is retried with the same 45 s budget,
-   with a test.
+2. **Closed 2026-10-30:** dry-run upload error (notice changed, see section 7), guard on
+   a real submit (real-Chrome test), LLM network-error retry, E741 lint.
+3. **Scroll brake effect.** Fired and was followed by a click in 1 WWR run (section 7).
+   Done when 3 or more flash-lite WWR runs are compared with the earlier ones.
+4. **Review findings not fixed yet (2026-10-30):** an unknown portal name in
+   `YamlStore.update_credentials` still rewrites the YAML and replies "saved" (a test
+   locks that in); `CLI.run` and `YamlStore` read `systems`/`sources` differently;
+   `ProfileInUse` is a `RuntimeError`, so it is retried; the `browser_start` log always says
+   "reused" (the `portal_password` file is in the profile dir); `StepCallback` extracts
+   actions twice; `PortalRunner` is built the same way in two places; two request-id sets
+   grow without limit; the analytics hosts `esp.aptrinsic.com`,
+   `pagead2.googlesyndication.com` and WWR `listing_ads/.../impression` are not in the
+   noise list yet.
 5. **Same job on two portals** is not detected (different URLs). Done when there is a
    cross-portal key (for example company plus title) or an explicit decision not to.
 6. **Screenshot timeouts on WWR** (`Clean screenshot timed out after 6 seconds`, 3 times)
    are not explained. Not caused by the guard on the Ashby page; never measured on WWR.
 7. `knowledge/README.md` lists files that no longer exist (it is git-ignored, the user's
    copy). Tell the user, do not edit their profile.
-8. One old lint warning: E741 in `tests/test_cdp_debugger.py` (`_events_lines`).
 
 ## 10. Rules for agents working here
 
