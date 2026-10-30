@@ -1132,7 +1132,7 @@ class NetworkRecorder:
 
     Lets you verify the agent actually submitted the right values rather than
     trusting its self-report. Filters out analytics/telemetry noise. Records
-    are persisted to applications/<portal>/network/<ts>_<method>.json and
+    are persisted to applications/<portal>/network/<ts>_<requestId>_<method>.json and
     also kept in an in-memory ring buffer that mark_applied can attach to
     its application record.
     """
@@ -1323,7 +1323,7 @@ class CDPDebugger:
     - Runtime.exceptionThrown  — uncaught JavaScript errors
     - Page.javascriptDialogOpening — alert/confirm/prompt dialogs (can block forms)
 
-    Interesting events (4xx/5xx, errors, popups) log at INFO. Everything else
+    Errors (4xx/5xx, JS errors) log at WARNING and new tabs at INFO. Everything else
     goes to DEBUG, but every event is persisted to applications/<portal>/cdp.jsonl
     for offline inspection.
     """
@@ -1821,9 +1821,8 @@ class AgentActions:
 
     _notes_lock = asyncio.Lock()
 
-    SESSION_VISIT_LIMIT = (
-        2  # max times a URL can be visited in this session before auto-bail
-    )
+    # check_applied calls per URL in one session; the next call gets loop_detected
+    SESSION_VISIT_LIMIT = 2
 
     def __init__(
         self,
@@ -1879,7 +1878,7 @@ class AgentActions:
             "Call this before clicking Apply on ANY listing. Returns one of: "
             "'already_applied' (we successfully applied — skip it), "
             "'already_attempted' (we tried and gave up before — DO NOT retry, skip it), "
-            "'visited_this_session' (you've already opened this URL once or more in this run — "
+            "'loop_detected' (you already checked this URL twice in this run — "
             "PICK A DIFFERENT listing, do not retry this one), "
             "'not_applied' (proceed with the apply flow)."
         )
@@ -2397,7 +2396,6 @@ class PortalRunner:
         )
         callback.agent_ref = agent  # lets callbacks attach the recorders
         self._network_recorder = network_recorder
-        self._cdp_debugger = cdp_debugger
         return agent
 
     async def _run_agent(self, agent: Agent) -> str:
@@ -2548,7 +2546,7 @@ class Orchestrator:
 
         # Failure modes we want to catch and continue past (other portals are still useful):
         # - browser_use's own runtime errors (wrapped in their own classes)
-        # - Browser/CDP connection issues (TimeoutError, OSError, asyncio.CancelledError)
+        # - Browser/CDP connection issues (TimeoutError, OSError)
         # - Network errors from the LLM (httpx.HTTPError)
         # Real bugs (TypeError/AttributeError/KeyError from our code) are not retried
         # and still crash the run, but only after the other portals finish and the
