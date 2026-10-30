@@ -539,6 +539,34 @@ def dry_run_registry(request: pytest.FixtureRequest) -> FakeRegistry:
     return request.getfixturevalue("fake_registry")
 
 
+@pytest.fixture
+def ghost_portal_registry(request: pytest.FixtureRequest) -> FakeRegistry:
+    """Tools of a real run for a portal that the systems YAML does not list."""
+    AgentActions(
+        request.getfixturevalue("mock_agent"),
+        "ghost",
+        dry_run=False,
+        yaml_store=request.getfixturevalue("yaml_store"),
+        applied=request.getfixturevalue("applied_tracker"),
+        attempted=request.getfixturevalue("attempted_tracker"),
+        recorder=request.getfixturevalue("recorder"),
+        app_logger=request.getfixturevalue("mock_app_logger"),
+    ).register_all()
+    return request.getfixturevalue("fake_registry")
+
+
+class TestSaveCredentialsUnknownPortal:
+    async def test_replies_not_saved_and_keeps_the_yaml(
+        self, ghost_portal_registry: FakeRegistry, yaml_store: YamlStore
+    ) -> None:
+        before = yaml_store.path.read_text()
+
+        reply = await ghost_portal_registry.actions["save_credentials"]("u@x", "pw")
+
+        assert yaml_store.path.read_text() == before
+        assert reply.extracted_content.startswith("not saved: 'ghost' is not in ")
+
+
 class TestDryRunWritesNoState:
     # The guard blocks the account-creation POST, so the account the agent "saves"
     # does not exist; writing it would overwrite the portal's real credentials.

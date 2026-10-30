@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from fill import YamlStore
+from fill import UnknownSystem, YamlStore
 
 
 class TestYamlStoreLoad:
@@ -114,12 +114,29 @@ class TestUpdateCredentials:
         assert "password_env" not in creds
         assert creds["username"] == "u@x"
 
-    @pytest.mark.asyncio
-    async def test_unknown_system_does_not_raise(self, systems_yaml_file: Path):
+    async def test_unknown_system_raises_and_keeps_the_file(
+        self, systems_yaml_file: Path
+    ) -> None:
+        before = systems_yaml_file.read_text()
         store = YamlStore(systems_yaml_file)
-        # Should silently no-op rather than raise — the agent could call this
-        # mid-flight after the user removed the entry from the yaml.
-        await store.update_credentials("nonexistent", "u", "p")
+
+        with pytest.raises(
+            UnknownSystem, match="^'nonexistent' is not in .*systems.yaml$"
+        ):
+            await store.update_credentials("nonexistent", "u", "p")
+
+        assert systems_yaml_file.read_text() == before
+
+    async def test_empty_systems_key_falls_back_to_sources(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "mixed.yaml"
+        path.write_text(yaml.dump({"systems": [], "sources": [{"name": "x"}]}))
+        store = YamlStore(path)
+
+        await store.update_credentials("x", "u", "p")
+
+        assert store.load()["sources"][0]["credentials"]["username"] == "u"
 
     @pytest.mark.asyncio
     async def test_works_with_sources_schema(self, tmp_path: Path):

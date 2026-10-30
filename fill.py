@@ -203,6 +203,10 @@ def expand_env(value: str) -> str:
 # ── YAML I/O ──────────────────────────────────────────────────────────────────
 
 
+class UnknownSystem(LookupError):
+    """The systems YAML has no entry with this name (the user may have removed it)."""
+
+
 class YamlStore:
     """Read + atomic write of a systems YAML file (works for both `systems:` and `sources:` schemas)."""
 
@@ -231,15 +235,10 @@ class YamlStore:
         with open(lock_path, "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             raw = self.load()
-            key = "systems" if "systems" in raw else "sources"
-            for system in raw.get(key) or []:
-                if system.get("name") == system_name:
-                    creds = system.setdefault("credentials", {})
-                    creds["username"] = username
-                    creds["password"] = password
-                    creds.pop("username_env", None)
-                    creds.pop("password_env", None)
-                    break
+            creds = self._find(raw, system_name).setdefault("credentials", {})
+            creds.update(username=username, password=password)
+            creds.pop("username_env", None)
+            creds.pop("password_env", None)
             self._replace(
                 yaml.dump(
                     raw,
@@ -249,6 +248,16 @@ class YamlStore:
                     width=120,
                 )
             )
+
+    def systems_key(self, raw: dict) -> str:
+        """`systems:` when it has entries, else the older `sources:` name."""
+        return "systems" if raw.get("systems") else "sources"
+
+    def _find(self, raw: dict, system_name: str) -> dict:
+        for system in raw.get(self.systems_key(raw)) or []:
+            if system.get("name") == system_name:
+                return system
+        raise UnknownSystem(f"{system_name!r} is not in {self.path}")
 
     def _replace(self, text: str) -> None:
         """Write to a sibling temp file, then rename, so a crash never truncates the yaml."""
@@ -2134,8 +2143,12 @@ class AgentActions:
             if dry_run:
                 plog.info("DRY RUN: would save credentials for %s", portal)
                 return ActionResult(extracted_content="dry_run: not saved. Move on.")
+            try:
+                await yaml_store.update_credentials(portal, username, password)
+            except UnknownSystem as exc:
+                plog.warning("CREDENTIALS not saved: %s", exc)
+                return ActionResult(extracted_content=f"not saved: {exc}. Move on.")
             plog.info("CREDENTIALS saved for %s (user=%s)", portal, username)
-            await yaml_store.update_credentials(portal, username, password)
             app_logger.emit(
                 "credentials_saved",
                 portal=portal,
@@ -2789,7 +2802,7 @@ class CLI:
 
         yaml_store = YamlStore(Path(args.systems).resolve())
         raw = yaml_store.load()
-        systems = raw.get("systems") or raw.get("sources") or []
+        systems = raw.get(yaml_store.systems_key(raw)) or []
         default_proxy_cfg = raw.get("proxy")
         log.info("Loaded %d portals from %s", len(systems), args.systems)
 
