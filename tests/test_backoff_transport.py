@@ -152,3 +152,73 @@ class TestHandleAsyncRequest:
         result = await t.handle_async_request(_request())
         assert result.status_code == 400
         assert wrapped.handle_async_request.call_count == 1
+
+
+HTTP_OK = 200
+BASE_WAIT_S = 2.0
+TINY_WAIT_S = 0.01
+TOTAL_BUDGET_S = 45.0
+MANY_RETRIES = 5
+TWO_RETRIES = 2
+# 2 + 4 + 8 + 16 = 30 s fits the 45 s budget; the next 32 s sleep would not.
+SLEEPS_WITHIN_BUDGET = (2.0, 4.0, 8.0, 16.0)
+
+
+class TestTransportErrors:
+    @pytest.mark.asyncio
+    async def test_retries_a_connect_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapped = MagicMock(spec=httpx.AsyncBaseTransport)
+        wrapped.handle_async_request = AsyncMock(
+            side_effect=[httpx.ConnectError("refused"), _response(HTTP_OK)]
+        )
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr("asyncio.sleep", sleep_mock)
+
+        response = await BackoffTransport(
+            wrapped, base_wait=BASE_WAIT_S
+        ).handle_async_request(_request())
+
+        assert response.status_code == HTTP_OK
+        assert [call.args[0] for call in sleep_mock.call_args_list] == [BASE_WAIT_S]
+
+    @pytest.mark.asyncio
+    async def test_raises_the_last_error_when_the_budget_runs_out(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapped = MagicMock(spec=httpx.AsyncBaseTransport)
+        reset = httpx.ReadError("connection reset by peer")
+        wrapped.handle_async_request = AsyncMock(side_effect=reset)
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr("asyncio.sleep", sleep_mock)
+        transport = BackoffTransport(
+            wrapped,
+            max_retries=MANY_RETRIES,
+            base_wait=BASE_WAIT_S,
+            max_total_wait=TOTAL_BUDGET_S,
+        )
+
+        with pytest.raises(httpx.ReadError, match="^connection reset by peer$"):
+            await transport.handle_async_request(_request())
+
+        sleeps = tuple(call.args[0] for call in sleep_mock.call_args_list)
+        assert sleeps == SLEEPS_WITHIN_BUDGET
+
+    @pytest.mark.asyncio
+    async def test_raises_after_max_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapped = MagicMock(spec=httpx.AsyncBaseTransport)
+        wrapped.handle_async_request = AsyncMock(
+            side_effect=httpx.ConnectError("refused")
+        )
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        transport = BackoffTransport(
+            wrapped, max_retries=TWO_RETRIES, base_wait=TINY_WAIT_S
+        )
+
+        with pytest.raises(httpx.ConnectError, match="^refused$"):
+            await transport.handle_async_request(_request())
+
+        assert wrapped.handle_async_request.call_count == TWO_RETRIES + 1

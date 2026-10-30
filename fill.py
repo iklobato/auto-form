@@ -448,8 +448,47 @@ class TaskBuilder:
 # ── HTTP backoff transport ────────────────────────────────────────────────────
 
 
+class RetryBudget:
+    """Attempts and sleep time left for one request through BackoffTransport."""
+
+    def __init__(
+        self, max_retries: int, max_total_wait: float, log: logging.Logger
+    ) -> None:
+        self._max_retries = max_retries
+        self._max_total_wait = max_total_wait
+        self._log = log
+        self.attempt = 0
+        self._waited = 0.0
+
+    def allows(self, wait: float, reason: str) -> bool:
+        """True when one more attempt after `wait` seconds fits; logs the decision."""
+        if self.attempt == self._max_retries:
+            return False
+        if self._waited + wait > self._max_total_wait:
+            self._log.warning(
+                "%s: next wait %.1fs would pass the %.0fs retry budget, giving up",
+                reason,
+                wait,
+                self._max_total_wait,
+            )
+            return False
+        self._log.warning(
+            "%s - retrying in %.1fs (attempt %d/%d)",
+            reason,
+            wait,
+            self.attempt + 1,
+            self._max_retries,
+        )
+        return True
+
+    async def sleep(self, wait: float) -> None:
+        await asyncio.sleep(wait)
+        self._waited += wait
+        self.attempt += 1
+
+
 class BackoffTransport(httpx.AsyncBaseTransport):
-    """Wraps another transport, retrying 429/5xx with exponential backoff."""
+    """Wraps another transport, retrying 429/5xx and network errors with backoff."""
 
     RETRY_STATUSES = (429, 500, 502, 503, 504)
     # browser_use cancels an LLM call after llm_timeout (75s for the default gemini
@@ -475,37 +514,33 @@ class BackoffTransport(httpx.AsyncBaseTransport):
         self._log = log or logging.getLogger("auto-form")
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        waited = 0.0
-        for attempt in range(self._max_retries + 1):
-            response = await self._wrapped.handle_async_request(request)
-            if (
-                response.status_code not in self.RETRY_STATUSES
-                or attempt == self._max_retries
-            ):
+        budget = RetryBudget(self._max_retries, self._max_total_wait, self._log)
+        while True:
+            try:
+                response = await self._wrapped.handle_async_request(request)
+            except httpx.TransportError as exc:
+                await self._sleep_or_raise(budget, exc, request)
+                continue
+            if response.status_code not in self.RETRY_STATUSES:
                 return response
-            wait = self._compute_wait(response.headers.get("retry-after"), attempt)
-            if waited + wait > self._max_total_wait:
-                self._log.warning(
-                    "HTTP %d from %s: next wait %.1fs would pass the %.0fs retry budget, giving up",
-                    response.status_code,
-                    request.url,
-                    wait,
-                    self._max_total_wait,
-                )
+            wait = self._compute_wait(
+                response.headers.get("retry-after"), budget.attempt
+            )
+            if not budget.allows(
+                wait, f"HTTP {response.status_code} from {request.url}"
+            ):
                 return response
             # Release the pooled connection of the response we are discarding
             await response.aclose()
-            self._log.warning(
-                "HTTP %d from %s — retrying in %.1fs (attempt %d/%d)",
-                response.status_code,
-                request.url,
-                wait,
-                attempt + 1,
-                self._max_retries,
-            )
-            await asyncio.sleep(wait)
-            waited += wait
-        return response
+            await budget.sleep(wait)
+
+    async def _sleep_or_raise(
+        self, budget: RetryBudget, error: httpx.TransportError, request: httpx.Request
+    ) -> None:
+        wait = self._compute_wait(None, budget.attempt)
+        if not budget.allows(wait, f"{error!r} from {request.url}"):
+            raise error
+        await budget.sleep(wait)
 
     def _compute_wait(self, retry_after_header: str | None, attempt: int) -> float:
         if retry_after_header:
