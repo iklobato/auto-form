@@ -30,6 +30,7 @@ import secrets
 import socket
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +40,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 import httpx
 import yaml
 from browser_use import Agent
+from browser_use.agent.message_manager.views import HistoryItem
 from browser_use.agent.views import ActionResult
 from browser_use.browser import BrowserSession
 from browser_use.browser.profile import BrowserProfile
@@ -1597,6 +1599,41 @@ class DryRunGuard:
         )
 
 
+class ScrollLoopBrake:
+    """Tells the agent to stop scrolling after a run of scroll-only steps.
+
+    browser_use has its own loop detector, but it nudges only from 5 repeats on and
+    says to carry on if making progress. flash-lite scrolled through it: 14 of 21
+    logged steps were scroll-only in run 20261025_235357 on We Work Remotely.
+    """
+
+    MAX_SCROLL_ONLY_STEPS = 3
+    NOTE = (
+        "<sys>You have only scrolled for {steps} steps in a row. Stop scrolling: "
+        "open the next listing that matches, use the site search or filters, or "
+        "call done if nothing here matches.</sys>"
+    )
+
+    def __init__(self, plog: logging.Logger) -> None:
+        self._plog = plog
+        self._streak = 0
+
+    def observe(self, actions: Sequence[str], agent: Agent) -> None:
+        if not actions or any(name != "scroll" for name in actions):
+            self._streak = 0
+            return
+        self._streak += 1
+        if self._streak % self.MAX_SCROLL_ONLY_STEPS:
+            return
+        # No public API adds a lasting note: context messages are cleared before the
+        # next LLM call, and Agent.add_new_task replaces the task.
+        history = agent._message_manager.state.agent_history_items
+        history.append(HistoryItem(system_message=self.NOTE.format(steps=self._streak)))
+        self._plog.info(
+            "scroll brake: %d scroll-only steps, told the agent to stop", self._streak
+        )
+
+
 # ── Per-step callback ─────────────────────────────────────────────────────────
 
 
@@ -1616,8 +1653,10 @@ class StepCallback:
         network_recorder: "NetworkRecorder | None" = None,
         cdp_debugger: "CDPDebugger | None" = None,
         dry_run_guard: DryRunGuard | None = None,
+        scroll_brake: ScrollLoopBrake | None = None,
     ):
         self.dry_run_guard = dry_run_guard
+        self.scroll_brake = scroll_brake
         self.portal_name = portal_name
         self.app_logger = app_logger
         self.plog = app_logger.portal(portal_name)
@@ -1674,6 +1713,8 @@ class StepCallback:
         memory = getattr(agent_output, "memory", None) or ""
         actions = self._extract_action_names(agent_output)
         action_details = self._extract_action_details(agent_output)
+        if self.scroll_brake:
+            self.scroll_brake.observe(actions, self.agent_ref)
 
         # INFO — single-line summary
         timing = f"{elapsed:5.1f}s" if elapsed is not None else "  ----"
@@ -2310,6 +2351,7 @@ class PortalRunner:
             dry_run_guard=(
                 DryRunGuard(self.name, self.app_logger) if self.opts.dry_run else None
             ),
+            scroll_brake=ScrollLoopBrake(self.plog),
         )
         # Files the agent is allowed to upload via browser_use's upload_file action.
         # Without this whitelist, EVERY upload attempt fails with
