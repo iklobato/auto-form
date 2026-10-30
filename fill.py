@@ -2094,12 +2094,16 @@ class AgentActions:
 
     def _register_note(self) -> None:
         portal, plog, app_logger = self.portal_name, self.plog, self.app_logger
+        dry_run = self.dry_run  # knowledge/*.md is in every prompt, real runs too
 
         @self.agent.tools.registry.action(
             "Append a short note about a portal-specific quirk for future agents. "
             "Call this once after finishing all applications on this portal."
         )
         async def save_note(note: str) -> ActionResult:
+            if dry_run:
+                plog.info("DRY RUN: note not saved (%d chars)", len(note))
+                return ActionResult(extracted_content="dry_run: not saved. Move on.")
             ts = time.strftime("%Y-%m-%d %H:%M")
             entry = f"\n## Portal: {portal} ({ts})\n{note.strip()}\n"
             async with AgentActions._notes_lock:
@@ -2110,11 +2114,12 @@ class AgentActions:
             return ActionResult(extracted_content="Note saved.")
 
     def _register_save_credentials(self) -> None:
-        portal, plog, app_logger, yaml_store = (
+        portal, plog, app_logger, yaml_store, dry_run = (
             self.portal_name,
             self.plog,
             self.app_logger,
             self.yaml_store,
+            self.dry_run,
         )
 
         @self.agent.tools.registry.action(
@@ -2122,6 +2127,11 @@ class AgentActions:
             "Call this immediately after successfully creating a new account."
         )
         async def save_credentials(username: str, password: str) -> ActionResult:
+            # The guard blocked the sign-up POST, so this account does not exist;
+            # saving it would overwrite the portal's real credentials.
+            if dry_run:
+                plog.info("DRY RUN: would save credentials for %s", portal)
+                return ActionResult(extracted_content="dry_run: not saved. Move on.")
             plog.info("CREDENTIALS saved for %s (user=%s)", portal, username)
             await yaml_store.update_credentials(portal, username, password)
             app_logger.emit(

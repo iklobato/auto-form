@@ -5,6 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.conftest import FakeRegistry
+
 from fill import (
     AgentActions,
     ApplicationRecorder,
@@ -518,3 +520,45 @@ class TestSaveCredentials:
         creds = yaml_store.load()["systems"][0]["credentials"]
         assert creds["username"] == "u@x"
         assert creds["password"] == "newpw"
+
+
+@pytest.fixture
+def dry_run_registry(request: pytest.FixtureRequest) -> FakeRegistry:
+    """Tools registered for a dry run, with a YAML store and the notes file present."""
+    Paths.NOTES.parent.mkdir(parents=True, exist_ok=True)
+    AgentActions(
+        request.getfixturevalue("mock_agent"),
+        "acme",
+        dry_run=True,
+        yaml_store=request.getfixturevalue("yaml_store"),
+        applied=request.getfixturevalue("applied_tracker"),
+        attempted=request.getfixturevalue("attempted_tracker"),
+        recorder=request.getfixturevalue("recorder"),
+        app_logger=request.getfixturevalue("mock_app_logger"),
+    ).register_all()
+    return request.getfixturevalue("fake_registry")
+
+
+class TestDryRunWritesNoState:
+    # The guard blocks the account-creation POST, so the account the agent "saves"
+    # does not exist; writing it would overwrite the portal's real credentials.
+    async def test_save_credentials_keeps_the_yaml(
+        self, dry_run_registry: FakeRegistry, yaml_store: YamlStore
+    ) -> None:
+        before = yaml_store.path.read_text()
+
+        reply = await dry_run_registry.actions["save_credentials"]("u@x", "newpw")
+
+        assert yaml_store.path.read_text() == before
+        assert reply.extracted_content.startswith("dry_run: not saved")
+
+    # knowledge/*.md is pasted into every prompt, real runs included.
+    async def test_save_note_keeps_the_notes_file(
+        self, dry_run_registry: FakeRegistry
+    ) -> None:
+        Paths.NOTES.write_text("")
+
+        reply = await dry_run_registry.actions["save_note"]("upload failed")
+
+        assert Paths.NOTES.read_text() == ""
+        assert reply.extracted_content.startswith("dry_run: not saved")
