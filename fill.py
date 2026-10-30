@@ -1268,6 +1268,8 @@ class NetworkRecorder:
             "portal": self.portal_name,
             "method": method,
             "url": url,
+            "document_url": event.get("documentURL", ""),
+            "resource_type": event.get("type", ""),
             "body": body[: self.BODY_CAP_BYTES],
             "body_truncated": len(body) > self.BODY_CAP_BYTES,
             "body_size": len(body),
@@ -1829,6 +1831,52 @@ class StepCallback:
 # ── Custom agent actions ──────────────────────────────────────────────────────
 
 
+class UnmarkedSubmits:
+    """Records pages whose form POST was never followed by mark_applied/attempted.
+
+    Without a record, check_applied says not_applied next run and the agent can send
+    the same application again (seen with flash-lite on 2026-10-30).
+    """
+
+    REASON = "submitted_not_marked"
+    # ponytail: same-host POSTs count as the page's form; analytics on the page's own
+    # host still counts. Add such hosts to NetworkRecorder.NOISE_FRAGMENTS.
+    BEACON_TYPE = "Ping"
+
+    def __init__(
+        self, portal: str, attempted: JsonlTracker, plog: logging.Logger
+    ) -> None:
+        self.portal = portal
+        self.attempted = attempted
+        self.plog = plog
+
+    def pages(self, captures: list[dict]) -> list[str]:
+        """Distinct pages that POSTed to their own host, in order."""
+        found = [
+            capture["document_url"]
+            for capture in captures
+            if capture.get("document_url")
+            and capture.get("resource_type") != self.BEACON_TYPE
+            and urlsplit(capture["url"]).hostname
+            == urlsplit(capture["document_url"]).hostname
+        ]
+        return list(dict.fromkeys(found))
+
+    async def record(self, captures: list[dict]) -> None:
+        for page in self.pages(captures):
+            self.plog.warning("submitted without mark_applied, recording: %s", page)
+            await self.attempted.append(
+                {
+                    "portal": self.portal,
+                    "job_url": page,
+                    "job_title": "",
+                    "reason": self.REASON,
+                    "notes": "a form on this page sent a POST; the agent never marked it",
+                    "attempted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+            )
+
+
 class AgentActions:
     """Registers all custom @tools.registry.action handlers for one portal."""
 
@@ -1868,6 +1916,15 @@ class AgentActions:
         # the agent often passes the apply-form URL instead (a different key).
         self._checked_job: dict[str, str] = {}
 
+    async def finish_job(self) -> None:
+        """Close the current job: record an unmarked submit, then forget its POSTs."""
+        if self.network_recorder is None:
+            return
+        if not self.dry_run:
+            unmarked = UnmarkedSubmits(self.portal_name, self.attempted, self.plog)
+            await unmarked.record(self.network_recorder.recent)
+        self.network_recorder.start_job()
+
     def register_all(self) -> None:
         self._register_check_applied()
         self._register_mark_applied()
@@ -1887,7 +1944,7 @@ class AgentActions:
         )
         session_visits = self._session_visits
         visit_limit = self.SESSION_VISIT_LIMIT
-        network_recorder = self.network_recorder
+        finish_job = self.finish_job
         checked_job = self._checked_job
 
         @self.agent.tools.registry.action(
@@ -1950,8 +2007,7 @@ class AgentActions:
                 result="not_applied",
                 visits=visits,
             )
-            if network_recorder:
-                network_recorder.start_job()
+            await finish_job()
             checked_job["url"] = job_url
             return ActionResult(extracted_content="not_applied")
 
@@ -2015,6 +2071,8 @@ class AgentActions:
             if job_url_key(job_url) != job_url_key(listing_url):
                 record["apply_url"] = job_url
             await applied.append(record)
+            if network_recorder:
+                network_recorder.start_job()
             recorder.write(record)
             plog.info(
                 "APPLIED: %s — %s [%s | %s]",
@@ -2044,6 +2102,7 @@ class AgentActions:
             self.app_logger,
             self.dry_run,
         )
+        network_recorder = self.network_recorder
 
         @self.agent.tools.registry.action(
             "Record that you ATTEMPTED to apply to a job but could not complete it. "
@@ -2073,6 +2132,8 @@ class AgentActions:
                 "attempted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }
             await attempted.append(record)
+            if network_recorder:
+                network_recorder.start_job()
             plog.info("ATTEMPTED (gave up): %s — reason=%s", job_title, reason)
             app_logger.emit(
                 "attempted",
@@ -2247,7 +2308,7 @@ class PortalRunner:
             else None
         )
         agent = self._build_agent(task, credentials, proxy=proxy)
-        AgentActions(
+        actions = AgentActions(
             agent,
             self.name,
             dry_run=self.opts.dry_run,
@@ -2257,9 +2318,12 @@ class PortalRunner:
             recorder=self.recorder,
             app_logger=self.app_logger,
             network_recorder=self._network_recorder,
-        ).register_all()
-
-        return await self._run_agent(agent)
+        )
+        actions.register_all()
+        try:
+            return await self._run_agent(agent)
+        finally:
+            await actions.finish_job()
 
     def _build_credentials(self) -> dict[str, str]:
         creds: dict[str, str] = {}

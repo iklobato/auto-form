@@ -658,3 +658,44 @@ class TestBrowserStartSession:
             if call.args and call.args[0] == "browser_start"
         ]
         assert starts == ["fresh"]
+
+
+class TestRunRecordsUnmarkedSubmit:
+    # flash-lite sent a form and called done without mark_applied (2026-10-30)
+    async def test_form_post_without_mark_applied_is_recorded_at_run_end(
+        self,
+        fresh_runner: PortalRunner,
+        attempted_tracker: JsonlTracker,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        agent.run.side_effect = BrowserSubmits(agent_ctor, agent).submit_then_stop
+        agent_ctor.return_value = agent
+
+        await fresh_runner.run()
+
+        assert attempted_tracker.load_keys() == {SUBMIT_PAGE}
+
+
+SUBMIT_PAGE = "https://jobs.acme.example/1001/apply"
+
+
+class BrowserSubmits:
+    """Agent.run stand-in: the page sends a form POST, then the agent stops."""
+
+    def __init__(self, agent_ctor: MagicMock, agent: MagicMock) -> None:
+        self.agent_ctor = agent_ctor
+        self.agent = agent
+
+    async def submit_then_stop(self) -> MagicMock:
+        step_callback = self.agent_ctor.call_args.kwargs["register_new_step_callback"]
+        step_callback.__self__.network_recorder._on_request(
+            {
+                "requestId": "r1",
+                "documentURL": SUBMIT_PAGE,
+                "type": "Document",
+                "request": {"method": "POST", "url": SUBMIT_PAGE},
+            }
+        )
+        return self.agent.run.return_value

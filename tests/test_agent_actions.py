@@ -9,6 +9,7 @@ from tests.conftest import FakeRegistry
 
 from fill import (
     AgentActions,
+    RunOptions,
     ApplicationRecorder,
     JsonlTracker,
     NetworkRecorder,
@@ -649,3 +650,120 @@ class TestApplyFormUrl:
         reply = await sessions.start().actions["check_applied"](APPLY_FORM_URL)
 
         assert reply.extracted_content == "already_applied"
+
+
+FORM_PAGE = "https://jobs.acme.example/1001/apply"
+
+
+class RecordedRun:
+    """One run's tools with a NetworkRecorder, so tests can fake browser POSTs."""
+
+    def __init__(
+        self, network: NetworkRecorder, actions: AgentActions, tools: dict
+    ) -> None:
+        self.network = network
+        self.actions = actions
+        self.tools = tools
+
+    def browser_posts(self, url: str, page: str = FORM_PAGE) -> None:
+        self.network._on_request(
+            {
+                "requestId": url,
+                "documentURL": page,
+                "type": "Document",
+                "request": {"method": "POST", "url": url},
+            }
+        )
+
+
+class RecordedRuns:
+    """Builds a RecordedRun for a real run or a dry run from the test fixtures."""
+
+    def __init__(self, request: pytest.FixtureRequest) -> None:
+        self.request = request
+
+    def real(self) -> RecordedRun:
+        return self.build(RunOptions(dry_run=False))
+
+    def dry(self) -> RecordedRun:
+        return self.build(RunOptions(dry_run=True))
+
+    def build(self, opts: RunOptions) -> RecordedRun:
+        fixture = self.request.getfixturevalue
+        network = NetworkRecorder("acme", fixture("mock_app_logger"))
+        actions = AgentActions(
+            fixture("mock_agent"),
+            "acme",
+            dry_run=opts.dry_run,
+            yaml_store=None,
+            applied=fixture("applied_tracker"),
+            attempted=fixture("attempted_tracker"),
+            recorder=fixture("recorder"),
+            app_logger=fixture("mock_app_logger"),
+            network_recorder=network,
+        )
+        actions.register_all()
+        return RecordedRun(network, actions, fixture("fake_registry").actions)
+
+
+@pytest.fixture
+def runs(request: pytest.FixtureRequest) -> RecordedRuns:
+    return RecordedRuns(request)
+
+
+@pytest.fixture
+def real_run(runs: RecordedRuns) -> RecordedRun:
+    return runs.real()
+
+
+class TestSubmitWithoutMark:
+    # Live run 2026-10-30: flash-lite submitted a form and called done without
+    # mark_applied, so nothing was recorded and the next run could apply again.
+    async def test_run_end_records_the_form_page_as_attempted(
+        self, real_run: RecordedRun
+    ) -> None:
+        real_run.browser_posts("https://jobs.acme.example/1001/apply")
+
+        await real_run.actions.finish_job()
+
+        reply = await real_run.tools["check_applied"](FORM_PAGE)
+        assert reply.extracted_content == "already_attempted"
+
+    async def test_moving_to_the_next_job_records_the_previous_form(
+        self, real_run: RecordedRun, attempted_tracker: JsonlTracker
+    ) -> None:
+        real_run.browser_posts("https://jobs.acme.example/1001/apply")
+
+        await real_run.tools["check_applied"]("https://jobs.acme.example/1002")
+
+        assert attempted_tracker.load_keys() == {FORM_PAGE}
+
+    async def test_mark_applied_leaves_nothing_to_record(
+        self, real_run: RecordedRun, attempted_tracker: JsonlTracker
+    ) -> None:
+        real_run.browser_posts("https://jobs.acme.example/1001/apply")
+        await real_run.tools["mark_applied"](FORM_PAGE, "Python Engineer")
+
+        await real_run.actions.finish_job()
+
+        assert attempted_tracker.load_keys() == set()
+
+    # Analytics on another host is not a submit of this page's form.
+    async def test_a_post_to_another_host_is_not_a_submit(
+        self, real_run: RecordedRun, attempted_tracker: JsonlTracker
+    ) -> None:
+        real_run.browser_posts("https://stats.tracker.example/collect")
+
+        await real_run.actions.finish_job()
+
+        assert attempted_tracker.load_keys() == set()
+
+    async def test_dry_run_records_nothing(
+        self, runs: RecordedRuns, attempted_tracker: JsonlTracker
+    ) -> None:
+        dry = runs.dry()
+        dry.browser_posts("https://jobs.acme.example/1001/apply")
+
+        await dry.actions.finish_job()
+
+        assert attempted_tracker.load_keys() == set()
