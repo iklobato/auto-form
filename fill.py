@@ -1328,7 +1328,7 @@ class CDPDebugger:
     for offline inspection.
     """
 
-    INTERESTING_STATUS = (400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504)
+    HTTP_ERROR_MIN = 400
 
     def __init__(
         self,
@@ -1407,7 +1407,7 @@ class CDPDebugger:
             "mime_type": resp.get("mimeType", ""),
         }
         self._persist(record)
-        if status in self.INTERESTING_STATUS:
+        if status >= self.HTTP_ERROR_MIN:
             self.plog.warning("HTTP %d %s %s", status, method, url[:80])
             self.app_logger.emit(
                 "http_error",
