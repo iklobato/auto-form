@@ -14,7 +14,7 @@ def _events_lines(portal: str) -> list[dict]:
     path = Paths.APPLICATIONS / portal / "cdp.jsonl"
     if not path.exists():
         return []
-    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 # ── Response handler ─────────────────────────────────────────────────────────
