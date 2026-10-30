@@ -110,6 +110,17 @@ and keeps a ring buffer. `check_applied` returning `not_applied` calls `start_jo
 clear it, so `mark_applied` attaches only the current job's POSTs. Analytics hosts live in
 `NetworkRecorder.NOISE_FRAGMENTS`; add new ones there (the guard uses the same list).
 
+### 5.3b Submits the agent did not record
+- `NetworkRecorder` enables Network/Page on every cross-site iframe session too
+  (`FrameSessions`, via `Target.attachedToTarget`), and stores `page_url` per POST
+  (`FrameUrls`: the frame's URL for a form submit, `documentURL` for XHR/fetch).
+- When a job is closed (`check_applied` moving on, or the end of `PortalRunner.run`), a page
+  that POSTed to its own host with no `mark_applied`/`mark_attempted` after it goes to
+  `attempted.jsonl` with `reason: submitted_not_marked` (`UnmarkedSubmits`).
+- `mark_applied` stores `job_url` = the URL `check_applied` cleared and `apply_url` = the
+  agent's URL when different; `has_job` matches either. Its record has `submit_seen`
+  (False when no POST was captured for the job) and logs a warning; it is not refused.
+
 ### 5.4 Trackers and duplicates
 `applied.jsonl` and `attempted.jsonl` are append-only JSONL with `flock`. `check_applied`
 compares `job_url_key()`, not the raw URL: scheme, host case, `www.`, trailing slash,
@@ -176,12 +187,13 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   form is filled. With the default 5, flash-lite left 10 of 14 fields empty.
 - browser_use's `input` action has `clear` (`'1=clear, 0=append'`); flash-lite sent
   `clear: False` when it typed into a field again, so the value went in twice.
-- `NetworkRecorder` listens only on the page's CDP session. A POST from a cross-site
-  iframe (a different host, so Chrome runs it in another process; how a company site
+- Before 2026-10-30 `NetworkRecorder` listened only on the page's CDP session (fixed,
+  see 5.3b). A POST from a cross-site iframe (a different host, so Chrome runs it in another process; how a company site
   embeds Greenhouse) is not captured at all: probe on 2026-10-30, the iframe server got
-  2 POSTs and the recorder 0; with a same-site iframe it got both. So there is no submit
-  evidence and no unmarked-submit record for such forms, and `mark_applied` must not
-  require a captured POST.
+  2 POSTs and the recorder 0; with a same-site iframe it got both. Requests an iframe
+  sends before its session is enabled are still missed, so `mark_applied` must not
+  require a captured POST. A single-threaded `HTTPServer` stalled the iframe load by
+  40 s in a test (Chrome keeps a preconnect socket open); use `ThreadingHTTPServer`.
 - For a form submit (`type: Document`) CDP's `documentURL` is the POST target, not the
   page with the form; `FrameUrls` keeps each frame's URL from `Page.frameNavigated` for
   that. `Referer` is not in `requestWillBeSent` headers.
@@ -297,8 +309,7 @@ Each item says when it is done.
    Veteran/Disability came back "I prefer not to answer" in 2 of 3 runs although the
    profile says otherwise; flash-lite can submit without `mark_applied`, so the job is not
    recorded and the next run applies again (run D); it can also call `mark_applied` when no POST went
-   out (run E), which records a job that was never sent; POSTs from cross-site iframes are not
-   captured (see section 6); records written before 2026-10-30 with a form URL as `job_url` still
+   out (run E), now flagged `submit_seen: false` but still recorded as applied; records written before 2026-10-30 with a form URL as `job_url` still
    do not match their listing URL. Done when each is fixed or dropped on purpose, measured
    with the local portal.
 6. **Same job on two portals** is not detected (different URLs). Done when there is a
