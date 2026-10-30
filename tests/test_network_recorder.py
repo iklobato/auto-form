@@ -21,6 +21,10 @@ class TestFiltering:
             "https://t.co/i/adsctp",
             "https://analytics.twitter.com/i/adsctp",
             "https://www.google.com/measurement/conversion?random=1&cv=11&tid=G-X",
+            # Seen on 2026-10-30 (We Work Remotely, Bitovi's applytojob.com form)
+            "https://pagead2.googlesyndication.com/pagead/ping?e=1",
+            "https://weworkremotely.com/listing_ads/16/impression?pk=abc",
+            "https://esp.aptrinsic.com/rte/v1/command?p=AP-X&sv=0.61.9",
         ],
     )
     def test_ignores_analytics_seen_on_job_sites(

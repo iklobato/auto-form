@@ -1147,7 +1147,10 @@ class NetworkRecorder:
         "google.com/pagead",
         "google.com/measurement",
         "google.com/recaptcha",
+        "googlesyndication.com",
+        "weworkremotely.com/listing_ads/",
         # SaaS analytics
+        "aptrinsic.com",
         "segment.io",
         "segment.com",
         "mixpanel.com",
