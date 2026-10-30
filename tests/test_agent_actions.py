@@ -656,23 +656,27 @@ FORM_PAGE = "https://jobs.acme.example/1001/apply"
 
 
 class RecordedRun:
-    """One run's tools with a NetworkRecorder, so tests can fake browser POSTs."""
+    """One run's tools with a NetworkRecorder attached to a fake CDP client."""
 
     def __init__(
-        self, network: NetworkRecorder, actions: AgentActions, tools: dict
+        self, network: NetworkRecorder, actions: AgentActions, browser: MagicMock
     ) -> None:
         self.network = network
         self.actions = actions
-        self.tools = tools
+        self.browser = browser
 
-    def browser_posts(self, url: str, page: str = FORM_PAGE) -> None:
-        self.network._on_request(
+    async def browser_posts(self, url: str, page: str = FORM_PAGE) -> None:
+        await self.network.attach_if_needed(self.browser)
+        cdp = await self.browser.get_or_create_cdp_session()
+        await cdp.cdp_client._event_registry.handle_event(
+            "Network.requestWillBeSent",
             {
                 "requestId": url,
                 "documentURL": page,
                 "type": "Document",
                 "request": {"method": "POST", "url": url},
-            }
+            },
+            cdp.session_id,
         )
 
 
@@ -703,7 +707,10 @@ class RecordedRuns:
             network_recorder=network,
         )
         actions.register_all()
-        return RecordedRun(network, actions, fixture("fake_registry").actions)
+        return RecordedRun(network, actions, fixture("cdp_browser"))
+
+    def tools(self) -> dict:
+        return self.request.getfixturevalue("fake_registry").actions
 
 
 @pytest.fixture
@@ -720,29 +727,33 @@ class TestSubmitWithoutMark:
     # Live run 2026-10-30: flash-lite submitted a form and called done without
     # mark_applied, so nothing was recorded and the next run could apply again.
     async def test_run_end_records_the_form_page_as_attempted(
-        self, real_run: RecordedRun
+        self, real_run: RecordedRun, runs: RecordedRuns
     ) -> None:
-        real_run.browser_posts("https://jobs.acme.example/1001/apply")
+        await real_run.browser_posts("https://jobs.acme.example/1001/apply")
 
         await real_run.actions.finish_job()
 
-        reply = await real_run.tools["check_applied"](FORM_PAGE)
+        reply = await runs.tools()["check_applied"](FORM_PAGE)
         assert reply.extracted_content == "already_attempted"
 
     async def test_moving_to_the_next_job_records_the_previous_form(
-        self, real_run: RecordedRun, attempted_tracker: JsonlTracker
+        self, real_run: RecordedRun, runs: RecordedRuns
     ) -> None:
-        real_run.browser_posts("https://jobs.acme.example/1001/apply")
+        await real_run.browser_posts("https://jobs.acme.example/1001/apply")
 
-        await real_run.tools["check_applied"]("https://jobs.acme.example/1002")
+        await runs.tools()["check_applied"]("https://jobs.acme.example/1002")
 
-        assert attempted_tracker.load_keys() == {FORM_PAGE}
+        reply = await runs.tools()["check_applied"](FORM_PAGE)
+        assert reply.extracted_content == "already_attempted"
 
     async def test_mark_applied_leaves_nothing_to_record(
-        self, real_run: RecordedRun, attempted_tracker: JsonlTracker
+        self,
+        real_run: RecordedRun,
+        runs: RecordedRuns,
+        attempted_tracker: JsonlTracker,
     ) -> None:
-        real_run.browser_posts("https://jobs.acme.example/1001/apply")
-        await real_run.tools["mark_applied"](FORM_PAGE, "Python Engineer")
+        await real_run.browser_posts("https://jobs.acme.example/1001/apply")
+        await runs.tools()["mark_applied"](FORM_PAGE, "Python Engineer")
 
         await real_run.actions.finish_job()
 
@@ -752,7 +763,7 @@ class TestSubmitWithoutMark:
     async def test_a_post_to_another_host_is_not_a_submit(
         self, real_run: RecordedRun, attempted_tracker: JsonlTracker
     ) -> None:
-        real_run.browser_posts("https://stats.tracker.example/collect")
+        await real_run.browser_posts("https://stats.tracker.example/collect")
 
         await real_run.actions.finish_job()
 
@@ -762,7 +773,7 @@ class TestSubmitWithoutMark:
         self, runs: RecordedRuns, attempted_tracker: JsonlTracker
     ) -> None:
         dry = runs.dry()
-        dry.browser_posts("https://jobs.acme.example/1001/apply")
+        await dry.browser_posts("https://jobs.acme.example/1001/apply")
 
         await dry.actions.finish_job()
 

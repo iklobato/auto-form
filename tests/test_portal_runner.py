@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from browser_use.browser.views import BrowserStateSummary
 
 import fill
 from fill import (
@@ -665,37 +666,44 @@ class TestRunRecordsUnmarkedSubmit:
     async def test_form_post_without_mark_applied_is_recorded_at_run_end(
         self,
         fresh_runner: PortalRunner,
-        attempted_tracker: JsonlTracker,
+        request: pytest.FixtureRequest,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
         agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        agent.browser_session = request.getfixturevalue("cdp_browser")
         agent.run.side_effect = BrowserSubmits(agent_ctor, agent).submit_then_stop
         agent_ctor.return_value = agent
 
         await fresh_runner.run()
 
-        assert attempted_tracker.load_keys() == {SUBMIT_PAGE}
+        attempted = request.getfixturevalue("attempted_tracker")
+        assert attempted.load_keys() == {SUBMIT_PAGE}
 
 
 SUBMIT_PAGE = "https://jobs.acme.example/1001/apply"
 
 
 class BrowserSubmits:
-    """Agent.run stand-in: the page sends a form POST, then the agent stops."""
+    """Agent.run stand-in: one step runs, the page sends a form POST, the agent stops."""
 
     def __init__(self, agent_ctor: MagicMock, agent: MagicMock) -> None:
         self.agent_ctor = agent_ctor
         self.agent = agent
 
     async def submit_then_stop(self) -> MagicMock:
-        step_callback = self.agent_ctor.call_args.kwargs["register_new_step_callback"]
-        step_callback.__self__.network_recorder._on_request(
+        on_step = self.agent_ctor.call_args.kwargs["register_new_step_callback"]
+        state = MagicMock(spec=BrowserStateSummary, url=SUBMIT_PAGE, screenshot=None)
+        await on_step(state, MagicMock(action=[]), 1)
+        cdp = await self.agent.browser_session.get_or_create_cdp_session()
+        await cdp.cdp_client._event_registry.handle_event(
+            "Network.requestWillBeSent",
             {
                 "requestId": "r1",
                 "documentURL": SUBMIT_PAGE,
                 "type": "Document",
                 "request": {"method": "POST", "url": SUBMIT_PAGE},
-            }
+            },
+            cdp.session_id,
         )
         return self.agent.run.return_value
