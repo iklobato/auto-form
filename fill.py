@@ -2176,6 +2176,7 @@ class ProfileInUse(RuntimeError):
 class PortalRunner:
     """Runs the apply flow for one portal end-to-end."""
 
+    PASSWORD_FILE = "portal_password"
     PORTAL_PWD_ENV = "PORTAL_ACCOUNT_PASSWORD"
     LINKEDIN_USER_ENV = "LINKEDIN_SSO_USERNAME"
     LINKEDIN_PWD_ENV = "LINKEDIN_SSO_PASSWORD"
@@ -2286,7 +2287,7 @@ class PortalRunner:
         """
         if from_env := os.getenv(self.PORTAL_PWD_ENV):
             return from_env
-        path = Paths.PROFILES / self.name / "portal_password"
+        path = Paths.PROFILES / self.name / self.PASSWORD_FILE
         if path.exists():
             return path.read_text().strip()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2341,7 +2342,10 @@ class PortalRunner:
         portal_profile = Paths.PROFILES / self.name
         portal_profile.mkdir(parents=True, exist_ok=True)
         self._clean_stale_locks(portal_profile)
-        is_first = not any(portal_profile.iterdir())
+        # The password file is written before the agent is built; it is not Chrome state
+        is_first = all(
+            entry.name == self.PASSWORD_FILE for entry in portal_profile.iterdir()
+        )
         self.plog.info(
             "browser profile: %s (%s)",
             portal_profile,

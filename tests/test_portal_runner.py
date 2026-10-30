@@ -620,3 +620,42 @@ class TestProxyWiring:
         )
         with pytest.raises(RuntimeError, match="upstream gone"):
             await runner.run()
+
+
+@pytest.fixture
+def runner_with_stored_password(request: pytest.FixtureRequest) -> PortalRunner:
+    """A runner whose profile dir holds only the generated portal_password file."""
+    request.getfixturevalue("clean_env")
+    runner = _make_runner(
+        request.getfixturevalue("sample_system"),
+        opts=request.getfixturevalue("run_opts"),
+        yaml_store=request.getfixturevalue("yaml_store"),
+        mock_app_logger=request.getfixturevalue("mock_app_logger"),
+        task_builder=request.getfixturevalue("task_builder"),
+        cred_resolver=request.getfixturevalue("cred_resolver"),
+        applied=request.getfixturevalue("applied_tracker"),
+        attempted=request.getfixturevalue("attempted_tracker"),
+        recorder=request.getfixturevalue("recorder"),
+    )
+    runner._portal_password()
+    return runner
+
+
+class TestBrowserStartSession:
+    # run() stores the portal password in the profile dir before building the agent
+    def test_profile_with_only_the_password_file_is_fresh(
+        self,
+        runner_with_stored_password: PortalRunner,
+        mock_app_logger: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        TestProxyWiring._patch_browser(monkeypatch)
+
+        runner_with_stored_password._build_agent(task="t", credentials={})
+
+        starts = [
+            call.kwargs["session"]
+            for call in mock_app_logger.emit.call_args_list
+            if call.args and call.args[0] == "browser_start"
+        ]
+        assert starts == ["fresh"]
