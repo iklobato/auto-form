@@ -564,7 +564,9 @@ class TestSaveCredentialsUnknownPortal:
         reply = await ghost_portal_registry.actions["save_credentials"]("u@x", "pw")
 
         assert yaml_store.path.read_text() == before
-        assert reply.extracted_content.startswith("not saved: 'ghost' is not in ")
+        assert reply.extracted_content == (
+            f"not saved: 'ghost' is not in {yaml_store.path}. Move on."
+        )
 
 
 class TestDryRunWritesNoState:

@@ -623,10 +623,10 @@ class TestProxyWiring:
 
 
 @pytest.fixture
-def runner_with_stored_password(request: pytest.FixtureRequest) -> PortalRunner:
-    """A runner whose profile dir holds only the generated portal_password file."""
+def fresh_runner(request: pytest.FixtureRequest) -> PortalRunner:
+    """A runner for a portal that has never run: its profile dir does not exist."""
     request.getfixturevalue("clean_env")
-    runner = _make_runner(
+    return _make_runner(
         request.getfixturevalue("sample_system"),
         opts=request.getfixturevalue("run_opts"),
         yaml_store=request.getfixturevalue("yaml_store"),
@@ -637,21 +637,20 @@ def runner_with_stored_password(request: pytest.FixtureRequest) -> PortalRunner:
         attempted=request.getfixturevalue("attempted_tracker"),
         recorder=request.getfixturevalue("recorder"),
     )
-    runner._portal_password()
-    return runner
 
 
 class TestBrowserStartSession:
-    # run() stores the portal password in the profile dir before building the agent
-    def test_profile_with_only_the_password_file_is_fresh(
+    # run() writes the generated portal password into the profile dir first
+    async def test_first_run_reports_a_fresh_profile(
         self,
-        runner_with_stored_password: PortalRunner,
+        fresh_runner: PortalRunner,
         mock_app_logger: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        TestProxyWiring._patch_browser(monkeypatch)
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent_ctor.return_value = TestRunAgentOutcome._agent_returning(is_done=True)
 
-        runner_with_stored_password._build_agent(task="t", credentials={})
+        await fresh_runner.run()
 
         starts = [
             call.kwargs["session"]
