@@ -30,6 +30,7 @@ import secrets
 import socket
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,10 +40,12 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 import httpx
 import yaml
 from browser_use import Agent
+from browser_use.agent.message_manager.views import HistoryItem
 from browser_use.agent.views import ActionResult
 from browser_use.browser import BrowserSession
 from browser_use.browser.profile import BrowserProfile
 from browser_use.llm.openrouter.chat import ChatOpenRouter
+from cdp_use.client import CDPClient
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -201,6 +204,10 @@ def expand_env(value: str) -> str:
 # ── YAML I/O ──────────────────────────────────────────────────────────────────
 
 
+class UnknownSystem(LookupError):
+    """The systems YAML has no entry with this name (the user may have removed it)."""
+
+
 class YamlStore:
     """Read + atomic write of a systems YAML file (works for both `systems:` and `sources:` schemas)."""
 
@@ -229,15 +236,10 @@ class YamlStore:
         with open(lock_path, "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             raw = self.load()
-            key = "systems" if "systems" in raw else "sources"
-            for system in raw.get(key) or []:
-                if system.get("name") == system_name:
-                    creds = system.setdefault("credentials", {})
-                    creds["username"] = username
-                    creds["password"] = password
-                    creds.pop("username_env", None)
-                    creds.pop("password_env", None)
-                    break
+            creds = self._find(raw, system_name).setdefault("credentials", {})
+            creds.update(username=username, password=password)
+            creds.pop("username_env", None)
+            creds.pop("password_env", None)
             self._replace(
                 yaml.dump(
                     raw,
@@ -247,6 +249,16 @@ class YamlStore:
                     width=120,
                 )
             )
+
+    def systems_key(self, raw: dict) -> str:
+        """`systems:` when it has entries, else the older `sources:` name."""
+        return "systems" if raw.get("systems") else "sources"
+
+    def _find(self, raw: dict, system_name: str) -> dict:
+        for system in raw.get(self.systems_key(raw)) or []:
+            if system.get("name") == system_name:
+                return system
+        raise UnknownSystem(f"{system_name!r} is not in {self.path}")
 
     def _replace(self, text: str) -> None:
         """Write to a sibling temp file, then rename, so a crash never truncates the yaml."""
@@ -347,8 +359,10 @@ class TaskBuilder:
     DRY_RUN_NOTICE = (
         "DRY RUN. This is a test run. Fill each application form completely, but do "
         "NOT click the final submit/apply/send button, and do not create accounts. "
-        "Any submit is blocked by the browser and will fail. When a form is filled, "
-        "call mark_applied for it (nothing is recorded in a dry run) and move on."
+        "Any submit is blocked by the browser and will fail. A file upload can fail "
+        "the same way: that is expected, do not report it as an error and do not "
+        "retry it. When a form is filled, call mark_applied for it (nothing is "
+        "recorded in a dry run) and move on."
     )
 
     def __init__(
@@ -448,8 +462,47 @@ class TaskBuilder:
 # ── HTTP backoff transport ────────────────────────────────────────────────────
 
 
+class RetryBudget:
+    """Attempts and sleep time left for one request through BackoffTransport."""
+
+    def __init__(
+        self, max_retries: int, max_total_wait: float, log: logging.Logger
+    ) -> None:
+        self._max_retries = max_retries
+        self._max_total_wait = max_total_wait
+        self._log = log
+        self.attempt = 0
+        self._waited = 0.0
+
+    def allows(self, wait: float, reason: str) -> bool:
+        """True when one more attempt after `wait` seconds fits; logs the decision."""
+        if self.attempt == self._max_retries:
+            return False
+        if self._waited + wait > self._max_total_wait:
+            self._log.warning(
+                "%s: next wait %.1fs would pass the %.0fs retry budget, giving up",
+                reason,
+                wait,
+                self._max_total_wait,
+            )
+            return False
+        self._log.warning(
+            "%s - retrying in %.1fs (attempt %d/%d)",
+            reason,
+            wait,
+            self.attempt + 1,
+            self._max_retries,
+        )
+        return True
+
+    async def sleep(self, wait: float) -> None:
+        await asyncio.sleep(wait)
+        self._waited += wait
+        self.attempt += 1
+
+
 class BackoffTransport(httpx.AsyncBaseTransport):
-    """Wraps another transport, retrying 429/5xx with exponential backoff."""
+    """Wraps another transport, retrying 429/5xx and network errors with backoff."""
 
     RETRY_STATUSES = (429, 500, 502, 503, 504)
     # browser_use cancels an LLM call after llm_timeout (75s for the default gemini
@@ -475,37 +528,33 @@ class BackoffTransport(httpx.AsyncBaseTransport):
         self._log = log or logging.getLogger("auto-form")
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        waited = 0.0
-        for attempt in range(self._max_retries + 1):
-            response = await self._wrapped.handle_async_request(request)
-            if (
-                response.status_code not in self.RETRY_STATUSES
-                or attempt == self._max_retries
-            ):
+        budget = RetryBudget(self._max_retries, self._max_total_wait, self._log)
+        while True:
+            try:
+                response = await self._wrapped.handle_async_request(request)
+            except httpx.TransportError as exc:
+                await self._sleep_or_raise(budget, exc, request)
+                continue
+            if response.status_code not in self.RETRY_STATUSES:
                 return response
-            wait = self._compute_wait(response.headers.get("retry-after"), attempt)
-            if waited + wait > self._max_total_wait:
-                self._log.warning(
-                    "HTTP %d from %s: next wait %.1fs would pass the %.0fs retry budget, giving up",
-                    response.status_code,
-                    request.url,
-                    wait,
-                    self._max_total_wait,
-                )
+            wait = self._compute_wait(
+                response.headers.get("retry-after"), budget.attempt
+            )
+            if not budget.allows(
+                wait, f"HTTP {response.status_code} from {request.url}"
+            ):
                 return response
             # Release the pooled connection of the response we are discarding
             await response.aclose()
-            self._log.warning(
-                "HTTP %d from %s — retrying in %.1fs (attempt %d/%d)",
-                response.status_code,
-                request.url,
-                wait,
-                attempt + 1,
-                self._max_retries,
-            )
-            await asyncio.sleep(wait)
-            waited += wait
-        return response
+            await budget.sleep(wait)
+
+    async def _sleep_or_raise(
+        self, budget: RetryBudget, error: httpx.TransportError, request: httpx.Request
+    ) -> None:
+        wait = self._compute_wait(None, budget.attempt)
+        if not budget.allows(wait, f"{error!r} from {request.url}"):
+            raise error
+        await budget.sleep(wait)
 
     def _compute_wait(self, retry_after_header: str | None, attempt: int) -> float:
         if retry_after_header:
@@ -942,53 +991,54 @@ class JsonlTracker:
         self._lock = asyncio.Lock()
         self._log = log or logging.getLogger("auto-form")
 
-    def load_keys(self, key: str = "job_url") -> set[str]:
+    JOB_URL_FIELDS = ("job_url", "apply_url")
+
+    def records(self) -> list[dict]:
+        """Every well-formed record in the file; malformed lines are logged and skipped."""
         if not self.path.exists():
-            return set()
-        out: set[str] = set()
-        skipped_malformed = 0
-        skipped_missing_key = 0
-        with open(self.path, "r") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
-                for lineno, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError as e:
-                        skipped_malformed += 1
-                        self._log.warning(
-                            "JsonlTracker: skipping malformed line %d in %s: %s",
-                            lineno,
-                            self.path.name,
-                            e,
-                        )
-                        continue
-                    if key not in record:
-                        skipped_missing_key += 1
-                        self._log.warning(
-                            "JsonlTracker: line %d in %s missing key %r",
-                            lineno,
-                            self.path.name,
-                            key,
-                        )
-                        continue
-                    out.add(record[key])
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-        self._log.debug(
-            "JsonlTracker.%s: loaded %d keys (skipped %d malformed, %d missing key)",
-            self.path.name,
-            len(out),
-            skipped_malformed,
-            skipped_missing_key,
+            return []
+        with open(self.path, "r") as handle:
+            fcntl.flock(handle, fcntl.LOCK_SH)  # released when the file closes
+            lines = handle.read().splitlines()
+        parsed = (
+            self._parse(number, line)
+            for number, line in enumerate(lines, 1)
+            if line.strip()
         )
+        return [record for record in parsed if record is not None]
+
+    def _parse(self, lineno: int, line: str) -> dict | None:
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError as exc:
+            self._log.warning(
+                "JsonlTracker: skipping malformed line %d in %s: %s",
+                lineno,
+                self.path.name,
+                exc,
+            )
+            return None
+
+    def load_keys(self, key: str = "job_url") -> set[str]:
+        out: set[str] = set()
+        for record in self.records():
+            if key not in record:
+                self._log.warning(
+                    "JsonlTracker: record in %s missing key %r", self.path.name, key
+                )
+                continue
+            out.add(record[key])
         return out
 
     def has_job(self, job_url: str) -> bool:
-        return job_url_key(job_url) in {job_url_key(u) for u in self.load_keys()}
+        """True when a record's job_url or apply_url is the same job as `job_url`."""
+        wanted = job_url_key(job_url)
+        return any(
+            job_url_key(record[field]) == wanted
+            for record in self.records()
+            for field in self.JOB_URL_FIELDS
+            if record.get(field)
+        )
 
     async def append(self, record: dict) -> None:
         line = json.dumps(record, ensure_ascii=False) + "\n"
@@ -1088,12 +1138,82 @@ def add_cdp_handler(cdp_client, method: str, callback) -> None:
     registry.register(method, fan_out)
 
 
+class FrameSessions:
+    """Turns on Network/Page events in each cross-site iframe's own CDP session.
+
+    browser_use auto-attaches every iframe in its own process (flatten, same client),
+    but events only flow from sessions that enabled the domain, so a form in a
+    cross-site iframe (a company page embedding Greenhouse) was never recorded.
+    """
+
+    # ponytail: covers iframes attached after attach_if_needed (the first step runs
+    # before any job page loads) and misses requests sent before enable returns.
+    IFRAME = "iframe"
+    ID_CHARS = 8
+
+    def __init__(
+        self, cdp_client: CDPClient, frame_urls: dict[str, str], plog: logging.Logger
+    ) -> None:
+        self.cdp_client = cdp_client
+        self.frame_urls = frame_urls
+        self.plog = plog
+        self._pending: dict[asyncio.Task, None] = {}
+
+    def on_attached(self, event: dict, session_id: str | None = None) -> None:
+        if (event.get("targetInfo") or {}).get("type") != self.IFRAME:
+            return
+        # Never await a CDP command inside an event handler (same read loop)
+        task = asyncio.create_task(self.enable(event["sessionId"]))
+        self._pending[task] = None
+        task.add_done_callback(self.forget)
+
+    def forget(self, task: asyncio.Task) -> None:
+        self._pending.pop(task, None)
+
+    async def enable(self, session_id: str) -> None:
+        try:
+            await self.cdp_client.send.Network.enable(session_id=session_id)
+            await self.cdp_client.send.Page.enable(session_id=session_id)
+            # Its first navigation came before Page events were on
+            tree = await self.cdp_client.send.Page.getFrameTree(session_id=session_id)
+        except (RuntimeError, ConnectionError) as exc:
+            # short-lived iframes detach before this runs
+            self.plog.debug(
+                "iframe session %s not enabled: %s", session_id[: self.ID_CHARS], exc
+            )
+            return
+        frame = tree["frameTree"]["frame"]
+        self.frame_urls.setdefault(frame["id"], frame.get("url", ""))
+
+
+class FrameUrls:
+    """URL each frame shows now, so a request can be tied to the page that sent it.
+
+    A form submit is a Document request whose documentURL is the POST target, not
+    the page that held the form.
+    """
+
+    def __init__(self, urls: dict[str, str]) -> None:
+        self._urls = urls
+
+    def on_navigated(self, event: dict, session_id: str | None = None) -> None:
+        frame = event.get("frame") or {}
+        if frame.get("id"):
+            self._urls[frame["id"]] = frame.get("url", "")
+
+    def page_url(self, request_event: dict) -> str:
+        document_url = request_event.get("documentURL", "")
+        if request_event.get("type") != "Document":
+            return document_url
+        return self._urls.get(request_event.get("frameId", ""), document_url)
+
+
 class NetworkRecorder:
     """Captures POST/PUT/PATCH HTTP requests via CDP for audit purposes.
 
     Lets you verify the agent actually submitted the right values rather than
     trusting its self-report. Filters out analytics/telemetry noise. Records
-    are persisted to applications/<portal>/network/<ts>_<method>.json and
+    are persisted to applications/<portal>/network/<ts>_<requestId>_<method>.json and
     also kept in an in-memory ring buffer that mark_applied can attach to
     its application record.
     """
@@ -1108,7 +1228,10 @@ class NetworkRecorder:
         "google.com/pagead",
         "google.com/measurement",
         "google.com/recaptcha",
+        "googlesyndication.com",
+        "weworkremotely.com/listing_ads/",
         # SaaS analytics
+        "aptrinsic.com",
         "segment.io",
         "segment.com",
         "mixpanel.com",
@@ -1175,6 +1298,7 @@ class NetworkRecorder:
         # CDP can fire requestWillBeSent twice for the same request when there are
         # both main-page and sub-frame handlers — dedup on the unique requestId.
         self._seen_request_ids: set[str] = set()
+        self._frame_urls: dict[str, str] = {}
 
     def start_job(self) -> None:
         """Forget earlier POSTs so mark_applied's evidence covers only this job."""
@@ -1189,11 +1313,18 @@ class NetworkRecorder:
         if sid in self._attached_session_ids:
             return
         await cdp_session.cdp_client.send.Network.enable(session_id=sid)
-        add_cdp_handler(
-            cdp_session.cdp_client, "Network.requestWillBeSent", self._on_request
-        )
+        await cdp_session.cdp_client.send.Page.enable(session_id=sid)
+        self._subscribe(cdp_session.cdp_client)
         self._attached_session_ids.add(sid)
         self.plog.debug("NetworkRecorder attached to CDP session %s", sid[:12])
+
+    def _subscribe(self, cdp_client: CDPClient) -> None:
+        add_cdp_handler(cdp_client, "Network.requestWillBeSent", self._on_request)
+        add_cdp_handler(
+            cdp_client, "Page.frameNavigated", FrameUrls(self._frame_urls).on_navigated
+        )
+        frames = FrameSessions(cdp_client, self._frame_urls, self.plog)
+        add_cdp_handler(cdp_client, "Target.attachedToTarget", frames.on_attached)
 
     def _on_request(self, event: dict, session_id: str | None = None) -> None:
         request_id = event.get("requestId", "")
@@ -1216,6 +1347,9 @@ class NetworkRecorder:
             "portal": self.portal_name,
             "method": method,
             "url": url,
+            "document_url": event.get("documentURL", ""),
+            "page_url": FrameUrls(self._frame_urls).page_url(event),
+            "resource_type": event.get("type", ""),
             "body": body[: self.BODY_CAP_BYTES],
             "body_truncated": len(body) > self.BODY_CAP_BYTES,
             "body_size": len(body),
@@ -1284,12 +1418,12 @@ class CDPDebugger:
     - Runtime.exceptionThrown  — uncaught JavaScript errors
     - Page.javascriptDialogOpening — alert/confirm/prompt dialogs (can block forms)
 
-    Interesting events (4xx/5xx, errors, popups) log at INFO. Everything else
+    Errors (4xx/5xx, JS errors) log at WARNING and new tabs at INFO. Everything else
     goes to DEBUG, but every event is persisted to applications/<portal>/cdp.jsonl
     for offline inspection.
     """
 
-    INTERESTING_STATUS = (400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504)
+    HTTP_ERROR_MIN = 400
 
     def __init__(
         self,
@@ -1368,7 +1502,7 @@ class CDPDebugger:
             "mime_type": resp.get("mimeType", ""),
         }
         self._persist(record)
-        if status in self.INTERESTING_STATUS:
+        if status >= self.HTTP_ERROR_MIN:
             self.plog.warning("HTTP %d %s %s", status, method, url[:80])
             self.app_logger.emit(
                 "http_error",
@@ -1560,6 +1694,41 @@ class DryRunGuard:
         )
 
 
+class ScrollLoopBrake:
+    """Tells the agent to stop scrolling after a run of scroll-only steps.
+
+    browser_use has its own loop detector, but it nudges only from 5 repeats on and
+    says to carry on if making progress. flash-lite scrolled through it: 14 of 21
+    logged steps were scroll-only in run 20261025_235357 on We Work Remotely.
+    """
+
+    MAX_SCROLL_ONLY_STEPS = 3
+    NOTE = (
+        "<sys>You have only scrolled for {steps} steps in a row. Stop scrolling: "
+        "open the next listing that matches, use the site search or filters, or "
+        "call done if nothing here matches.</sys>"
+    )
+
+    def __init__(self, plog: logging.Logger) -> None:
+        self._plog = plog
+        self._streak = 0
+
+    def observe(self, actions: Sequence[str], agent: Agent) -> None:
+        if not actions or any(name != "scroll" for name in actions):
+            self._streak = 0
+            return
+        self._streak += 1
+        if self._streak % self.MAX_SCROLL_ONLY_STEPS:
+            return
+        # No public API adds a lasting note: context messages are cleared before the
+        # next LLM call, and Agent.add_new_task replaces the task.
+        history = agent._message_manager.state.agent_history_items
+        history.append(HistoryItem(system_message=self.NOTE.format(steps=self._streak)))
+        self._plog.info(
+            "scroll brake: %d scroll-only steps, told the agent to stop", self._streak
+        )
+
+
 # ── Per-step callback ─────────────────────────────────────────────────────────
 
 
@@ -1579,8 +1748,10 @@ class StepCallback:
         network_recorder: "NetworkRecorder | None" = None,
         cdp_debugger: "CDPDebugger | None" = None,
         dry_run_guard: DryRunGuard | None = None,
+        scroll_brake: ScrollLoopBrake | None = None,
     ):
         self.dry_run_guard = dry_run_guard
+        self.scroll_brake = scroll_brake
         self.portal_name = portal_name
         self.app_logger = app_logger
         self.plog = app_logger.portal(portal_name)
@@ -1637,6 +1808,8 @@ class StepCallback:
         memory = getattr(agent_output, "memory", None) or ""
         actions = self._extract_action_names(agent_output)
         action_details = self._extract_action_details(agent_output)
+        if self.scroll_brake:
+            self.scroll_brake.observe(actions, self.agent_ref)
 
         # INFO — single-line summary
         timing = f"{elapsed:5.1f}s" if elapsed is not None else "  ----"
@@ -1738,14 +1911,59 @@ class StepCallback:
 # ── Custom agent actions ──────────────────────────────────────────────────────
 
 
+class UnmarkedSubmits:
+    """Records pages whose form POST was never followed by mark_applied/attempted.
+
+    Without a record, check_applied says not_applied next run and the agent can send
+    the same application again (seen with flash-lite on 2026-10-30).
+    """
+
+    REASON = "submitted_not_marked"
+    # ponytail: same-host POSTs count as the page's form; analytics on the page's own
+    # host still counts. Add such hosts to NetworkRecorder.NOISE_FRAGMENTS.
+    BEACON_TYPE = "Ping"
+
+    def __init__(
+        self, portal: str, attempted: JsonlTracker, plog: logging.Logger
+    ) -> None:
+        self.portal = portal
+        self.attempted = attempted
+        self.plog = plog
+
+    def pages(self, captures: list[dict]) -> list[str]:
+        """Distinct pages that POSTed to their own host, in order."""
+        found = [
+            capture["page_url"]
+            for capture in captures
+            if capture.get("page_url")
+            and capture.get("resource_type") != self.BEACON_TYPE
+            and urlsplit(capture["url"]).hostname
+            == urlsplit(capture["page_url"]).hostname
+        ]
+        return list(dict.fromkeys(found))
+
+    async def record(self, captures: list[dict]) -> None:
+        for page in self.pages(captures):
+            self.plog.warning("submitted without mark_applied, recording: %s", page)
+            await self.attempted.append(
+                {
+                    "portal": self.portal,
+                    "job_url": page,
+                    "job_title": "",
+                    "reason": self.REASON,
+                    "notes": "a form on this page sent a POST; the agent never marked it",
+                    "attempted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+            )
+
+
 class AgentActions:
     """Registers all custom @tools.registry.action handlers for one portal."""
 
     _notes_lock = asyncio.Lock()
 
-    SESSION_VISIT_LIMIT = (
-        2  # max times a URL can be visited in this session before auto-bail
-    )
+    # check_applied calls per URL in one session; the next call gets loop_detected
+    SESSION_VISIT_LIMIT = 2
 
     def __init__(
         self,
@@ -1774,6 +1992,18 @@ class AgentActions:
         self.shot_dir.mkdir(parents=True, exist_ok=True)
         # In-session visit counter — auto-bails when the agent revisits the same URL.
         self._session_visits: dict[str, int] = {}
+        # Listing URL that check_applied cleared last; mark_applied records it, since
+        # the agent often passes the apply-form URL instead (a different key).
+        self._checked_job: dict[str, str] = {}
+
+    async def finish_job(self) -> None:
+        """Close the current job: record an unmarked submit, then forget its POSTs."""
+        if self.network_recorder is None:
+            return
+        if not self.dry_run:
+            unmarked = UnmarkedSubmits(self.portal_name, self.attempted, self.plog)
+            await unmarked.record(self.network_recorder.recent)
+        self.network_recorder.start_job()
 
     def register_all(self) -> None:
         self._register_check_applied()
@@ -1794,14 +2024,15 @@ class AgentActions:
         )
         session_visits = self._session_visits
         visit_limit = self.SESSION_VISIT_LIMIT
-        network_recorder = self.network_recorder
+        finish_job = self.finish_job
+        checked_job = self._checked_job
 
         @self.agent.tools.registry.action(
             "Check whether a specific job has already been applied to OR previously attempted-and-failed. "
             "Call this before clicking Apply on ANY listing. Returns one of: "
             "'already_applied' (we successfully applied — skip it), "
             "'already_attempted' (we tried and gave up before — DO NOT retry, skip it), "
-            "'visited_this_session' (you've already opened this URL once or more in this run — "
+            "'loop_detected' (you already checked this URL twice in this run — "
             "PICK A DIFFERENT listing, do not retry this one), "
             "'not_applied' (proceed with the apply flow)."
         )
@@ -1856,8 +2087,8 @@ class AgentActions:
                 result="not_applied",
                 visits=visits,
             )
-            if network_recorder:
-                network_recorder.start_job()
+            await finish_job()
+            checked_job["url"] = job_url
             return ActionResult(extracted_content="not_applied")
 
     def _register_mark_applied(self) -> None:
@@ -1870,6 +2101,7 @@ class AgentActions:
             self.dry_run,
         )
         network_recorder = self.network_recorder
+        checked_job = self._checked_job
 
         @self.agent.tools.registry.action(
             "Record that an application was successfully submitted. "
@@ -1898,9 +2130,10 @@ class AgentActions:
                         "listing, or call done if there is none."
                     )
                 )
+            listing_url = checked_job.pop("url", job_url)
             record = {
                 "portal": portal,
-                "job_url": job_url,
+                "job_url": listing_url,
                 "job_title": job_title,
                 "salary": salary,
                 "location": location,
@@ -1915,7 +2148,17 @@ class AgentActions:
             # contains evidence of what was actually POSTed during the apply flow.
             if network_recorder:
                 record["recent_network_posts"] = network_recorder.recent[-10:]
+            if job_url_key(job_url) != job_url_key(listing_url):
+                record["apply_url"] = job_url
+            if network_recorder:
+                # False: no POST since the job started, so the form likely never went
+                # out (browser validation can block it); left for a person to check
+                record["submit_seen"] = bool(network_recorder.recent)
+                if not record["submit_seen"]:
+                    plog.warning("mark_applied with no POST seen: %s", listing_url)
             await applied.append(record)
+            if network_recorder:
+                network_recorder.start_job()
             recorder.write(record)
             plog.info(
                 "APPLIED: %s — %s [%s | %s]",
@@ -1945,6 +2188,7 @@ class AgentActions:
             self.app_logger,
             self.dry_run,
         )
+        network_recorder = self.network_recorder
 
         @self.agent.tools.registry.action(
             "Record that you ATTEMPTED to apply to a job but could not complete it. "
@@ -1974,6 +2218,8 @@ class AgentActions:
                 "attempted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }
             await attempted.append(record)
+            if network_recorder:
+                network_recorder.start_job()
             plog.info("ATTEMPTED (gave up): %s — reason=%s", job_title, reason)
             app_logger.emit(
                 "attempted",
@@ -2016,12 +2262,16 @@ class AgentActions:
 
     def _register_note(self) -> None:
         portal, plog, app_logger = self.portal_name, self.plog, self.app_logger
+        dry_run = self.dry_run  # knowledge/*.md is in every prompt, real runs too
 
         @self.agent.tools.registry.action(
             "Append a short note about a portal-specific quirk for future agents. "
             "Call this once after finishing all applications on this portal."
         )
         async def save_note(note: str) -> ActionResult:
+            if dry_run:
+                plog.info("DRY RUN: note not saved (%d chars)", len(note))
+                return ActionResult(extracted_content="dry_run: not saved. Move on.")
             ts = time.strftime("%Y-%m-%d %H:%M")
             entry = f"\n## Portal: {portal} ({ts})\n{note.strip()}\n"
             async with AgentActions._notes_lock:
@@ -2032,11 +2282,12 @@ class AgentActions:
             return ActionResult(extracted_content="Note saved.")
 
     def _register_save_credentials(self) -> None:
-        portal, plog, app_logger, yaml_store = (
+        portal, plog, app_logger, yaml_store, dry_run = (
             self.portal_name,
             self.plog,
             self.app_logger,
             self.yaml_store,
+            self.dry_run,
         )
 
         @self.agent.tools.registry.action(
@@ -2044,8 +2295,17 @@ class AgentActions:
             "Call this immediately after successfully creating a new account."
         )
         async def save_credentials(username: str, password: str) -> ActionResult:
+            # The guard blocked the sign-up POST, so this account does not exist;
+            # saving it would overwrite the portal's real credentials.
+            if dry_run:
+                plog.info("DRY RUN: would save credentials for %s", portal)
+                return ActionResult(extracted_content="dry_run: not saved. Move on.")
+            try:
+                await yaml_store.update_credentials(portal, username, password)
+            except UnknownSystem as exc:
+                plog.warning("CREDENTIALS not saved: %s", exc)
+                return ActionResult(extracted_content=f"not saved: {exc}. Move on.")
             plog.info("CREDENTIALS saved for %s (user=%s)", portal, username)
-            await yaml_store.update_credentials(portal, username, password)
             app_logger.emit(
                 "credentials_saved",
                 portal=portal,
@@ -2073,6 +2333,7 @@ class ProfileInUse(RuntimeError):
 class PortalRunner:
     """Runs the apply flow for one portal end-to-end."""
 
+    PASSWORD_FILE = "portal_password"
     PORTAL_PWD_ENV = "PORTAL_ACCOUNT_PASSWORD"
     LINKEDIN_USER_ENV = "LINKEDIN_SSO_USERNAME"
     LINKEDIN_PWD_ENV = "LINKEDIN_SSO_PASSWORD"
@@ -2133,7 +2394,7 @@ class PortalRunner:
             else None
         )
         agent = self._build_agent(task, credentials, proxy=proxy)
-        AgentActions(
+        actions = AgentActions(
             agent,
             self.name,
             dry_run=self.opts.dry_run,
@@ -2143,9 +2404,12 @@ class PortalRunner:
             recorder=self.recorder,
             app_logger=self.app_logger,
             network_recorder=self._network_recorder,
-        ).register_all()
-
-        return await self._run_agent(agent)
+        )
+        actions.register_all()
+        try:
+            return await self._run_agent(agent)
+        finally:
+            await actions.finish_job()
 
     def _build_credentials(self) -> dict[str, str]:
         creds: dict[str, str] = {}
@@ -2183,7 +2447,7 @@ class PortalRunner:
         """
         if from_env := os.getenv(self.PORTAL_PWD_ENV):
             return from_env
-        path = Paths.PROFILES / self.name / "portal_password"
+        path = Paths.PROFILES / self.name / self.PASSWORD_FILE
         if path.exists():
             return path.read_text().strip()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2238,7 +2502,10 @@ class PortalRunner:
         portal_profile = Paths.PROFILES / self.name
         portal_profile.mkdir(parents=True, exist_ok=True)
         self._clean_stale_locks(portal_profile)
-        is_first = not any(portal_profile.iterdir())
+        # The password file is written before the agent is built; it is not Chrome state
+        is_first = all(
+            entry.name == self.PASSWORD_FILE for entry in portal_profile.iterdir()
+        )
         self.plog.info(
             "browser profile: %s (%s)",
             portal_profile,
@@ -2273,6 +2540,7 @@ class PortalRunner:
             dry_run_guard=(
                 DryRunGuard(self.name, self.app_logger) if self.opts.dry_run else None
             ),
+            scroll_brake=ScrollLoopBrake(self.plog),
         )
         # Files the agent is allowed to upload via browser_use's upload_file action.
         # Without this whitelist, EVERY upload attempt fails with
@@ -2308,7 +2576,6 @@ class PortalRunner:
         )
         callback.agent_ref = agent  # lets callbacks attach the recorders
         self._network_recorder = network_recorder
-        self._cdp_debugger = cdp_debugger
         return agent
 
     async def _run_agent(self, agent: Agent) -> str:
@@ -2424,8 +2691,13 @@ class Orchestrator:
     async def _retry_failures(
         self, results: list[tuple[str, str | Exception]]
     ) -> list[tuple[str, str | Exception]]:
+        # A profile held by a live Chrome is still held 5 s later
         failed = {
-            n for n, r in results if isinstance(r, Exception) and n not in self._crashed
+            n
+            for n, r in results
+            if isinstance(r, Exception)
+            and not isinstance(r, ProfileInUse)
+            and n not in self._crashed
         }
         if not failed:
             return results
@@ -2459,7 +2731,7 @@ class Orchestrator:
 
         # Failure modes we want to catch and continue past (other portals are still useful):
         # - browser_use's own runtime errors (wrapped in their own classes)
-        # - Browser/CDP connection issues (TimeoutError, OSError, asyncio.CancelledError)
+        # - Browser/CDP connection issues (TimeoutError, OSError)
         # - Network errors from the LLM (httpx.HTTPError)
         # Real bugs (TypeError/AttributeError/KeyError from our code) are not retried
         # and still crash the run, but only after the other portals finish and the
@@ -2599,7 +2871,11 @@ class SummaryReporter:
 
 
 def positive_int(value: str) -> int:
-    """argparse type: --workers 0 would make Semaphore(0) and hang the run forever."""
+    """argparse type for counts that must be at least 1.
+
+    --workers 0 would make Semaphore(0) and hang the run; --max-actions 0 would make
+    every step run no action.
+    """
     number = int(value)
     if number < 1:
         raise argparse.ArgumentTypeError(f"must be 1 or more, got {number}")
@@ -2670,7 +2946,7 @@ class CLI:
         )
         p.add_argument(
             "--max-actions",
-            type=int,
+            type=positive_int,
             default=5,
             help="Max actions per LLM call (default 5; raise to 8–12)",
         )
@@ -2695,7 +2971,7 @@ class CLI:
 
         yaml_store = YamlStore(Path(args.systems).resolve())
         raw = yaml_store.load()
-        systems = raw.get("systems") or raw.get("sources") or []
+        systems = raw.get(yaml_store.systems_key(raw)) or []
         default_proxy_cfg = raw.get("proxy")
         log.info("Loaded %d portals from %s", len(systems), args.systems)
 

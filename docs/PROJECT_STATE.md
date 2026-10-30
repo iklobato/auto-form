@@ -2,7 +2,11 @@
 
 Read this first if you are an agent (or a person) picking up this repo. It says what the
 code does today, what was learned the hard way, what was done, and what is still open.
-Last updated: 2026-10-26.
+Last updated: 2026-10-30.
+
+Work of one session, with its evidence, lives in `docs/sessions/<date>.md`:
+[2026-10-30](sessions/2026-10-30.md) (retries, dry-run safety, duplicate applications,
+submit capture, local end-to-end test).
 
 This repo is public. Never put personal data here (names, emails, phone, resume file
 names, anything from `knowledge/`, `systems*.yaml` or `.env`).
@@ -37,10 +41,11 @@ uv run python fill.py --summary                   # applications on disk
 
 | Path | Tracked | What it is |
 |---|---|---|
-| `fill.py` | yes | the whole app (about 2,800 lines) |
+| `fill.py` | yes | the whole app (about 3,100 lines) |
 | `prompts/task.md` | yes | task template; `TaskBuilder` fills `{placeholders}` |
 | `tests/` | yes | pytest suite; `tests/fixtures/forms.py` has form fixtures |
 | `README.md` | yes | user docs and CLI flags |
+| `docs/` | yes | this file and `sessions/<date>.md` (one file per work session) |
 | `.env.example` | yes | env template |
 | `.env` | no | secrets: `OPENROUTER_TOKEN`, `RESUME_PATH`, `PORTAL_ACCOUNT_PASSWORD`, `LINKEDIN_SSO_*`, per-portal `*_USERNAME/_PASSWORD` |
 | `systems.yaml` | no | default portal list (55 entries). Holds plaintext portal passwords |
@@ -90,6 +95,9 @@ uv run python fill.py --summary                   # applications on disk
 - The prompt gets one `TaskBuilder.DRY_RUN_NOTICE`: fill, do not submit, call
   `mark_applied`, move on. In a dry run `mark_applied` and `mark_attempted` write nothing,
   and `mark_applied` replies that the job is done (a "not recorded" reply caused a loop).
+  `save_credentials` (the sign-up POST was blocked, so the account does not exist) and
+  `save_note` (`knowledge/*.md` goes into every prompt) also write nothing. The notice
+  says a failed upload is expected, so the agent does not report it as an error.
 - Known cost: sites that use POST for reads other than GraphQL queries (for example Algolia
   search) may show nothing in a dry run.
 
@@ -106,6 +114,17 @@ handler (its reply comes on the same read loop): schedule it with `asyncio.creat
 and keeps a ring buffer. `check_applied` returning `not_applied` calls `start_job()` to
 clear it, so `mark_applied` attaches only the current job's POSTs. Analytics hosts live in
 `NetworkRecorder.NOISE_FRAGMENTS`; add new ones there (the guard uses the same list).
+
+### 5.3b Submits the agent did not record
+- `NetworkRecorder` enables Network/Page on every cross-site iframe session too
+  (`FrameSessions`, via `Target.attachedToTarget`), and stores `page_url` per POST
+  (`FrameUrls`: the frame's URL for a form submit, `documentURL` for XHR/fetch).
+- When a job is closed (`check_applied` moving on, or the end of `PortalRunner.run`), a page
+  that POSTed to its own host with no `mark_applied`/`mark_attempted` after it goes to
+  `attempted.jsonl` with `reason: submitted_not_marked` (`UnmarkedSubmits`).
+- `mark_applied` stores `job_url` = the URL `check_applied` cleared and `apply_url` = the
+  agent's URL when different; `has_job` matches either. Its record has `submit_seen`
+  (False when no POST was captured for the job) and logs a warning; it is not refused.
 
 ### 5.4 Trackers and duplicates
 `applied.jsonl` and `attempted.jsonl` are append-only JSONL with `flock`. `check_applied`
@@ -127,11 +146,15 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   as `portal_crash`, not retried, the batch and summary finish, then it is re-raised.
 - `StepCallback` errors (other than the guard) are logged as `step_callback_error` and
   never reach the agent.
-- `BackoffTransport` retries 429/5xx, caps `Retry-After` at `max_wait`, stops when the
+- `BackoffTransport` retries 429/5xx and `httpx.TransportError` (one `RetryBudget` per
+  request), caps `Retry-After` at `max_wait`, stops when the
   next sleep would pass 45 s in total (browser_use cancels an LLM call after 75 s for the
   default gemini model; slowest logged step was 19.8 s), and closes each discarded response.
 - `PortalRunner._clean_stale_locks` raises `ProfileInUse` if the profile's `SingletonLock`
   points at a live Chrome on this host; it only removes locks from dead or foreign pids.
+  `Orchestrator` does not retry `ProfileInUse`.
+- `ScrollLoopBrake` (called from `StepCallback`) adds a note to the agent history after
+  every 3rd scroll-only step in a row (see section 6 for why it uses a private API).
 
 ## 6. Things learned (read before debugging)
 
@@ -161,13 +184,37 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   `https://api.lever.co/v0/postings/<co>?mode=json`.
 - GitGuardian scans every commit of a PR; it flagged a made-up test password. Keep test
   secrets short or built at runtime (`"x$y"`), not password-looking literals.
+- browser_use has its own loop detector, but its nudges start at 5 repeats and say to
+  carry on if making progress; flash-lite scrolled through them. `ScrollLoopBrake` adds a
+  note after every 3rd scroll-only step in a row. It writes to
+  `agent._message_manager.state.agent_history_items` because context messages added in
+  the step callback are cleared before the next LLM call, and `Agent.add_new_task`
+  replaces the task. A browser_use upgrade can break this: `tests/test_scroll_loop_brake.py`
+  checks it against the real `MessageManager`.
+- browser_use drops actions past `max_actions_per_step` without telling the model
+  (`agent/service.py`, `parsed.action[: max_actions_per_step]`); its memory then says the
+  form is filled. With the default 5, flash-lite left 10 of 14 fields empty.
+- browser_use's `input` action has `clear` (`'1=clear, 0=append'`); flash-lite sent
+  `clear: False` when it typed into a field again, so the value went in twice.
+- Before 2026-10-30 `NetworkRecorder` listened only on the page's CDP session (fixed,
+  see 5.3b). A POST from a cross-site iframe (a different host, so Chrome runs it in another process; how a company site
+  embeds Greenhouse) is not captured at all: probe on 2026-10-30, the iframe server got
+  2 POSTs and the recorder 0; with a same-site iframe it got both. Requests an iframe
+  sends before its session is enabled are still missed, so `mark_applied` must not
+  require a captured POST. A single-threaded `HTTPServer` stalled the iframe load by
+  40 s in a test (Chrome keeps a preconnect socket open); use `ThreadingHTTPServer`.
+- For a form submit (`type: Document`) CDP's `documentURL` is the POST target, not the
+  page with the form; `FrameUrls` keeps each frame's URL from `Page.frameNavigated` for
+  that. `Referer` is not in `requestWillBeSent` headers.
 - The editor quality hook runs `ruff --fix` and `black` on every edited file and deletes
   imports that are unused at that moment: add an import in the same edit as its first use.
 
 ## 7. Live test record
 
-All runs were `--dry-run`. Nothing was ever written to `applied.jsonl` or `attempted.jsonl`
-by these runs.
+The real-site runs below were all `--dry-run`; nothing was written to the user's
+`applied.jsonl` or `attempted.jsonl`. The local end-to-end runs further down were not dry,
+but every submit went only to a local test server and they ran from a sandbox dir with
+its own trackers (how: [sessions/2026-10-30.md](sessions/2026-10-30.md), section 8).
 
 | Date | Portal | Mode | Result |
 |---|---|---|---|
@@ -180,14 +227,41 @@ by these runs.
 | 2026-10-26 | weworkremotely, `--model google/gemini-2.5-flash` (run `20261026_004642`) | visible | 23 logged steps, 5 scroll-only (flash-lite: 21 / 14). Accepted the Proxify role that flash-lite rejected on timezone, followed it to `talent.proxify.io/apply`, filled it and uploaded the resume; its "Next" button never enabled, so no POST went to Proxify. Blocked: WWR `job_apply_count` and a Google conversion ping |
 | 2026-10-26 | weworkremotely, cost run, flash-lite (run `20261026_005544`) | visible | **US$ 0.0117** (key `usage` 461.284374135 to 461.296102585), 9 steps, 5 scroll-only, 244 s, no form |
 | 2026-10-26 | weworkremotely, cost run, flash (run `20261026_010014`) | visible | **US$ 0.0800** (461.298752735 to 461.378750505), 27 steps, 6 scroll-only, 178 s, no form |
+| 2026-10-30 | Supabase "SDK Engineer - Python" (Ashby, temp YAML), new upload notice | headless | 15 steps, one `upload_file`, not retried; 1 `ApiCreateFileUploadHandle` blocked; final result: "the resume upload was attempted (and failed, as expected in a dry run)" |
+| 2026-10-30 | weworkremotely, flash-lite, `ScrollLoopBrake` (run `20261030_114910`) | visible | 29 logged steps, 7 scroll-only; the brake fired twice and the next step was a click both times; reached the Bitovi form on `applytojob.com`, filled it, uploaded the resume, `done`. Cost not measured |
+
+Local end-to-end runs (2026-10-30, not dry, submits went only to a local server on
+`127.0.0.1:8765` that serves two forms built from `tests/fixtures/forms.py`; the app ran
+from a sandbox dir with links to `fill.py`, `prompts`, `.env` and `knowledge`, so the
+real trackers were not touched; submitted fields compared with `00_form_answers.md`):
+
+| Model | `--max-actions` | Result |
+|---|---|---|
+| flash-lite | 5 (default) | 4 of 14 fields filled; browser validation blocked the submit; agent said `done` with success; no POST |
+| flash-lite | 12 | job 1 sent; phone, LinkedIn and website sent twice (it typed again with `clear: False`); Gender, Veteran, Disability wrong; no `mark_applied`; job 2 never opened |
+| flash | 12 | both jobs sent; job 1: 12 of 14 right (Veteran and Disability "I prefer not to answer"); job 2: all fields right; `mark_applied` passed the form URL for job 2 |
+| flash, same trackers again | 12 | job 1 skipped (`already_applied`); job 2 **sent a second time** (fixed since, see section 9) |
+
+After the duplicate fix (same day, fresh sandbox trackers, cost from the key `usage`):
+
+| Run | Result | Cost |
+|---|---|---|
+| A: flash, `--max-actions 12` | 16 steps; both jobs sent; records keep the listing URL as `job_url` and the form URL as `apply_url`; no field sent twice; Veteran "I am not a veteran", Disability "No" | US$ 0.172 |
+| B: same again | 8 steps; both jobs `already_applied`, **no POST** | US$ 0.068 |
+| C: flash, `--dry-run`, fresh trackers | 48 steps; both forms filled; **no POST**, nothing in `applied.jsonl`, notes file unchanged (md5); the agent never clicked submit, so the guard had nothing to block | US$ 0.569 |
+| D: flash-lite, `--max-actions 12` | 8 steps; job 1 sent, but no `check_applied` and no `mark_applied`, so nothing recorded; job 2 never opened | US$ 0.020 |
+| E: flash-lite, fresh trackers, after the unmarked-submit fix | 13 steps; job 1 sent and marked; job 2 **marked applied with no POST** (the form never went out), so it is recorded as applied and will be skipped forever | not reliable (key usage also rose from other use) |
+| F: same again | job 1 `already_applied`; job 2 opened and left; no POST | same |
 
 Cost runs are read from `GET https://openrouter.ai/api/v1/key` (`data.usage`, USD) before and
 after one run; `/api/v1/activity` needs a management key. Usage also rose US$ 0.0027
 between the two runs with nothing of ours running, so each number is good to about
 US$ 0.003. One run per model is a small sample.
 
-Still never seen live: the guard blocking a final submit click. The agent obeys the
-dry-run notice and never clicks it.
+The agent obeys the dry-run notice and never clicks a final submit, so that click is
+covered by `tests/test_dry_run_guard_chrome.py` instead: a real headless Chrome clicks a
+form's submit button and sends a `fetch` POST to a local server; without the guard the
+server records the POST, with it the server records nothing.
 
 ## 8. Done so far
 
@@ -209,6 +283,9 @@ dry-run notice and never clicks it.
   `mark_applied` reply says the job is done; this file and `CLAUDE.md`.
 - Follow-up after PR #4 (2026-10-26): `google.com/measurement` (Google Ads conversion
   ping) added to the noise list; this file updated with the model comparison.
+- Branch `fix/retry-upload-guard-scroll` (2026-10-30, one commit per change, each with its test):
+  every change, the evidence and the commit for each is in
+  [sessions/2026-10-30.md](sessions/2026-10-30.md), section 3.
 - Measured: the guard does not slow screenshots (0.10 to 0.13 s with and without, 5 runs
   each on an Ashby page). Page loads were 1.1 to 1.5 s or about 8.2 s in both groups; the
   8 s is browser_use's own readiness timeout.
@@ -222,23 +299,26 @@ Each item says when it is done.
    2.3 times per step), and its better behavior (fewer scroll-only steps, reached a form)
    showed in 1 of 2 runs. Use `--model google/gemini-2.5-flash` for a portal where
    flash-lite stalls. Reopen if more runs show flash-lite missing real matches.
-2. **Dry-run upload is reported as an error.** The guard correctly blocks
-   `ApiCreateFileUploadHandle`, and the agent then says the upload failed. Decide whether
-   the notice should tell the agent uploads are blocked in a dry run. Done when a dry run
-   on an Ashby form ends without an upload error in the final result.
-3. **Guard on a real final submit.** Never observed live (see section 7). Done when a dry
-   run log shows a blocked submit mutation or form POST after a submit click.
-4. **No retry for LLM network errors.** `ChatOpenRouter(max_retries=0)` plus
-   `BackoffTransport` retries only status codes, so `ConnectError`/`ReadTimeout` fail the
-   step at once. Done when a transport-level error is retried with the same 45 s budget,
-   with a test.
-5. **Same job on two portals** is not detected (different URLs). Done when there is a
+2. **Closed 2026-10-30:** dry-run upload error (notice changed, see section 7), guard on
+   a real submit (real-Chrome test), LLM network-error retry, E741 lint.
+3. **Open from 2026-10-30** (details, fix ideas and "done when" for each in
+   [sessions/2026-10-30.md](sessions/2026-10-30.md), section 6): `clear: False` sends a
+   value twice; the default `--max-actions 5` cuts form fills short (no form was sent in
+   the default local run); `mark_applied` with no POST is still recorded as applied
+   (`submit_seen: false`); an agent that skips `check_applied` can still apply twice;
+   Veteran/Disability answers; scroll brake measured once; Greenhouse in a cross-site
+   iframe and the guard on an agent's submit click not seen live; three review findings.
+4. **Records written before 2026-10-30** with a form URL as `job_url` do not match their
+   listing URL. The user's `applied.jsonl` did not exist on 2026-10-30, so nothing to fix
+   there today.
+5. **What to watch in real runs:** [sessions/2026-10-30.md](sessions/2026-10-30.md),
+   section 9 (`submit_seen: false`, `submitted_not_marked`, brake log lines, dry-run cost).
+6. **Same job on two portals** is not detected (different URLs). Done when there is a
    cross-portal key (for example company plus title) or an explicit decision not to.
-6. **Screenshot timeouts on WWR** (`Clean screenshot timed out after 6 seconds`, 3 times)
+7. **Screenshot timeouts on WWR** (`Clean screenshot timed out after 6 seconds`, 3 times)
    are not explained. Not caused by the guard on the Ashby page; never measured on WWR.
-7. `knowledge/README.md` lists files that no longer exist (it is git-ignored, the user's
+8. `knowledge/README.md` lists files that no longer exist (it is git-ignored, the user's
    copy). Tell the user, do not edit their profile.
-8. One old lint warning: E741 in `tests/test_cdp_debugger.py` (`_events_lines`).
 
 ## 10. Rules for agents working here
 

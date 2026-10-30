@@ -5,8 +5,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.conftest import FakeRegistry
+
 from fill import (
     AgentActions,
+    RunOptions,
     ApplicationRecorder,
     JsonlTracker,
     NetworkRecorder,
@@ -518,3 +521,288 @@ class TestSaveCredentials:
         creds = yaml_store.load()["systems"][0]["credentials"]
         assert creds["username"] == "u@x"
         assert creds["password"] == "newpw"
+
+
+@pytest.fixture
+def dry_run_registry(request: pytest.FixtureRequest) -> FakeRegistry:
+    """Tools registered for a dry run, with a YAML store and the notes file present."""
+    Paths.NOTES.parent.mkdir(parents=True, exist_ok=True)
+    AgentActions(
+        request.getfixturevalue("mock_agent"),
+        "acme",
+        dry_run=True,
+        yaml_store=request.getfixturevalue("yaml_store"),
+        applied=request.getfixturevalue("applied_tracker"),
+        attempted=request.getfixturevalue("attempted_tracker"),
+        recorder=request.getfixturevalue("recorder"),
+        app_logger=request.getfixturevalue("mock_app_logger"),
+    ).register_all()
+    return request.getfixturevalue("fake_registry")
+
+
+@pytest.fixture
+def ghost_portal_registry(request: pytest.FixtureRequest) -> FakeRegistry:
+    """Tools of a real run for a portal that the systems YAML does not list."""
+    AgentActions(
+        request.getfixturevalue("mock_agent"),
+        "ghost",
+        dry_run=False,
+        yaml_store=request.getfixturevalue("yaml_store"),
+        applied=request.getfixturevalue("applied_tracker"),
+        attempted=request.getfixturevalue("attempted_tracker"),
+        recorder=request.getfixturevalue("recorder"),
+        app_logger=request.getfixturevalue("mock_app_logger"),
+    ).register_all()
+    return request.getfixturevalue("fake_registry")
+
+
+class TestSaveCredentialsUnknownPortal:
+    async def test_replies_not_saved_and_keeps_the_yaml(
+        self, ghost_portal_registry: FakeRegistry, yaml_store: YamlStore
+    ) -> None:
+        before = yaml_store.path.read_text()
+
+        reply = await ghost_portal_registry.actions["save_credentials"]("u@x", "pw")
+
+        assert yaml_store.path.read_text() == before
+        assert reply.extracted_content == (
+            f"not saved: 'ghost' is not in {yaml_store.path}. Move on."
+        )
+
+
+class TestDryRunWritesNoState:
+    # The guard blocks the account-creation POST, so the account the agent "saves"
+    # does not exist; writing it would overwrite the portal's real credentials.
+    async def test_save_credentials_keeps_the_yaml(
+        self, dry_run_registry: FakeRegistry, yaml_store: YamlStore
+    ) -> None:
+        before = yaml_store.path.read_text()
+
+        reply = await dry_run_registry.actions["save_credentials"]("u@x", "newpw")
+
+        assert yaml_store.path.read_text() == before
+        assert reply.extracted_content.startswith("dry_run: not saved")
+
+    # knowledge/*.md is pasted into every prompt, real runs included.
+    async def test_save_note_keeps_the_notes_file(
+        self, dry_run_registry: FakeRegistry
+    ) -> None:
+        Paths.NOTES.write_text("")
+
+        reply = await dry_run_registry.actions["save_note"]("upload failed")
+
+        assert Paths.NOTES.read_text() == ""
+        assert reply.extracted_content.startswith("dry_run: not saved")
+
+
+LISTING_URL = "http://127.0.0.1:8765/jobs/1002"
+APPLY_FORM_URL = "http://127.0.0.1:8765/jobs/1002/apply"
+
+
+class RealRunSessions:
+    """Builds the tools of one real (not dry) run; each call is a new run session."""
+
+    def __init__(self, request: pytest.FixtureRequest) -> None:
+        self.request = request
+
+    def start(self) -> FakeRegistry:
+        fixture = self.request.getfixturevalue
+        AgentActions(
+            fixture("mock_agent"),
+            "acme",
+            dry_run=False,
+            yaml_store=None,
+            applied=fixture("applied_tracker"),
+            attempted=fixture("attempted_tracker"),
+            recorder=fixture("recorder"),
+            app_logger=fixture("mock_app_logger"),
+        ).register_all()
+        return fixture("fake_registry")
+
+
+@pytest.fixture
+def sessions(request: pytest.FixtureRequest) -> RealRunSessions:
+    return RealRunSessions(request)
+
+
+class TestApplyFormUrl:
+    # Live run 2026-10-30: the agent checked the listing URL, applied, then passed
+    # the form URL to mark_applied. The next run checked the listing again, got
+    # not_applied and sent the same application a second time.
+    async def test_next_session_skips_the_listing_after_marking_the_form_url(
+        self, sessions: RealRunSessions
+    ) -> None:
+        first = sessions.start()
+        await first.actions["check_applied"](LISTING_URL)
+        await first.actions["mark_applied"](APPLY_FORM_URL, "Python Engineer")
+
+        reply = await sessions.start().actions["check_applied"](LISTING_URL)
+
+        assert reply.extracted_content == "already_applied"
+
+    # Without a check_applied first, only the URL the agent passed is known.
+    async def test_a_listing_never_checked_is_matched_by_its_form_url(
+        self, sessions: RealRunSessions
+    ) -> None:
+        first = sessions.start()
+        await first.actions["mark_applied"](APPLY_FORM_URL, "Python Engineer")
+
+        reply = await sessions.start().actions["check_applied"](APPLY_FORM_URL)
+
+        assert reply.extracted_content == "already_applied"
+
+
+FORM_PAGE = "https://jobs.acme.example/1001/apply"
+
+
+class RecordedRun:
+    """One run's tools with a NetworkRecorder attached to a fake CDP client."""
+
+    def __init__(
+        self, network: NetworkRecorder, actions: AgentActions, browser: MagicMock
+    ) -> None:
+        self.network = network
+        self.actions = actions
+        self.browser = browser
+
+    async def browser_posts(self, url: str, page: str = FORM_PAGE) -> None:
+        await self.network.attach_if_needed(self.browser)
+        cdp = await self.browser.get_or_create_cdp_session()
+        await cdp.cdp_client._event_registry.handle_event(
+            "Network.requestWillBeSent",
+            {
+                "requestId": url,
+                "documentURL": page,
+                "type": "Document",
+                "request": {"method": "POST", "url": url},
+            },
+            cdp.session_id,
+        )
+
+
+class RecordedRuns:
+    """Builds a RecordedRun for a real run or a dry run from the test fixtures."""
+
+    def __init__(self, request: pytest.FixtureRequest) -> None:
+        self.request = request
+
+    def real(self) -> RecordedRun:
+        return self.build(RunOptions(dry_run=False))
+
+    def dry(self) -> RecordedRun:
+        return self.build(RunOptions(dry_run=True))
+
+    def build(self, opts: RunOptions) -> RecordedRun:
+        fixture = self.request.getfixturevalue
+        network = NetworkRecorder("acme", fixture("mock_app_logger"))
+        actions = AgentActions(
+            fixture("mock_agent"),
+            "acme",
+            dry_run=opts.dry_run,
+            yaml_store=None,
+            applied=fixture("applied_tracker"),
+            attempted=fixture("attempted_tracker"),
+            recorder=fixture("recorder"),
+            app_logger=fixture("mock_app_logger"),
+            network_recorder=network,
+        )
+        actions.register_all()
+        return RecordedRun(network, actions, fixture("cdp_browser"))
+
+    def tools(self) -> dict:
+        return self.request.getfixturevalue("fake_registry").actions
+
+
+@pytest.fixture
+def runs(request: pytest.FixtureRequest) -> RecordedRuns:
+    return RecordedRuns(request)
+
+
+@pytest.fixture
+def real_run(runs: RecordedRuns) -> RecordedRun:
+    return runs.real()
+
+
+class TestSubmitWithoutMark:
+    # Live run 2026-10-30: flash-lite submitted a form and called done without
+    # mark_applied, so nothing was recorded and the next run could apply again.
+    async def test_run_end_records_the_form_page_as_attempted(
+        self, real_run: RecordedRun, runs: RecordedRuns
+    ) -> None:
+        await real_run.browser_posts("https://jobs.acme.example/1001/apply")
+
+        await real_run.actions.finish_job()
+
+        reply = await runs.tools()["check_applied"](FORM_PAGE)
+        assert reply.extracted_content == "already_attempted"
+
+    async def test_moving_to_the_next_job_records_the_previous_form(
+        self, real_run: RecordedRun, runs: RecordedRuns
+    ) -> None:
+        await real_run.browser_posts("https://jobs.acme.example/1001/apply")
+
+        await runs.tools()["check_applied"]("https://jobs.acme.example/1002")
+
+        reply = await runs.tools()["check_applied"](FORM_PAGE)
+        assert reply.extracted_content == "already_attempted"
+
+    async def test_mark_applied_leaves_nothing_to_record(
+        self,
+        real_run: RecordedRun,
+        runs: RecordedRuns,
+        attempted_tracker: JsonlTracker,
+    ) -> None:
+        await real_run.browser_posts("https://jobs.acme.example/1001/apply")
+        await runs.tools()["mark_applied"](FORM_PAGE, "Python Engineer")
+
+        await real_run.actions.finish_job()
+
+        assert attempted_tracker.load_keys() == set()
+
+    # Analytics on another host is not a submit of this page's form.
+    async def test_a_post_to_another_host_is_not_a_submit(
+        self, real_run: RecordedRun, attempted_tracker: JsonlTracker
+    ) -> None:
+        await real_run.browser_posts("https://stats.tracker.example/collect")
+
+        await real_run.actions.finish_job()
+
+        assert attempted_tracker.load_keys() == set()
+
+    async def test_dry_run_records_nothing(
+        self, runs: RecordedRuns, attempted_tracker: JsonlTracker
+    ) -> None:
+        dry = runs.dry()
+        await dry.browser_posts("https://jobs.acme.example/1001/apply")
+
+        await dry.actions.finish_job()
+
+        assert attempted_tracker.load_keys() == set()
+
+
+class TestSubmitSeen:
+    # Live run 2026-10-30: flash-lite called mark_applied for a form that never
+    # went out (browser validation blocked it), so the job was recorded as sent.
+    async def test_mark_applied_without_any_post_is_flagged(
+        self,
+        real_run: RecordedRun,
+        runs: RecordedRuns,
+        applied_tracker: JsonlTracker,
+    ) -> None:
+        await runs.tools()["mark_applied"](FORM_PAGE, "Python Engineer")
+
+        assert [record["submit_seen"] for record in applied_tracker.records()] == [
+            False
+        ]
+
+    async def test_mark_applied_after_a_post_is_not_flagged(
+        self,
+        real_run: RecordedRun,
+        runs: RecordedRuns,
+        applied_tracker: JsonlTracker,
+    ) -> None:
+        await real_run.browser_posts("https://jobs.acme.example/1001/apply")
+
+        await runs.tools()["mark_applied"](FORM_PAGE, "Python Engineer")
+
+        assert [record["submit_seen"] for record in applied_tracker.records()] == [True]

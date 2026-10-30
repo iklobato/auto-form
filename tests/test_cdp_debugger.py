@@ -14,7 +14,7 @@ def _events_lines(portal: str) -> list[dict]:
     path = Paths.APPLICATIONS / portal / "cdp.jsonl"
     if not path.exists():
         return []
-    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 # ── Response handler ─────────────────────────────────────────────────────────
@@ -41,7 +41,9 @@ class TestResponseHandler:
         records = _events_lines("acme")
         assert records[-1]["status"] == 200
 
-    @pytest.mark.parametrize("status", [400, 401, 403, 404, 429, 500, 502, 503])
+    @pytest.mark.parametrize(
+        "status", [400, 401, 403, 404, 409, 410, 422, 429, 500, 502, 503]
+    )
     def test_logs_4xx_5xx_as_warning(
         self, status: int, tmp_app_root: Path, mock_app_logger: MagicMock
     ):

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from browser_use.browser.views import BrowserStateSummary
 
 import fill
 from fill import (
@@ -620,3 +621,89 @@ class TestProxyWiring:
         )
         with pytest.raises(RuntimeError, match="upstream gone"):
             await runner.run()
+
+
+@pytest.fixture
+def fresh_runner(request: pytest.FixtureRequest) -> PortalRunner:
+    """A runner for a portal that has never run: its profile dir does not exist."""
+    request.getfixturevalue("clean_env")
+    return _make_runner(
+        request.getfixturevalue("sample_system"),
+        opts=request.getfixturevalue("run_opts"),
+        yaml_store=request.getfixturevalue("yaml_store"),
+        mock_app_logger=request.getfixturevalue("mock_app_logger"),
+        task_builder=request.getfixturevalue("task_builder"),
+        cred_resolver=request.getfixturevalue("cred_resolver"),
+        applied=request.getfixturevalue("applied_tracker"),
+        attempted=request.getfixturevalue("attempted_tracker"),
+        recorder=request.getfixturevalue("recorder"),
+    )
+
+
+class TestBrowserStartSession:
+    # run() writes the generated portal password into the profile dir first
+    async def test_first_run_reports_a_fresh_profile(
+        self,
+        fresh_runner: PortalRunner,
+        mock_app_logger: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent_ctor.return_value = TestRunAgentOutcome._agent_returning(is_done=True)
+
+        await fresh_runner.run()
+
+        starts = [
+            call.kwargs["session"]
+            for call in mock_app_logger.emit.call_args_list
+            if call.args and call.args[0] == "browser_start"
+        ]
+        assert starts == ["fresh"]
+
+
+class TestRunRecordsUnmarkedSubmit:
+    # flash-lite sent a form and called done without mark_applied (2026-10-30)
+    async def test_form_post_without_mark_applied_is_recorded_at_run_end(
+        self,
+        fresh_runner: PortalRunner,
+        request: pytest.FixtureRequest,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        agent.browser_session = request.getfixturevalue("cdp_browser")
+        agent.run.side_effect = BrowserSubmits(agent_ctor, agent).submit_then_stop
+        agent_ctor.return_value = agent
+
+        await fresh_runner.run()
+
+        attempted = request.getfixturevalue("attempted_tracker")
+        assert attempted.load_keys() == {SUBMIT_PAGE}
+
+
+SUBMIT_PAGE = "https://jobs.acme.example/1001/apply"
+
+
+class BrowserSubmits:
+    """Agent.run stand-in: one step runs, the page sends a form POST, the agent stops."""
+
+    def __init__(self, agent_ctor: MagicMock, agent: MagicMock) -> None:
+        self.agent_ctor = agent_ctor
+        self.agent = agent
+
+    async def submit_then_stop(self) -> MagicMock:
+        on_step = self.agent_ctor.call_args.kwargs["register_new_step_callback"]
+        state = MagicMock(spec=BrowserStateSummary, url=SUBMIT_PAGE, screenshot=None)
+        await on_step(state, MagicMock(action=[]), 1)
+        cdp = await self.agent.browser_session.get_or_create_cdp_session()
+        await cdp.cdp_client._event_registry.handle_event(
+            "Network.requestWillBeSent",
+            {
+                "requestId": "r1",
+                "documentURL": SUBMIT_PAGE,
+                "type": "Document",
+                "request": {"method": "POST", "url": SUBMIT_PAGE},
+            },
+            cdp.session_id,
+        )
+        return self.agent.run.return_value
