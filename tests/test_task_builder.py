@@ -92,6 +92,13 @@ class TestResume:
         assert dry.startswith("DRY RUN.") and "do NOT click the final submit" in dry
         assert "DRY RUN" not in real
 
+    def test_dry_run_says_a_blocked_upload_is_expected(
+        self, task_builder: TaskBuilder, sample_system: dict
+    ) -> None:
+        dry = task_builder.build(sample_system, "K", RunOptions(dry_run=True))
+        assert "A file upload can fail the same way" in dry
+        assert "do not report it as an error" in dry
+
 
 class TestKnowledgeInjection:
     def test_knowledge_appears(self, task_builder: TaskBuilder, sample_system: dict):

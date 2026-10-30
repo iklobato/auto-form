@@ -347,8 +347,10 @@ class TaskBuilder:
     DRY_RUN_NOTICE = (
         "DRY RUN. This is a test run. Fill each application form completely, but do "
         "NOT click the final submit/apply/send button, and do not create accounts. "
-        "Any submit is blocked by the browser and will fail. When a form is filled, "
-        "call mark_applied for it (nothing is recorded in a dry run) and move on."
+        "Any submit is blocked by the browser and will fail. A file upload can fail "
+        "the same way: that is expected, do not report it as an error and do not "
+        "retry it. When a form is filled, call mark_applied for it (nothing is "
+        "recorded in a dry run) and move on."
     )
 
     def __init__(
