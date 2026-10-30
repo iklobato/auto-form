@@ -1137,6 +1137,28 @@ def add_cdp_handler(cdp_client, method: str, callback) -> None:
     registry.register(method, fan_out)
 
 
+class FrameUrls:
+    """URL each frame shows now, so a request can be tied to the page that sent it.
+
+    A form submit is a Document request whose documentURL is the POST target, not
+    the page that held the form.
+    """
+
+    def __init__(self, urls: dict[str, str]) -> None:
+        self._urls = urls
+
+    def on_navigated(self, event: dict, session_id: str | None = None) -> None:
+        frame = event.get("frame") or {}
+        if frame.get("id"):
+            self._urls[frame["id"]] = frame.get("url", "")
+
+    def page_url(self, request_event: dict) -> str:
+        document_url = request_event.get("documentURL", "")
+        if request_event.get("type") != "Document":
+            return document_url
+        return self._urls.get(request_event.get("frameId", ""), document_url)
+
+
 class NetworkRecorder:
     """Captures POST/PUT/PATCH HTTP requests via CDP for audit purposes.
 
@@ -1227,6 +1249,7 @@ class NetworkRecorder:
         # CDP can fire requestWillBeSent twice for the same request when there are
         # both main-page and sub-frame handlers — dedup on the unique requestId.
         self._seen_request_ids: set[str] = set()
+        self._frame_urls: dict[str, str] = {}
 
     def start_job(self) -> None:
         """Forget earlier POSTs so mark_applied's evidence covers only this job."""
@@ -1241,8 +1264,14 @@ class NetworkRecorder:
         if sid in self._attached_session_ids:
             return
         await cdp_session.cdp_client.send.Network.enable(session_id=sid)
+        await cdp_session.cdp_client.send.Page.enable(session_id=sid)
         add_cdp_handler(
             cdp_session.cdp_client, "Network.requestWillBeSent", self._on_request
+        )
+        add_cdp_handler(
+            cdp_session.cdp_client,
+            "Page.frameNavigated",
+            FrameUrls(self._frame_urls).on_navigated,
         )
         self._attached_session_ids.add(sid)
         self.plog.debug("NetworkRecorder attached to CDP session %s", sid[:12])
@@ -1269,6 +1298,7 @@ class NetworkRecorder:
             "method": method,
             "url": url,
             "document_url": event.get("documentURL", ""),
+            "page_url": FrameUrls(self._frame_urls).page_url(event),
             "resource_type": event.get("type", ""),
             "body": body[: self.BODY_CAP_BYTES],
             "body_truncated": len(body) > self.BODY_CAP_BYTES,
@@ -1853,12 +1883,12 @@ class UnmarkedSubmits:
     def pages(self, captures: list[dict]) -> list[str]:
         """Distinct pages that POSTed to their own host, in order."""
         found = [
-            capture["document_url"]
+            capture["page_url"]
             for capture in captures
-            if capture.get("document_url")
+            if capture.get("page_url")
             and capture.get("resource_type") != self.BEACON_TYPE
             and urlsplit(capture["url"]).hostname
-            == urlsplit(capture["document_url"]).hostname
+            == urlsplit(capture["page_url"]).hostname
         ]
         return list(dict.fromkeys(found))
 
