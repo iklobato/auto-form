@@ -699,6 +699,47 @@ class TestAfterStepScreenshotWiring:
         assert shots[0].read_bytes() == OneStepEnds.PNG
 
 
+class TestAppliedJobWiring:
+    # flash-lite opened a job it had already sent and sent it again (2026-10-30)
+    async def test_form_actions_on_an_applied_job_are_dropped(
+        self,
+        fresh_runner: PortalRunner,
+        request: pytest.FixtureRequest,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await request.getfixturevalue("applied_tracker").append(
+            {"job_url": SUBMIT_PAGE}
+        )
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        agent._message_manager.state.agent_history_items = []
+        step = ClickOnPage(agent_ctor, agent)
+        agent.run.side_effect = step.click_send
+        agent_ctor.return_value = agent
+
+        await fresh_runner.run()
+
+        assert step.actions == []
+
+
+class ClickOnPage:
+    """Agent.run stand-in: the model asks to click on SUBMIT_PAGE."""
+
+    def __init__(self, agent_ctor: MagicMock, agent: MagicMock) -> None:
+        self.agent_ctor = agent_ctor
+        self.agent = agent
+        self.actions: list = []
+
+    async def click_send(self, on_step_end: Callable | None = None) -> MagicMock:
+        click = MagicMock()
+        click.model_dump.return_value = {"click": {"index": 1}}
+        self.actions.append(click)
+        on_step = self.agent_ctor.call_args.kwargs["register_new_step_callback"]
+        state = MagicMock(spec=BrowserStateSummary, url=SUBMIT_PAGE, screenshot=None)
+        await on_step(state, MagicMock(action=self.actions), 1)
+        return self.agent.run.return_value
+
+
 class OneStepEnds:
     """Agent.run stand-in: one step ends, browser_use calls the on_step_end hook."""
 

@@ -1755,6 +1755,47 @@ class InputClearer:
             self._plog.info("input index %s: clear=False changed to True", params.index)
 
 
+class AppliedPageStop:
+    """Drops form actions on a job the trackers already hold.
+
+    check_applied is the agent's own duplicate check, and an agent that skips it
+    can fill and send the same job again (flash-lite did on 2026-10-30). Navigation
+    and the custom tools still run, so the agent can leave the page.
+    """
+
+    PAGE_ACTIONS = frozenset(
+        {"click", "input", "upload_file", "send_keys", "select_dropdown"}
+    )
+    NOTE = (
+        "<sys>{url} is already in the applied or attempted list. Do not fill or "
+        "submit it again: go back and open the next listing.</sys>"
+    )
+
+    def __init__(
+        self, applied: JsonlTracker, attempted: JsonlTracker, plog: logging.Logger
+    ) -> None:
+        self._applied = applied
+        self._attempted = attempted
+        self._plog = plog
+
+    def apply(self, url: str, actions: list, agent: Agent) -> None:
+        if not url or not self._is_known(url):
+            return
+        kept = [action for action in actions if not self._touches_page(action)]
+        if len(kept) == len(actions):
+            return
+        actions[:] = kept
+        history = agent._message_manager.state.agent_history_items
+        history.append(HistoryItem(system_message=self.NOTE.format(url=url)))
+        self._plog.warning("already applied to %s: form actions dropped", url)
+
+    def _is_known(self, url: str) -> bool:
+        return self._applied.has_job(url) or self._attempted.has_job(url)
+
+    def _touches_page(self, action: object) -> bool:
+        return bool(self.PAGE_ACTIONS & action.model_dump(exclude_none=True).keys())
+
+
 class ShotPhase(StrEnum):
     BEFORE = "before"  # the page the LLM saw when it chose the step's actions
     AFTER = "after"  # the page once those actions ran
@@ -1799,6 +1840,11 @@ class StepCallback:
               elapsed since previous step
     """
 
+    # Instance values replace these: the previous step's time, and the agent,
+    # which PortalRunner sets after building it
+    _last_step_at: float | None = None
+    agent_ref: Agent | None = None
+
     def __init__(
         self,
         portal_name: str,
@@ -1808,6 +1854,7 @@ class StepCallback:
         dry_run_guard: DryRunGuard | None = None,
         scroll_brake: ScrollLoopBrake | None = None,
         shots: StepShots | None = None,
+        applied_stop: AppliedPageStop | None = None,
     ):
         self.dry_run_guard = dry_run_guard
         self.scroll_brake = scroll_brake
@@ -1815,10 +1862,9 @@ class StepCallback:
         self.app_logger = app_logger
         self.plog = app_logger.portal(portal_name)
         self.shots = shots
-        self._last_step_at: float | None = None
+        self.applied_stop = applied_stop
         self.network_recorder = network_recorder
         self.cdp_debugger = cdp_debugger
-        self.agent_ref = None  # set by PortalRunner after agent build
 
     async def on_step(self, browser_state, agent_output, step_num: int) -> None:
         # browser_use runs this hook between the LLM reply and executing its actions,
@@ -1830,6 +1876,10 @@ class StepCallback:
             session = getattr(self.agent_ref, "browser_session", None)
             await self.dry_run_guard.attach_if_needed(session)
         try:
+            actions = getattr(agent_output, "action", None)
+            if self.applied_stop and self.agent_ref and actions:
+                url = getattr(browser_state, "url", "") or ""
+                self.applied_stop.apply(url, actions, self.agent_ref)
             await self._record_step(browser_state, agent_output, step_num)
         except Exception as exc:
             self._report_failure(step_num, exc)
@@ -2607,6 +2657,7 @@ class PortalRunner:
             ),
             scroll_brake=ScrollLoopBrake(self.plog),
             shots=StepShots(Paths.SCREENSHOTS / self.name / self.app_logger.run_id),
+            applied_stop=AppliedPageStop(self.applied, self.attempted, self.plog),
         )
         # Files the agent is allowed to upload via browser_use's upload_file action.
         # Without this whitelist, EVERY upload attempt fails with
