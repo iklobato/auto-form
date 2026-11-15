@@ -33,6 +33,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import ClassVar, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -1754,6 +1755,38 @@ class InputClearer:
             self._plog.info("input index %s: clear=False changed to True", params.index)
 
 
+class ShotPhase(StrEnum):
+    BEFORE = "before"  # the page the LLM saw when it chose the step's actions
+    AFTER = "after"  # the page once those actions ran
+
+
+class StepShots:
+    """One agent's step screenshots, in screenshots/<portal>/<run_id>/.
+
+    A portal retried in the same run gets a new agent whose steps start at 1 again,
+    so it writes to <run_id>-2 instead of overwriting the first attempt.
+    """
+
+    def __init__(self, base: Path) -> None:
+        self._base = base
+        self._folder: Path | None = None
+
+    def save(self, step_num: int, phase: ShotPhase, png: bytes) -> Path:
+        path = self._resolve_folder() / f"step{step_num:04d}_{phase}.png"
+        path.write_bytes(png)
+        return path
+
+    def _resolve_folder(self) -> Path:
+        if self._folder is None:
+            folder, attempt = self._base, 1
+            while folder.exists():
+                attempt += 1
+                folder = self._base.with_name(f"{self._base.name}-{attempt}")
+            folder.mkdir(parents=True)
+            self._folder = folder
+        return self._folder
+
+
 # ── Per-step callback ─────────────────────────────────────────────────────────
 
 
@@ -1774,14 +1807,14 @@ class StepCallback:
         cdp_debugger: "CDPDebugger | None" = None,
         dry_run_guard: DryRunGuard | None = None,
         scroll_brake: ScrollLoopBrake | None = None,
+        shots: StepShots | None = None,
     ):
         self.dry_run_guard = dry_run_guard
         self.scroll_brake = scroll_brake
         self.portal_name = portal_name
         self.app_logger = app_logger
         self.plog = app_logger.portal(portal_name)
-        self.shot_dir = Paths.SCREENSHOTS / portal_name
-        self.shot_dir.mkdir(parents=True, exist_ok=True)
+        self.shots = shots
         self._last_step_at: float | None = None
         self.network_recorder = network_recorder
         self.cdp_debugger = cdp_debugger
@@ -1799,20 +1832,36 @@ class StepCallback:
         try:
             await self._record_step(browser_state, agent_output, step_num)
         except Exception as exc:
-            self.plog.warning(
-                "step %04d: step callback failed, agent continues: %s: %s",
-                step_num,
-                type(exc).__name__,
-                exc,
-                exc_info=True,
-            )
-            self.app_logger.emit(
-                "step_callback_error",
-                portal=self.portal_name,
-                step=step_num,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
+            self._report_failure(step_num, exc)
+
+    async def on_step_end(self, agent: Agent) -> None:
+        """browser_use hook after a step's actions ran: saves the page as it is now."""
+        step_num = agent.state.n_steps - 1  # browser_use counts the step as done
+        session = agent.browser_session
+        if self.shots is None or session is None:
+            return
+        try:
+            png = await session.take_screenshot()
+            path = self.shots.save(step_num, ShotPhase.AFTER, png)
+            self.plog.debug("  screenshot  : %s", path.name)
+        except (TimeoutError, RuntimeError, OSError) as exc:  # CDP error, disk
+            self._report_failure(step_num, exc)
+
+    def _report_failure(self, step_num: int, exc: Exception) -> None:
+        self.plog.warning(
+            "step %04d: step callback failed, agent continues: %s: %s",
+            step_num,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        self.app_logger.emit(
+            "step_callback_error",
+            portal=self.portal_name,
+            step=step_num,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
 
     async def _record_step(self, browser_state, agent_output, step_num: int) -> None:
         # Lazy CDP attach — runs once on first step when browser_session exists
@@ -1862,10 +1911,9 @@ class StepCallback:
             self.plog.debug("  memory      : %s", memory[:200])
 
         screenshot_path = None
-        if browser_state.screenshot:
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            screenshot_path = self.shot_dir / f"step{step_num:04d}_{ts}.png"
-            screenshot_path.write_bytes(base64.b64decode(browser_state.screenshot))
+        if self.shots and browser_state.screenshot:
+            png = base64.b64decode(browser_state.screenshot)
+            screenshot_path = self.shots.save(step_num, ShotPhase.BEFORE, png)
             self.plog.debug("  screenshot  : %s", screenshot_path.name)
 
         self.app_logger.emit(
@@ -2390,6 +2438,7 @@ class PortalRunner:
         self.proxy_provider = proxy_provider
         self.plog = app_logger.portal(self.name)
         self._network_recorder: NetworkRecorder | None = None
+        self._step_callback: StepCallback | None = None
 
     async def run(self) -> str:
         mode = "DRY RUN" if self.opts.dry_run else "APPLY"
@@ -2557,6 +2606,7 @@ class PortalRunner:
                 DryRunGuard(self.name, self.app_logger) if self.opts.dry_run else None
             ),
             scroll_brake=ScrollLoopBrake(self.plog),
+            shots=StepShots(Paths.SCREENSHOTS / self.name / self.app_logger.run_id),
         )
         # Files the agent is allowed to upload via browser_use's upload_file action.
         # Without this whitelist, EVERY upload attempt fails with
@@ -2592,6 +2642,7 @@ class PortalRunner:
         )
         callback.agent_ref = agent  # lets callbacks attach the recorders
         self._network_recorder = network_recorder
+        self._step_callback = callback
         return agent
 
     async def _run_agent(self, agent: Agent) -> str:
@@ -2601,7 +2652,8 @@ class PortalRunner:
             self.opts.fast,
             self.opts.max_actions,
         )
-        history = await agent.run()
+        on_step_end = self._step_callback.on_step_end if self._step_callback else None
+        history = await agent.run(on_step_end=on_step_end)
         elapsed = time.monotonic() - t0
 
         final = history.final_result() or "(no result)"

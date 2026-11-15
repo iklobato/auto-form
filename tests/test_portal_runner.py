@@ -3,6 +3,7 @@
 import os
 import socket
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,6 +16,7 @@ from fill import (
     ApplicationRecorder,
     CredentialsResolver,
     JsonlTracker,
+    Paths,
     PortalRunner,
     ProfileInUse,
     Proxy,
@@ -681,6 +683,41 @@ class TestRunRecordsUnmarkedSubmit:
         assert attempted.load_keys() == {SUBMIT_PAGE}
 
 
+class TestAfterStepScreenshotWiring:
+    async def test_run_saves_a_screenshot_after_each_step(
+        self, fresh_runner: PortalRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        agent.run.side_effect = OneStepEnds(agent).end_one_step
+        agent_ctor.return_value = agent
+
+        await fresh_runner.run()
+
+        shots = sorted(Paths.SCREENSHOTS.rglob("*.png"))
+        assert [shot.name for shot in shots] == ["step0001_after.png"]
+        assert shots[0].read_bytes() == OneStepEnds.PNG
+
+
+class OneStepEnds:
+    """Agent.run stand-in: one step ends, browser_use calls the on_step_end hook."""
+
+    PNG = b"\x89PNG after"
+    STEPS_AFTER_FIRST = 2
+
+    def __init__(self, agent: MagicMock) -> None:
+        self.agent = agent
+
+    async def take_screenshot(self) -> bytes:
+        return self.PNG
+
+    async def end_one_step(self, on_step_end: Callable | None = None) -> MagicMock:
+        self.agent.browser_session = self
+        self.agent.state.n_steps = self.STEPS_AFTER_FIRST
+        await on_step_end(self.agent)
+        return self.agent.run.return_value
+
+
 SUBMIT_PAGE = "https://jobs.acme.example/1001/apply"
 
 
@@ -691,7 +728,7 @@ class BrowserSubmits:
         self.agent_ctor = agent_ctor
         self.agent = agent
 
-    async def submit_then_stop(self) -> MagicMock:
+    async def submit_then_stop(self, on_step_end: object = None) -> MagicMock:
         on_step = self.agent_ctor.call_args.kwargs["register_new_step_callback"]
         state = MagicMock(spec=BrowserStateSummary, url=SUBMIT_PAGE, screenshot=None)
         await on_step(state, MagicMock(action=[]), 1)

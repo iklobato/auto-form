@@ -62,7 +62,7 @@ the browser, so nothing is sent. In a dry run nothing is written to `applied.jso
 Then look at what it did:
 
 ```bash
-ls screenshots/weworkremotely/            # one PNG per step
+ls screenshots/weworkremotely/<run_id>/   # two PNGs per step: before and after
 tail -n 50 logs/<run_id>.log              # the run id is printed at start
 grep "DRY RUN: blocked" logs/<run_id>.log # what the browser stopped
 ```
@@ -240,7 +240,9 @@ disability questions whose profile answers did not match the option text.
 ```
 logs/<run_id>.log                          the run log
 logs/events.jsonl                          one JSON event per line (steps, errors, blocks)
-screenshots/<site>/stepNNNN_<time>.png     one screenshot per agent step
+screenshots/<site>/<run_id>/stepNNNN_before.png  the page the model saw for that step
+screenshots/<site>/<run_id>/stepNNNN_after.png   the page after the step's actions ran
+                                           (a retried site writes to <run_id>-2)
 applications/<site>/<time>_<title>.json    one record per application
 applications/<site>/INDEX.md               table of applications for that site
 applications/<site>/network/*_post.json    every POST/PUT/PATCH sent (not analytics)

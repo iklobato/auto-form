@@ -10,7 +10,7 @@ import pytest
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.tools.service import Tools
 
-from fill import DryRunGuard, Paths, StepCallback
+from fill import DryRunGuard, Paths, ShotPhase, StepCallback, StepShots
 
 
 def _png_b64() -> str:
@@ -21,6 +21,21 @@ def _png_b64() -> str:
         b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
     )
     return base64.b64encode(raw).decode()
+
+
+@pytest.fixture
+def run_shots(tmp_app_root: Path) -> StepShots:
+    return StepShots(Paths.SCREENSHOTS / "acme" / "test-run")
+
+
+class TestStepShots:
+    def test_a_retried_portal_gets_its_own_folder(self, tmp_app_root: Path) -> None:
+        base = Paths.SCREENSHOTS / "acme" / "test-run"
+        first = StepShots(base).save(1, ShotPhase.BEFORE, b"first")
+        retry = StepShots(base).save(1, ShotPhase.BEFORE, b"retry")
+
+        assert first.read_bytes() == b"first"
+        assert retry == base.with_name("test-run-2") / "step0001_before.png"
 
 
 class TestActionNameExtraction:
@@ -92,9 +107,9 @@ class TestOnStepFailureIsolation:
 class TestOnStep:
     @pytest.mark.asyncio
     async def test_saves_screenshot_when_present(
-        self, tmp_app_root: Path, mock_app_logger: MagicMock
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
     ):
-        cb = StepCallback("acme", mock_app_logger)
+        cb = StepCallback("acme", mock_app_logger, shots=run_shots)
         state = MagicMock(spec=BrowserStateSummary)
         state.url = "https://acme/jobs"
         state.screenshot = _png_b64()
@@ -104,15 +119,15 @@ class TestOnStep:
 
         await cb.on_step(state, agent_output, step_num=1)
 
-        files = list((Paths.SCREENSHOTS / "acme").glob("step0001_*.png"))
-        assert len(files) == 1
-        assert files[0].read_bytes().startswith(b"\x89PNG")
+        run_dir = Paths.SCREENSHOTS / "acme" / "test-run"
+        assert [shot.name for shot in run_dir.iterdir()] == ["step0001_before.png"]
+        assert (run_dir / "step0001_before.png").read_bytes().startswith(b"\x89PNG")
 
     @pytest.mark.asyncio
     async def test_no_screenshot_no_file(
-        self, tmp_app_root: Path, mock_app_logger: MagicMock
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
     ):
-        cb = StepCallback("acme", mock_app_logger)
+        cb = StepCallback("acme", mock_app_logger, shots=run_shots)
         state = MagicMock(spec=BrowserStateSummary)
         state.url = "https://acme/jobs"
         state.screenshot = None
@@ -156,6 +171,67 @@ class TestOnStep:
             step_num=1,
         )
         assert mock_app_logger.emit.call_args.kwargs["url"] == "unknown"
+
+
+class FakeScreenshotSession:
+    """Stands in for BrowserSession.take_screenshot (a CDP call)."""
+
+    def __init__(self, png: bytes, error: Exception | None = None) -> None:
+        self.png = png
+        self.error = error
+
+    async def take_screenshot(self) -> bytes:
+        if self.error is not None:
+            raise self.error
+        return self.png
+
+
+class TestAfterStepScreenshot:
+    """on_step_end saves what the page looks like after the step's actions ran."""
+
+    # browser_use bumps n_steps before on_step_end, so step 1 has ended at 2
+    STEPS_AFTER_FIRST = 2
+
+    def _agent(self, session: FakeScreenshotSession | None) -> MagicMock:
+        return MagicMock(
+            browser_session=session, state=MagicMock(n_steps=self.STEPS_AFTER_FIRST)
+        )
+
+    @pytest.mark.asyncio
+    async def test_saves_after_shot_next_to_before_shot(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
+    ) -> None:
+        png = base64.b64decode(_png_b64())
+        agent = self._agent(FakeScreenshotSession(png))
+
+        await StepCallback("acme", mock_app_logger, shots=run_shots).on_step_end(agent)
+
+        shot = Paths.SCREENSHOTS / "acme" / "test-run" / "step0001_after.png"
+        assert shot.read_bytes() == png
+
+    @pytest.mark.asyncio
+    async def test_screenshot_failure_does_not_reach_the_agent(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
+    ) -> None:
+        timeout = TimeoutError("capture timed out")
+        agent = self._agent(FakeScreenshotSession(b"", error=timeout))
+
+        await StepCallback("acme", mock_app_logger, shots=run_shots).on_step_end(agent)
+
+        event = mock_app_logger.emit.call_args
+        assert event.args == ("step_callback_error",)
+        assert event.kwargs["error"] == "capture timed out"
+        assert event.kwargs["step"] == 1
+
+    @pytest.mark.asyncio
+    async def test_no_browser_session_no_file(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
+    ) -> None:
+        await StepCallback("acme", mock_app_logger, shots=run_shots).on_step_end(
+            self._agent(None)
+        )
+
+        assert list(Paths.SCREENSHOTS.rglob("*.png")) == []
 
 
 class TestInputAlwaysClears:
