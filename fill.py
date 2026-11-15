@@ -1330,12 +1330,6 @@ class NetworkRecorder:
         add_cdp_handler(cdp_client, "Target.attachedToTarget", frames.on_attached)
 
     def _on_request(self, event: dict, session_id: str | None = None) -> None:
-        request_id = event.get("requestId", "")
-        if request_id and request_id in self._seen_request_ids:
-            return
-        if request_id:
-            self._seen_request_ids.add(request_id)
-
         req = event.get("request", {}) or {}
         method = req.get("method", "")
         url = req.get("url", "")
@@ -1343,6 +1337,12 @@ class NetworkRecorder:
             return
         if any(noise in url for noise in self.NOISE_FRAGMENTS):
             return
+        # Checked after the filters, so only recorded POSTs are kept for the run
+        request_id = event.get("requestId", "")
+        if request_id and request_id in self._seen_request_ids:
+            return
+        if request_id:
+            self._seen_request_ids.add(request_id)
         body = req.get("postData") or ""
         headers = req.get("headers") or {}
         capture = {
@@ -1415,7 +1415,7 @@ class CDPDebugger:
     """Subscribes to extra CDP event streams for debugging visibility:
 
     - Network.responseReceived — pair status codes with outgoing POSTs
-    - Network.loadingFailed    — network errors (DNS, CORS, ERR_CONNECTION)
+    - Network.loadingFailed/Finished — network errors; both end the request's entry
     - Page.frameNavigated      — every navigation, including silent redirects
     - Target.targetCreated     — every new tab/popup opened by the page
     - Runtime.exceptionThrown  — uncaught JavaScript errors
@@ -1441,8 +1441,7 @@ class CDPDebugger:
         self.events_file = Paths.APPLICATIONS / portal_name / "cdp.jsonl"
         self.events_file.parent.mkdir(parents=True, exist_ok=True)
         self._attached_session_ids: set[str] = set()
-        # Map requestId → (method, url) so responses can be paired with their POST
-        self._request_index: dict[str, tuple[str, str]] = {}
+        self._request_index: dict[str, tuple[str, str]] = {}  # id: (method, url)
 
     async def attach_if_needed(self, browser_session) -> None:
         if browser_session is None:
@@ -1461,11 +1460,11 @@ class CDPDebugger:
             params={"discover": True},
             session_id=sid,
         )
-
         for method, callback in (
             ("Network.requestWillBeSent", self._on_request_index),
             ("Network.responseReceived", self._on_response),
             ("Network.loadingFailed", self._on_loading_failed),
+            ("Network.loadingFinished", self._on_loading_finished),
             ("Page.frameNavigated", self._on_navigated),
             ("Target.targetCreated", self._on_target_created),
             ("Runtime.exceptionThrown", self._on_exception),
@@ -1475,8 +1474,6 @@ class CDPDebugger:
 
         self._attached_session_ids.add(sid)
         self.plog.debug("CDPDebugger attached to session %s", sid[:12])
-
-    # ── handlers ──────────────────────────────────────────────────────────
 
     def _is_noise(self, url: str) -> bool:
         return any(noise in url for noise in self.noise_fragments)
@@ -1517,9 +1514,12 @@ class CDPDebugger:
         else:
             self.plog.debug("HTTP %d %s %s", status, method, url[:80])
 
+    def _on_loading_finished(self, event: dict, session_id: str | None = None) -> None:
+        self._request_index.pop(event.get("requestId", ""), None)
+
     def _on_loading_failed(self, event: dict, session_id: str | None = None) -> None:
         rid = event.get("requestId", "")
-        method, url = self._request_index.get(rid, ("?", ""))
+        method, url = self._request_index.pop(rid, ("?", ""))
         if self._is_noise(url):
             return
         error = event.get("errorText", "")
@@ -1832,8 +1832,8 @@ class StepCallback:
         eval_prev = getattr(agent_output, "evaluation_previous_goal", None) or ""
         memory = getattr(agent_output, "memory", None) or ""
         InputClearer(self.plog).apply(getattr(agent_output, "action", None) or [])
-        actions = self._extract_action_names(agent_output)
         action_details = self._extract_action_details(agent_output)
+        actions = [name for name, _ in action_details]
         if self.scroll_brake:
             self.scroll_brake.observe(actions, self.agent_ref)
 
@@ -1884,16 +1884,6 @@ class StepCallback:
             elapsed_s=round(elapsed, 2) if elapsed else None,
             screenshot=screenshot_path.name if screenshot_path else None,
         )
-
-    @staticmethod
-    def _extract_action_names(agent_output) -> list[str]:
-        names: list[str] = []
-        for act in getattr(agent_output, "action", []) or []:
-            if hasattr(act, "model_dump"):
-                names.extend(act.model_dump(exclude_none=True).keys())
-            elif isinstance(act, dict):
-                names.extend(k for k, v in act.items() if v is not None)
-        return names
 
     @staticmethod
     def _extract_action_details(agent_output) -> list[tuple[str, dict]]:
@@ -2768,7 +2758,7 @@ class Orchestrator:
             name = system["name"]
             async with sem:
                 try:
-                    return (name, await self._make_runner(system).run())
+                    return (name, await self.make_runner(system).run())
                 except recoverable as exc:
                     self.log.error(
                         "[%s] failed (recoverable): %s: %s",
@@ -2817,7 +2807,7 @@ class Orchestrator:
             results.append((name, result))
         return results
 
-    def _make_runner(self, system: dict) -> PortalRunner:
+    def make_runner(self, system: dict) -> PortalRunner:
         return PortalRunner(
             system,
             knowledge=self.knowledge,
@@ -3014,6 +3004,7 @@ class CLI:
             log.info("Resume PDF: %s", opts.resume_path)
 
         deps = cls._build_deps(args, log, app_logger, yaml_store, opts)
+        deps.update(opts=opts, yaml_store=yaml_store, app_logger=app_logger)
         deps["default_proxy_provider"] = ProxyProviderFactory.build(
             default_proxy_cfg,
             log=log,
@@ -3083,23 +3074,8 @@ class CLI:
     @staticmethod
     def _run_all(systems, workers, opts, yaml_store, deps, app_logger, log) -> None:
         log.info("Mode: ALL portals (%d)", len(systems))
-        asyncio.run(
-            Orchestrator(
-                systems,
-                knowledge=deps["knowledge"],
-                llm=deps["llm"],
-                opts=opts,
-                max_workers=workers,
-                yaml_store=yaml_store,
-                task_builder=deps["task_builder"],
-                cred_resolver=deps["cred_resolver"],
-                applied=deps["applied"],
-                attempted=deps["attempted"],
-                recorder=deps["recorder"],
-                app_logger=app_logger,
-                default_proxy_provider=deps["default_proxy_provider"],
-            ).run()
-        )
+        orchestrator = CLI._orchestrator(systems, workers, deps)
+        asyncio.run(orchestrator.run())
 
     @staticmethod
     def _run_single(
@@ -3118,24 +3094,28 @@ class CLI:
         if not url or url.startswith("$"):
             log.error("[%s] URL not configured — set the env var in .env", system_name)
             raise SystemExit(1)
-        proxy_provider = portal_proxy_provider(
-            system, deps["default_proxy_provider"], log=log
-        )
-        runner = PortalRunner(
-            system,
+        orchestrator = CLI._orchestrator([system], 1, deps)
+        asyncio.run(orchestrator.make_runner(system).run())
+
+    @classmethod
+    def _orchestrator(
+        cls, systems: list[dict], workers: int, deps: dict
+    ) -> "Orchestrator":
+        return Orchestrator(
+            systems,
             knowledge=deps["knowledge"],
             llm=deps["llm"],
-            opts=opts,
-            yaml_store=yaml_store,
+            opts=deps["opts"],
+            max_workers=workers,
+            yaml_store=deps["yaml_store"],
             task_builder=deps["task_builder"],
             cred_resolver=deps["cred_resolver"],
             applied=deps["applied"],
             attempted=deps["attempted"],
             recorder=deps["recorder"],
-            app_logger=app_logger,
-            proxy_provider=proxy_provider,
+            app_logger=deps["app_logger"],
+            default_proxy_provider=deps["default_proxy_provider"],
         )
-        asyncio.run(runner.run())
 
 
 def main() -> None:

@@ -24,29 +24,37 @@ def _png_b64() -> str:
 
 
 class TestActionNameExtraction:
-    def test_extracts_from_pydantic_actions(self):
-        # When agent_output.action is a list of pydantic-like objects with model_dump.
+    """Action names as logged in the `step` event."""
+
+    async def _logged_actions(self, mock_app_logger: MagicMock, action: object) -> list:
+        state = MagicMock(
+            spec=BrowserStateSummary, url="https://acme/x", screenshot=None
+        )
+        output = MagicMock(action=action, next_goal="", evaluation_previous_goal="")
+        await StepCallback("acme", mock_app_logger).on_step(state, output, step_num=1)
+        return mock_app_logger.emit.call_args.kwargs["actions"]
+
+    @pytest.mark.asyncio
+    async def test_extracts_from_pydantic_actions(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ) -> None:
         action = MagicMock()
-        action.model_dump.return_value = {"click": {"index": 5}, "wait": None}
-        names = StepCallback._extract_action_names(MagicMock(action=[action]))
-        # `wait` is None → excluded (exclude_none in real model_dump)
-        assert names == [
-            "click",
-            "wait",
-        ]  # MagicMock returns full dict; we test the wiring
+        action.model_dump.return_value = {"click": {"index": 5}}
+        assert await self._logged_actions(mock_app_logger, [action]) == ["click"]
 
-    def test_extracts_from_dict_actions(self):
-        out = MagicMock(action=[{"click": {"index": 1}, "scroll": None}])
-        names = StepCallback._extract_action_names(out)
-        assert "click" in names
+    @pytest.mark.asyncio
+    async def test_dict_actions_skip_none_values(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ) -> None:
+        action = {"click": {"index": 1}, "scroll": None}
+        assert await self._logged_actions(mock_app_logger, [action]) == ["click"]
 
-    def test_handles_empty_action_list(self):
-        out = MagicMock(action=[])
-        assert StepCallback._extract_action_names(out) == []
-
-    def test_handles_none_action_attr(self):
-        out = MagicMock(action=None)
-        assert StepCallback._extract_action_names(out) == []
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", [[], None])
+    async def test_no_actions(
+        self, action: list | None, tmp_app_root: Path, mock_app_logger: MagicMock
+    ) -> None:
+        assert await self._logged_actions(mock_app_logger, action) == []
 
 
 class TestOnStepFailureIsolation:
@@ -168,7 +176,9 @@ class TestInputAlwaysClears:
         typed = {"index": self.FIELD_INDEX, "text": self.PHONE}
         click = {"click": {"index": self.BUTTON_INDEX}}
         actions = self._actions([{"input": {**typed, "clear": False}}, click])
-        state = MagicMock(spec=BrowserStateSummary, url="https://acme/x", screenshot=None)
+        state = MagicMock(
+            spec=BrowserStateSummary, url="https://acme/x", screenshot=None
+        )
         output = MagicMock(action=actions, next_goal="", evaluation_previous_goal="")
 
         await StepCallback("acme", mock_app_logger).on_step(state, output, step_num=1)

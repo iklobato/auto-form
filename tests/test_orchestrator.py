@@ -86,8 +86,8 @@ class TestProxyProviders:
             ]
         )
         system = orch.active[0]
-        first = orch._make_runner(system).proxy_provider.acquire("a").host
-        retry = orch._make_runner(system).proxy_provider.acquire("a").host
+        first = orch.make_runner(system).proxy_provider.acquire("a").host
+        retry = orch.make_runner(system).proxy_provider.acquire("a").host
         assert (first, retry) == ("1.1.1.1", "2.2.2.2")
 
 
@@ -107,7 +107,7 @@ class TestCrashIsolation:
             "fine": AsyncMock(return_value="applied to 1 role"),
         }
         monkeypatch.setattr(
-            orch, "_make_runner", lambda system: MagicMock(run=runs[system["name"]])
+            orch, "make_runner", lambda system: MagicMock(run=runs[system["name"]])
         )
 
         with pytest.raises(TypeError, match="bad arg"):
@@ -143,7 +143,7 @@ class TestProfileInUse:
         flaky = AsyncMock(side_effect=[TimeoutError("cdp"), "applied"])
         runs = {"locked": locked, "flaky": flaky}
         monkeypatch.setattr(
-            orch, "_make_runner", lambda system: MagicMock(run=runs[system["name"]])
+            orch, "make_runner", lambda system: MagicMock(run=runs[system["name"]])
         )
         monkeypatch.setattr("asyncio.sleep", AsyncMock())
 

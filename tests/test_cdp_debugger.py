@@ -156,6 +156,36 @@ class TestLoadingFailed:
         assert "network_failure" not in emit_kinds
 
 
+class TestRequestIndexIsBounded:
+    """A request is forgotten once it ends, so the index does not grow all run."""
+
+    FAILED = {"requestId": "r1", "errorText": "net::ERR_FAILED", "canceled": True}
+
+    def _debugger_with_request(self, mock_app_logger: MagicMock) -> CDPDebugger:
+        debugger = CDPDebugger("acme", mock_app_logger)
+        debugger._on_request_index(
+            {"requestId": "r1", "request": {"method": "POST", "url": "https://acme/x"}}
+        )
+        return debugger
+
+    def test_finished_request_is_forgotten(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ) -> None:
+        debugger = self._debugger_with_request(mock_app_logger)
+        debugger._on_loading_finished({"requestId": "r1"})
+        debugger._on_loading_failed(self.FAILED)
+        assert _events_lines("acme")[-1]["method"] == "?"
+
+    def test_failed_request_is_forgotten(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ) -> None:
+        debugger = self._debugger_with_request(mock_app_logger)
+        debugger._on_loading_failed(self.FAILED)
+        debugger._on_loading_failed(self.FAILED)
+        methods = [record["method"] for record in _events_lines("acme")]
+        assert methods == ["POST", "?"]
+
+
 # ── Navigation / popup / dialog ──────────────────────────────────────────────
 
 
@@ -231,6 +261,17 @@ class TestExceptionAndDialog:
 
 
 class TestAttach:
+    EVENT_STREAMS = {
+        "Network.requestWillBeSent",
+        "Network.responseReceived",
+        "Network.loadingFailed",
+        "Network.loadingFinished",
+        "Page.frameNavigated",
+        "Target.targetCreated",
+        "Runtime.exceptionThrown",
+        "Page.javascriptDialogOpening",
+    }
+
     @pytest.mark.asyncio
     async def test_subscribes_to_all_event_streams(
         self, tmp_app_root: Path, mock_app_logger: MagicMock, cdp_browser: MagicMock
@@ -243,15 +284,8 @@ class TestAttach:
         client.send.Network.enable.assert_awaited_once()
         client.send.Page.enable.assert_awaited_once()
         client.send.Runtime.enable.assert_awaited_once()
-        assert set(client._event_registry.get_registered_methods()) == {
-            "Network.requestWillBeSent",
-            "Network.responseReceived",
-            "Network.loadingFailed",
-            "Page.frameNavigated",
-            "Target.targetCreated",
-            "Runtime.exceptionThrown",
-            "Page.javascriptDialogOpening",
-        }
+        registered = set(client._event_registry.get_registered_methods())
+        assert registered == self.EVENT_STREAMS
 
     @pytest.mark.asyncio
     async def test_attach_is_idempotent_per_session(
