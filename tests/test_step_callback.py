@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from browser_use.browser.views import BrowserStateSummary
+from browser_use.tools.service import Tools
 
 from fill import DryRunGuard, Paths, StepCallback
 
@@ -147,6 +148,35 @@ class TestOnStep:
             step_num=1,
         )
         assert mock_app_logger.emit.call_args.kwargs["url"] == "unknown"
+
+
+class TestInputAlwaysClears:
+    """flash-lite sent clear: False when it typed into a field again (2026-10-30)."""
+
+    FIELD_INDEX = 3
+    BUTTON_INDEX = 4
+    PHONE = "555-0100"
+
+    def _actions(self, raw_actions: list[dict]) -> list:
+        action_model = Tools().registry.create_action_model()
+        return [action_model.model_validate(raw) for raw in raw_actions]
+
+    @pytest.mark.asyncio
+    async def test_append_input_is_turned_into_clear(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ) -> None:
+        typed = {"index": self.FIELD_INDEX, "text": self.PHONE}
+        click = {"click": {"index": self.BUTTON_INDEX}}
+        actions = self._actions([{"input": {**typed, "clear": False}}, click])
+        state = MagicMock(spec=BrowserStateSummary, url="https://acme/x", screenshot=None)
+        output = MagicMock(action=actions, next_goal="", evaluation_previous_goal="")
+
+        await StepCallback("acme", mock_app_logger).on_step(state, output, step_num=1)
+
+        assert [action.model_dump(exclude_unset=True) for action in actions] == [
+            {"input": {**typed, "clear": True}},
+            click,
+        ]
 
 
 class TestDryRunGuard:

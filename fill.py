@@ -1732,6 +1732,28 @@ class ScrollLoopBrake:
         )
 
 
+class InputClearer:
+    """Makes every `input` action replace the field instead of appending to it.
+
+    flash-lite sent `clear: False` when it typed into a field again, so phone,
+    LinkedIn and website went out twice in the 2026-10-30 local run. No form here
+    needs append, so the flag is forced on before browser_use runs the action.
+    """
+
+    ACTION = "input"
+
+    def __init__(self, plog: logging.Logger) -> None:
+        self._plog = plog
+
+    def apply(self, actions: Sequence) -> None:
+        for action in actions:
+            params = getattr(getattr(action, "root", action), self.ACTION, None)
+            if params is None or getattr(params, "clear", True):
+                continue
+            params.clear = True
+            self._plog.info("input index %s: clear=False changed to True", params.index)
+
+
 # ── Per-step callback ─────────────────────────────────────────────────────────
 
 
@@ -1809,6 +1831,7 @@ class StepCallback:
         next_goal = getattr(agent_output, "next_goal", None) or ""
         eval_prev = getattr(agent_output, "evaluation_previous_goal", None) or ""
         memory = getattr(agent_output, "memory", None) or ""
+        InputClearer(self.plog).apply(getattr(agent_output, "action", None) or [])
         actions = self._extract_action_names(agent_output)
         action_details = self._extract_action_details(agent_output)
         if self.scroll_brake:
