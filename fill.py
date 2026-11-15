@@ -1770,6 +1770,7 @@ class AppliedPageStop:
         "<sys>{url} is already in the applied or attempted list. Do not fill or "
         "submit it again: go back and open the next listing.</sys>"
     )
+    GO_BACK = {"go_back": {}}
 
     def __init__(
         self, applied: JsonlTracker, attempted: JsonlTracker, plog: logging.Logger
@@ -1784,7 +1785,9 @@ class AppliedPageStop:
         kept = [action for action in actions if not self._touches_page(action)]
         if len(kept) == len(actions):
             return
-        actions[:] = kept
+        # browser_use skips counting a step with no actions, so the step number
+        # would repeat; going back is also what the note tells the agent to do
+        actions[:] = kept or [type(actions[0]).model_validate(self.GO_BACK)]
         history = agent._message_manager.state.agent_history_items
         history.append(HistoryItem(system_message=self.NOTE.format(url=url)))
         self._plog.warning("already applied to %s: form actions dropped", url)

@@ -27,15 +27,14 @@ class TestAppliedPageStop:
     FIELD_INDEX = 3
     BUTTON_INDEX = 4
     GO_BACK = {"go_back": {}}
+    FILL = {"input": {"index": FIELD_INDEX, "text": "x", "clear": True}}
+    SEND = {"click": {"index": BUTTON_INDEX}}
+    # what the model asks for in this step; a test may replace it
+    raw_actions = (FILL, SEND, GO_BACK)
 
     def _actions(self) -> list:
         action_model = Tools().registry.create_action_model()
-        fill_and_send = [
-            {"input": {"index": self.FIELD_INDEX, "text": "x", "clear": True}},
-            {"click": {"index": self.BUTTON_INDEX}},
-            self.GO_BACK,
-        ]
-        return [action_model.model_validate(raw) for raw in fill_and_send]
+        return [action_model.model_validate(raw) for raw in self.raw_actions]
 
     def _agent(self) -> MagicMock:
         agent = MagicMock()
@@ -77,6 +76,23 @@ class TestAppliedPageStop:
         mock_app_logger: MagicMock,
     ) -> None:
         await attempted_tracker.append({"job_url": JOB})
+
+        actions, _ = await self._step_on(JOB, stop, mock_app_logger)
+
+        kept = [action.model_dump(exclude_unset=True) for action in actions]
+        assert kept == [self.GO_BACK]
+
+    @pytest.mark.asyncio
+    async def test_a_step_with_only_form_actions_goes_back(
+        self,
+        stop: AppliedPageStop,
+        applied_tracker: JsonlTracker,
+        mock_app_logger: MagicMock,
+    ) -> None:
+        # browser_use does not count a step whose action list is empty, so the step
+        # number repeats and the after-step screenshot gets the previous number
+        await applied_tracker.append({"job_url": JOB})
+        self.raw_actions = (self.FILL, self.SEND)
 
         actions, _ = await self._step_on(JOB, stop, mock_app_logger)
 

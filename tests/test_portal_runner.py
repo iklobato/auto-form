@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from browser_use.browser.views import BrowserStateSummary
+from browser_use.tools.service import Tools
 
 import fill
 from fill import (
@@ -719,7 +720,8 @@ class TestAppliedJobWiring:
 
         await fresh_runner.run()
 
-        assert step.actions == []
+        sent = [action.model_dump(exclude_unset=True) for action in step.actions]
+        assert sent == [{"go_back": {}}]
 
 
 class ClickOnPage:
@@ -731,9 +733,8 @@ class ClickOnPage:
         self.actions: list = []
 
     async def click_send(self, on_step_end: Callable | None = None) -> MagicMock:
-        click = MagicMock()
-        click.model_dump.return_value = {"click": {"index": 1}}
-        self.actions.append(click)
+        action_model = Tools().registry.create_action_model()
+        self.actions.append(action_model.model_validate({"click": {"index": 1}}))
         on_step = self.agent_ctor.call_args.kwargs["register_new_step_callback"]
         state = MagicMock(spec=BrowserStateSummary, url=SUBMIT_PAGE, screenshot=None)
         await on_step(state, MagicMock(action=self.actions), 1)
