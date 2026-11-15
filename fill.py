@@ -1790,7 +1790,18 @@ class AppliedPageStop:
         self._plog.warning("already applied to %s: form actions dropped", url)
 
     def _is_known(self, url: str) -> bool:
-        return self._applied.has_job(url) or self._attempted.has_job(url)
+        if self._applied.has_job(url):
+            return True
+        # submitted_not_marked is a guess from any same-host POST and can name a
+        # listing (Ashby loads its board through same-host GraphQL POSTs)
+        wanted = job_url_key(url)
+        return any(
+            job_url_key(record[field]) == wanted
+            for record in self._attempted.records()
+            if record.get("reason") != UnmarkedSubmits.REASON
+            for field in JsonlTracker.JOB_URL_FIELDS
+            if record.get(field)
+        )
 
     def _touches_page(self, action: object) -> bool:
         return bool(self.PAGE_ACTIONS & action.model_dump(exclude_none=True).keys())

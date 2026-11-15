@@ -6,7 +6,7 @@ import pytest
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.tools.service import Tools
 
-from fill import AppliedPageStop, JsonlTracker, StepCallback
+from fill import AppliedPageStop, JsonlTracker, StepCallback, UnmarkedSubmits
 
 JOB = "https://jobs.acme.example/1001"
 OTHER_JOB = "https://jobs.acme.example/2002"
@@ -82,6 +82,24 @@ class TestAppliedPageStop:
 
         kept = [action.model_dump(exclude_unset=True) for action in actions]
         assert kept == [self.GO_BACK]
+
+    @pytest.mark.asyncio
+    async def test_guessed_unmarked_submit_does_not_lock_the_page(
+        self,
+        stop: AppliedPageStop,
+        attempted_tracker: JsonlTracker,
+        mock_app_logger: MagicMock,
+    ) -> None:
+        # UnmarkedSubmits records any page that POSTed to its own host, which can be a
+        # listing (Ashby loads its board with same-host GraphQL POSTs)
+        await attempted_tracker.append(
+            {"job_url": JOB, "reason": UnmarkedSubmits.REASON}
+        )
+
+        actions, notes = await self._step_on(JOB, stop, mock_app_logger)
+
+        assert len(actions) == len(self._actions())
+        assert notes == []
 
     @pytest.mark.asyncio
     async def test_new_job_is_left_alone(
