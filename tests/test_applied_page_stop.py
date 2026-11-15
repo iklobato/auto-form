@@ -6,10 +6,11 @@ import pytest
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.tools.service import Tools
 
-from fill import AppliedPageStop, JsonlTracker, StepCallback, UnmarkedSubmits
+from fill import AppliedPageStop, JsonlTracker, KnownJobs, StepCallback, UnmarkedSubmits
 
 JOB = "https://jobs.acme.example/1001"
 OTHER_JOB = "https://jobs.acme.example/2002"
+PORTAL = "https://jobs.acme.example/"
 
 
 @pytest.fixture
@@ -18,9 +19,8 @@ def stop(
     attempted_tracker: JsonlTracker,
     mock_app_logger: MagicMock,
 ) -> AppliedPageStop:
-    return AppliedPageStop(
-        applied_tracker, attempted_tracker, mock_app_logger.portal("acme")
-    )
+    known = KnownJobs(applied_tracker, attempted_tracker, start_url=PORTAL)
+    return AppliedPageStop(known, mock_app_logger.portal("acme"))
 
 
 class TestAppliedPageStop:
@@ -29,8 +29,9 @@ class TestAppliedPageStop:
     GO_BACK = {"go_back": {}}
     FILL = {"input": {"index": FIELD_INDEX, "text": "x", "clear": True}}
     SEND = {"click": {"index": BUTTON_INDEX}}
+    SEND_BY_JS = {"evaluate": {"code": "document.forms[0].submit()"}}
     # what the model asks for in this step; a test may replace it
-    raw_actions = (FILL, SEND, GO_BACK)
+    raw_actions = (FILL, SEND, SEND_BY_JS, GO_BACK)
 
     def _actions(self) -> list:
         action_model = Tools().registry.create_action_model()
@@ -113,6 +114,21 @@ class TestAppliedPageStop:
         )
 
         actions, notes = await self._step_on(JOB, stop, mock_app_logger)
+
+        assert len(actions) == len(self._actions())
+        assert notes == []
+
+    @pytest.mark.asyncio
+    async def test_the_portal_start_page_is_never_locked(
+        self,
+        stop: AppliedPageStop,
+        attempted_tracker: JsonlTracker,
+        mock_app_logger: MagicMock,
+    ) -> None:
+        # 1 of 16 real attempts on 2026-11-15 named a portal start URL (captcha)
+        await attempted_tracker.append({"job_url": PORTAL, "reason": "captcha"})
+
+        actions, notes = await self._step_on(PORTAL, stop, mock_app_logger)
 
         assert len(actions) == len(self._actions())
         assert notes == []

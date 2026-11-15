@@ -1755,6 +1755,33 @@ class InputClearer:
             self._plog.info("input index %s: clear=False changed to True", params.index)
 
 
+@dataclass(frozen=True)
+class KnownJobs:
+    """Pages that are jobs already applied to, or given up on by the agent."""
+
+    applied: JsonlTracker
+    attempted: JsonlTracker
+    # Never a job, even when recorded: 1 of 16 real attempts on 2026-11-15 named a
+    # portal start URL (captcha), and locking it would end every later run there
+    start_url: str
+
+    def holds(self, url: str) -> bool:
+        if not url or job_url_key(url) == job_url_key(self.start_url):
+            return False
+        if self.applied.has_job(url):
+            return True
+        # submitted_not_marked is a guess from any same-host POST and can name a
+        # listing (Ashby loads its board through same-host GraphQL POSTs)
+        wanted = job_url_key(url)
+        return any(
+            job_url_key(record[field]) == wanted
+            for record in self.attempted.records()
+            if record.get("reason") != UnmarkedSubmits.REASON
+            for field in JsonlTracker.JOB_URL_FIELDS
+            if record.get(field)
+        )
+
+
 class AppliedPageStop:
     """Drops form actions on a job the trackers already hold.
 
@@ -1763,8 +1790,9 @@ class AppliedPageStop:
     and the custom tools still run, so the agent can leave the page.
     """
 
+    # evaluate runs page JavaScript, which can submit the form too
     PAGE_ACTIONS = frozenset(
-        {"click", "input", "upload_file", "send_keys", "select_dropdown"}
+        {"click", "input", "upload_file", "send_keys", "select_dropdown", "evaluate"}
     )
     NOTE = (
         "<sys>{url} is already in the applied or attempted list. Do not fill or "
@@ -1772,15 +1800,12 @@ class AppliedPageStop:
     )
     GO_BACK = {"go_back": {}}
 
-    def __init__(
-        self, applied: JsonlTracker, attempted: JsonlTracker, plog: logging.Logger
-    ) -> None:
-        self._applied = applied
-        self._attempted = attempted
+    def __init__(self, known: KnownJobs, plog: logging.Logger) -> None:
+        self._known = known
         self._plog = plog
 
     def apply(self, url: str, actions: list, agent: Agent) -> None:
-        if not url or not self._is_known(url):
+        if not self._known.holds(url):
             return
         kept = [action for action in actions if not self._touches_page(action)]
         if len(kept) == len(actions):
@@ -1791,20 +1816,6 @@ class AppliedPageStop:
         history = agent._message_manager.state.agent_history_items
         history.append(HistoryItem(system_message=self.NOTE.format(url=url)))
         self._plog.warning("already applied to %s: form actions dropped", url)
-
-    def _is_known(self, url: str) -> bool:
-        if self._applied.has_job(url):
-            return True
-        # submitted_not_marked is a guess from any same-host POST and can name a
-        # listing (Ashby loads its board through same-host GraphQL POSTs)
-        wanted = job_url_key(url)
-        return any(
-            job_url_key(record[field]) == wanted
-            for record in self._attempted.records()
-            if record.get("reason") != UnmarkedSubmits.REASON
-            for field in JsonlTracker.JOB_URL_FIELDS
-            if record.get(field)
-        )
 
     def _touches_page(self, action: object) -> bool:
         return bool(self.PAGE_ACTIONS & action.model_dump(exclude_none=True).keys())
@@ -2697,7 +2708,9 @@ class PortalRunner:
             ),
             scroll_brake=ScrollLoopBrake(self.plog),
             shots=StepShots(Paths.SCREENSHOTS / self.name / self.app_logger.run_id),
-            applied_stop=AppliedPageStop(self.applied, self.attempted, self.plog),
+            applied_stop=AppliedPageStop(
+                KnownJobs(self.applied, self.attempted, start_url=self.url), self.plog
+            ),
         )
         # Files the agent is allowed to upload via browser_use's upload_file action.
         # Without this whitelist, EVERY upload attempt fails with
