@@ -1815,6 +1815,10 @@ class ShotPhase(StrEnum):
     AFTER = "after"  # the page once those actions ran
 
 
+class EmptyScreenshot(RuntimeError):
+    """The browser answered a screenshot request without image data."""
+
+
 class StepShots:
     """One agent's step screenshots, in screenshots/<portal>/<run_id>/.
 
@@ -1822,9 +1826,29 @@ class StepShots:
     so it writes to <run_id>-2 instead of overwriting the first attempt.
     """
 
+    # browser_use gives its own screenshot 6 s; captures here took 0.10 to 0.13 s
+    TIMEOUT_S = 6.0
+
     def __init__(self, base: Path) -> None:
         self._base = base
         self._folder: Path | None = None
+
+    async def capture(self, session: BrowserSession) -> bytes:
+        """PNG of the current page, or TimeoutError after TIMEOUT_S.
+
+        Not BrowserSession.take_screenshot: it has no time limit (on_step_end runs
+        outside browser_use's step timeout) and raises a bare Exception on no data.
+        """
+        return await asyncio.wait_for(self._capture(session), self.TIMEOUT_S)
+
+    async def _capture(self, session: BrowserSession) -> bytes:
+        cdp = await session.get_or_create_cdp_session()
+        reply = await cdp.cdp_client.send.Page.captureScreenshot(
+            params={"format": "png"}, session_id=cdp.session_id
+        )
+        if not reply.get("data"):
+            raise EmptyScreenshot("the browser returned no screenshot data")
+        return base64.b64decode(reply["data"])
 
     def save(self, step_num: int, phase: ShotPhase, png: bytes) -> Path:
         path = self._resolve_folder() / f"step{step_num:04d}_{phase}.png"
@@ -1905,10 +1929,12 @@ class StepCallback:
         if self.shots is None or session is None:
             return
         try:
-            png = await session.take_screenshot()
-            path = self.shots.save(step_num, ShotPhase.AFTER, png)
+            path = self.shots.save(
+                step_num, ShotPhase.AFTER, await self.shots.capture(session)
+            )
             self.plog.debug("  screenshot  : %s", path.name)
-        except (TimeoutError, RuntimeError, OSError) as exc:  # CDP error, disk
+        except (TimeoutError, RuntimeError, OSError, ValueError) as exc:
+            # CDP error or no reply, disk, no focused page or bad base64
             self._report_failure(step_num, exc)
 
     def _report_failure(self, step_num: int, exc: Exception) -> None:

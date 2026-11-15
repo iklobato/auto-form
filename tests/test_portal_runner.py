@@ -1,5 +1,6 @@
 """PortalRunner — credential injection (portal_password + LinkedIn SSO)."""
 
+import base64
 import os
 import socket
 import threading
@@ -12,6 +13,7 @@ from browser_use.browser.views import BrowserStateSummary
 from browser_use.tools.service import Tools
 
 import fill
+from tests.test_step_callback import FakeScreenshotSession
 from fill import (
     AgentStoppedEarly,
     ApplicationRecorder,
@@ -750,11 +752,9 @@ class OneStepEnds:
     def __init__(self, agent: MagicMock) -> None:
         self.agent = agent
 
-    async def take_screenshot(self) -> bytes:
-        return self.PNG
-
     async def end_one_step(self, on_step_end: Callable | None = None) -> MagicMock:
-        self.agent.browser_session = self
+        reply = {"data": base64.b64encode(self.PNG).decode()}
+        self.agent.browser_session = FakeScreenshotSession(reply)
         self.agent.state.n_steps = self.STEPS_AFTER_FIRST
         await on_step_end(self.agent)
         return self.agent.run.return_value

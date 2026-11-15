@@ -174,16 +174,34 @@ class TestOnStep:
 
 
 class FakeScreenshotSession:
-    """Stands in for BrowserSession.take_screenshot (a CDP call)."""
+    """Stands in for the CDP session behind a screenshot (Page.captureScreenshot)."""
 
-    def __init__(self, png: bytes, error: Exception | None = None) -> None:
-        self.png = png
-        self.error = error
+    session_id = "s1"
 
-    async def take_screenshot(self) -> bytes:
-        if self.error is not None:
-            raise self.error
-        return self.png
+    def __init__(self, reply: dict, delay_s: float = 0.0) -> None:
+        self.reply = reply
+        self.delay_s = delay_s
+
+    @property
+    def cdp_client(self) -> "FakeScreenshotSession":
+        return self
+
+    @property
+    def send(self) -> "FakeScreenshotSession":
+        return self
+
+    @property
+    def Page(self) -> "FakeScreenshotSession":  # noqa: N802 - CDP domain name
+        return self
+
+    async def get_or_create_cdp_session(self) -> "FakeScreenshotSession":
+        return self
+
+    async def captureScreenshot(  # noqa: N802 - CDP method name
+        self, params: dict, session_id: str
+    ) -> dict:
+        await asyncio.sleep(self.delay_s)
+        return self.reply
 
 
 class TestAfterStepScreenshot:
@@ -191,6 +209,9 @@ class TestAfterStepScreenshot:
 
     # browser_use bumps n_steps before on_step_end, so step 1 has ended at 2
     STEPS_AFTER_FIRST = 2
+    # longer than the patched limit below, so the capture never answers in time
+    HANG_S = 5.0
+    SHORT_LIMIT_S = 0.05
 
     def _agent(self, session: FakeScreenshotSession | None) -> MagicMock:
         return MagicMock(
@@ -201,27 +222,41 @@ class TestAfterStepScreenshot:
     async def test_saves_after_shot_next_to_before_shot(
         self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
     ) -> None:
-        png = base64.b64decode(_png_b64())
-        agent = self._agent(FakeScreenshotSession(png))
+        agent = self._agent(FakeScreenshotSession({"data": _png_b64()}))
 
         await StepCallback("acme", mock_app_logger, shots=run_shots).on_step_end(agent)
 
         shot = Paths.SCREENSHOTS / "acme" / "test-run" / "step0001_after.png"
-        assert shot.read_bytes() == png
+        assert shot.read_bytes() == base64.b64decode(_png_b64())
 
     @pytest.mark.asyncio
-    async def test_screenshot_failure_does_not_reach_the_agent(
-        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
+    async def test_a_capture_that_never_answers_is_cut_off(
+        self,
+        mock_app_logger: MagicMock,
+        run_shots: StepShots,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        timeout = TimeoutError("capture timed out")
-        agent = self._agent(FakeScreenshotSession(b"", error=timeout))
+        # browser_use awaits on_step_end outside its step timeout
+        monkeypatch.setattr(StepShots, "TIMEOUT_S", self.SHORT_LIMIT_S)
+        agent = self._agent(FakeScreenshotSession({}, delay_s=self.HANG_S))
 
         await StepCallback("acme", mock_app_logger, shots=run_shots).on_step_end(agent)
 
         event = mock_app_logger.emit.call_args
         assert event.args == ("step_callback_error",)
-        assert event.kwargs["error"] == "capture timed out"
-        assert event.kwargs["step"] == 1
+        assert (event.kwargs["error_type"], event.kwargs["step"]) == ("TimeoutError", 1)
+
+    @pytest.mark.asyncio
+    async def test_a_reply_without_data_is_reported_not_raised(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
+    ) -> None:
+        agent = self._agent(FakeScreenshotSession({}))
+
+        await StepCallback("acme", mock_app_logger, shots=run_shots).on_step_end(agent)
+
+        event = mock_app_logger.emit.call_args
+        assert event.kwargs["error"] == "the browser returned no screenshot data"
+        assert list(Paths.SCREENSHOTS.rglob("*.png")) == []
 
     @pytest.mark.asyncio
     async def test_no_browser_session_no_file(
