@@ -1,5 +1,6 @@
 """PortalRunner — credential injection (portal_password + LinkedIn SSO)."""
 
+import asyncio
 import base64
 import os
 import socket
@@ -20,6 +21,7 @@ from fill import (
     CredentialsResolver,
     JsonlTracker,
     Paths,
+    PortalInterrupted,
     PortalRunner,
     ProfileInUse,
     Proxy,
@@ -643,6 +645,46 @@ def fresh_runner(request: pytest.FixtureRequest) -> PortalRunner:
         attempted=request.getfixturevalue("attempted_tracker"),
         recorder=request.getfixturevalue("recorder"),
     )
+
+
+class TestAgentInterrupted:
+    # 2026-11-15, systems-all.yaml with 5 workers: Chrome took over 30 s to start,
+    # bubus raised CancelledError ("interrupted because of a parent timeout") out of
+    # Agent.run; it is not an Exception, so it stopped the whole batch after 7 of 70
+    async def test_cancel_from_inside_browser_use_is_a_retryable_failure(
+        self, fresh_runner: PortalRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        interrupted = asyncio.CancelledError("interrupted because of a parent timeout")
+        agent.run.side_effect = interrupted
+        agent_ctor.return_value = agent
+
+        with pytest.raises(PortalInterrupted, match="parent timeout") as raised:
+            await fresh_runner.run()
+
+        # Orchestrator retries RuntimeError
+        assert isinstance(raised.value, RuntimeError)
+
+    async def test_cancelling_the_run_itself_still_cancels(
+        self, fresh_runner: PortalRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        started = asyncio.Event()
+
+        async def run_until_cancelled(on_step_end: Callable | None = None) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        agent.run.side_effect = run_until_cancelled
+        agent_ctor.return_value = agent
+        task = asyncio.create_task(fresh_runner.run())
+        await started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 class TestBrowserStartSession:

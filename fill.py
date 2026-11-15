@@ -2483,6 +2483,16 @@ class AgentActions:
 # ── Per-portal runner ─────────────────────────────────────────────────────────
 
 
+class PortalInterrupted(RuntimeError):
+    """browser_use cancelled the portal's work from inside, not a cancel of the run.
+
+    bubus raises CancelledError out of Agent.run when one of its handlers times out:
+    on 2026-11-15 Chrome took over 30 s to start with 5 workers. CancelledError is
+    not an Exception, so it skipped the Orchestrator's handlers and stopped the
+    whole batch after 7 of 70 portals. As a RuntimeError it is retried once.
+    """
+
+
 class AgentStoppedEarly(RuntimeError):
     """The agent hit max_steps or max_failures without calling `done`.
 
@@ -2757,7 +2767,12 @@ class PortalRunner:
             self.opts.max_actions,
         )
         on_step_end = self._step_callback.on_step_end if self._step_callback else None
-        history = await agent.run(on_step_end=on_step_end)
+        try:
+            history = await agent.run(on_step_end=on_step_end)
+        except asyncio.CancelledError as exc:
+            if asyncio.current_task().cancelling():
+                raise  # the run itself is being cancelled (Ctrl+C)
+            raise PortalInterrupted(f"{self.name}: {exc}") from exc
         elapsed = time.monotonic() - t0
 
         final = history.final_result() or "(no result)"
