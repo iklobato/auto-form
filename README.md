@@ -81,7 +81,7 @@ uv run python fill.py --all --workers 2 --headless --model google/gemini-2.5-fla
 ```
 
 **Which model and `--max-actions`.** The defaults are `google/gemini-2.5-flash-lite` and
-5 actions per step. In a local end-to-end test on 2026-10-30 these defaults sent no
+12 actions per step. In a local end-to-end test on 2026-10-30 the old default of 5 sent no
 application: the agent filled 4 of 14 fields, the browser blocked the submit, and the
 agent said it worked. browser_use drops actions past `--max-actions` without telling the
 model. With `--model google/gemini-2.5-flash --max-actions 12` both test forms were
@@ -212,7 +212,7 @@ disability questions whose profile answers did not match the option text.
 --headless             no Chrome window (some sites answer 403)
 --workers N            sites at the same time with --all, 1 or more (default 5)
 --model ID             OpenRouter model id (default google/gemini-2.5-flash-lite)
---max-actions N        actions per LLM step, 1 or more (default 5; 12 works better for forms)
+--max-actions N        actions per LLM step, 1 or more (default 12)
 --fast                 browser_use flash mode: no self-check step, about 30% faster
 --filter WORD          only roles whose title or description has WORD
 --note "TEXT"          extra context added to the prompt for this run

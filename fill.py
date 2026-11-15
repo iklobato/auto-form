@@ -34,7 +34,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import ClassVar, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
@@ -76,10 +76,13 @@ class Paths:
 class RunOptions:
     """Per-run knobs passed from the CLI down to PortalRunner."""
 
+    # 5 left 10 of 14 fields empty in the 2026-10-30 local run; 12 filled them
+    DEFAULT_MAX_ACTIONS: ClassVar[int] = 12
+
     dry_run: bool = False
     headless: bool = False
     fast: bool = False
-    max_actions: int = 5
+    max_actions: int = DEFAULT_MAX_ACTIONS
     filter_keyword: str = ""
     note: str = ""
     resume_path: str = ""
@@ -2947,8 +2950,8 @@ class CLI:
         p.add_argument(
             "--max-actions",
             type=positive_int,
-            default=5,
-            help="Max actions per LLM call (default 5; raise to 8–12)",
+            default=RunOptions.DEFAULT_MAX_ACTIONS,
+            help="Max actions per LLM call (default %(default)s)",
         )
         p.add_argument(
             "--model", help="OpenRouter model id (overrides OPENROUTER_MODEL env)"
