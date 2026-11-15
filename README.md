@@ -93,8 +93,11 @@ flash for sites where you expect a form; flash-lite is fine for scanning. Detail
 **Duplicates.** Before applying, the agent calls `check_applied`, which skips a job
 already in `applied.jsonl` or `attempted.jsonl` (URLs are compared without tracking
 params, `www.`, trailing slash). A run can be stopped and started again. If the agent
-skips `check_applied` and opens a job that is already in either file, the program drops
-that step's clicks, typing and uploads and tells the agent to move on.
+skips `check_applied` and opens a job that is in `applied.jsonl`, or in
+`attempted.jsonl` with a reason the agent gave, the program drops that step's clicks,
+typing, uploads and page scripts and sends the agent back. Not covered: attempts with
+reason `submitted_not_marked` (a guess that can name a listing page) and the site's own
+start page.
 
 ## 6. After a real run, check
 

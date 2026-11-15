@@ -164,17 +164,22 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
 ### 5.7 Step actions are corrected before they run (2026-11-15)
 - `InputClearer` sets `clear=True` on every `input` action (flash-lite sent
   `clear: False` and values went out twice). The params are at `action.root.input`.
-- `AppliedPageStop`: when the page URL is in `applied.jsonl` or in an attempt the agent
-  recorded, `click`, `input`, `upload_file`, `send_keys`, `select_dropdown` are dropped
-  and a note goes to the agent history. Records with reason `submitted_not_marked` are
-  ignored (they can name a listing). If no action is left, a `go_back` replaces them:
-  browser_use does not count a step with an empty action list.
+- `AppliedPageStop`: when `KnownJobs.holds(url)` (the page URL is in `applied.jsonl` or
+  in an attempt the agent recorded), `click`, `input`, `upload_file`, `send_keys`,
+  `select_dropdown` and `evaluate` are dropped and a note goes to the agent history.
+  Records with reason `submitted_not_marked` are ignored (they can name a listing), and
+  the portal start URL never counts (1 of 16 real attempts named one, reason
+  `captcha`). If no action is left, a `go_back` replaces them: browser_use does not count
+  a step with an empty action list.
 
 ### 5.8 Screenshots (2026-11-15)
 - `StepShots` writes `screenshots/<portal>/<run_id>/stepNNNN_before.png` from
   `on_step` and `stepNNNN_after.png` from `on_step_end` (step = `n_steps - 1`, because
   browser_use bumps it first). A retried portal (same run id, steps from 1 again) writes
-  to `<run_id>-2`. A failed capture never reaches the agent.
+  to `<run_id>-2`. The after shot calls `Page.captureScreenshot` itself with a 6 s
+  limit: `BrowserSession.take_screenshot` has none (and `on_step_end` runs outside
+  browser_use's step timeout) and raises a bare `Exception` on an empty reply. A failed
+  capture never reaches the agent.
 
 ## 6. Things learned (read before debugging)
 
