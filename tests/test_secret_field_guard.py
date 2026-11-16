@@ -49,7 +49,7 @@ class TestSecretFieldGuard:
     async def _run(self, raw_actions: tuple, mock_app_logger: MagicMock) -> tuple:
         actions, state, callback, output = self._step(raw_actions, mock_app_logger)
         guard = SecretFieldGuard(mock_app_logger.portal("acme"))
-        await GuardedStep(guard, callback).on_step(state, output, step_num=1)
+        await GuardedStep((guard,), callback).on_step(state, output, step_num=1)
         kept = [action.model_dump(exclude_none=True) for action in actions]
         notes = callback.agent_ref._message_manager.state.agent_history_items
         return kept, notes

@@ -1907,15 +1907,102 @@ class SecretFieldGuard:
         return attributes.get("type", "").lower() != self.PASSWORD_TYPE
 
 
-class GuardedStep:
-    """The step hook browser_use calls: the password check, then StepCallback.
+class ReservedEmailGuard:
+    """Drops typing an email on a reserved test domain (example.com, .test, ...).
 
-    The check runs outside StepCallback's try/except on purpose: if it fails, the
+    Those domains never receive mail (RFC 2606), so such an address is always made
+    up. On 2026-11-16 the agent typed `<name>@example.com` twice into an Ashby form.
+    """
+
+    RESERVED = re.compile(
+        r"@[\w.-]*\b(example\.(com|org|net)|[\w-]+\.(test|invalid|example))\b",
+        re.IGNORECASE,
+    )
+    WAIT = {"wait": {"seconds": 1}}
+    NOTE = (
+        "<sys>Your input at index {index} was not run: it held a made-up email. Use "
+        "only the email from my profile, never invent contact data.</sys>"
+    )
+
+    def __init__(self, plog: logging.Logger) -> None:
+        self._plog = plog
+
+    def apply(self, browser_state: object, actions: list, agent: Agent) -> None:
+        dropped = [action for action in actions if self._made_up(action)]
+        if not dropped:
+            return
+        filler = type(actions[0]).model_validate(self.WAIT)
+        actions[:] = [action for action in actions if action not in dropped] or [filler]
+        history = agent._message_manager.state.agent_history_items
+        for action in dropped:
+            index = action.model_dump(exclude_none=True)["input"].get("index")
+            history.append(HistoryItem(system_message=self.NOTE.format(index=index)))
+            self._plog.warning("made-up email typed: dropped (index %s)", index)
+
+    def _made_up(self, action: object) -> bool:
+        params = action.model_dump(exclude_none=True).get("input") or {}
+        return bool(self.RESERVED.search(params.get("text", "")))
+
+
+class ResumeReminder:
+    """Tells the agent once per page when a file field is there and no resume went in.
+
+    In a local run on 2026-11-16 the agent filled every field but never called
+    upload_file; Chrome refused the submit ("Please select a file.") and the agent
+    gave up after 6 clicks, since it does not read the browser's validation bubble.
+    """
+
+    UPLOAD_ACTION = "upload_file"
+    FILE_TYPE = "file"
+    NOTE = (
+        "<sys>This page has a file upload field and no file was uploaded here yet. "
+        "Upload my resume with upload_file, path {path}, before you submit.</sys>"
+    )
+
+    def __init__(self, resume_path: str, plog: logging.Logger) -> None:
+        self._resume_path = resume_path
+        self._plog = plog
+        # page url -> True once the resume went in or the agent was told
+        self._handled: dict[str, bool] = {}
+
+    def apply(self, browser_state: object, actions: list, agent: Agent) -> None:
+        url = getattr(browser_state, "url", "") or ""
+        if self._handled.get(url):
+            return
+        if any(
+            self.UPLOAD_ACTION in action.model_dump(exclude_none=True)
+            for action in actions
+        ):
+            self._handled[url] = True
+            return
+        if not self._has_file_field(browser_state):
+            return
+        self._handled[url] = True
+        history = agent._message_manager.state.agent_history_items
+        history.append(
+            HistoryItem(system_message=self.NOTE.format(path=self._resume_path))
+        )
+        self._plog.info("file field with no upload: reminded the agent")
+
+    def _has_file_field(self, browser_state: object) -> bool:
+        dom_state = getattr(browser_state, "dom_state", None)
+        fields = getattr(dom_state, "selector_map", None) or {}
+        return any(
+            (getattr(node, "attributes", None) or {}).get("type", "").lower()
+            == self.FILE_TYPE
+            for node in fields.values()
+        )
+
+
+class GuardedStep:
+    """The step hook browser_use calls: the step checks, then StepCallback.
+
+    The checks run outside StepCallback's try/except on purpose: if one fails, the
     exception makes browser_use drop the step's actions instead of running them.
     """
 
-    def __init__(self, guard: SecretFieldGuard, callback: "StepCallback") -> None:
-        self.guard = guard
+    def __init__(self, checks: tuple, callback: "StepCallback") -> None:
+        self.checks = checks
         self.callback = callback
 
     async def on_step(
@@ -1923,7 +2010,8 @@ class GuardedStep:
     ) -> None:
         actions = getattr(agent_output, "action", None)
         if actions and self.callback.agent_ref is not None:
-            self.guard.apply(browser_state, actions, self.callback.agent_ref)
+            for check in self.checks:
+                check.apply(browser_state, actions, self.callback.agent_ref)
         await self.callback.on_step(browser_state, agent_output, step_num)
 
 
@@ -2997,6 +3085,12 @@ class PortalRunner:
             pass  # alive, owned by another user
         return int(pid_text)
 
+    def _step_checks(self, uploads: list[str]) -> tuple:
+        checks = (SecretFieldGuard(self.plog), ReservedEmailGuard(self.plog))
+        if not uploads:
+            return checks
+        return (*checks, ResumeReminder(uploads[0], self.plog))
+
     def _build_agent(
         self, task: str, credentials: dict[str, str], *, proxy: Proxy | None = None
     ) -> Agent:
@@ -3083,7 +3177,7 @@ class PortalRunner:
             max_actions_per_step=self.opts.max_actions,
             flash_mode=self.opts.fast,
             register_new_step_callback=GuardedStep(
-                SecretFieldGuard(self.plog), callback
+                self._step_checks(allowed_uploads), callback
             ).on_step,
         )
         callback.agent_ref = agent  # lets callbacks attach the recorders
