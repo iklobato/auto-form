@@ -189,6 +189,18 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   browser_use's step timeout) and raises a bare `Exception` on an empty reply. A failed
   capture never reaches the agent.
 
+### 5.9 Portal outcome from facts (2026-11-15)
+- "succeeded" only means no exception. `PortalFacts` counts, per portal, form actions
+  (`input`, `select_dropdown`, `upload_file`) on pages that are not sign-up/login/join,
+  uploads, steps on such auth pages, and 403/429/503 answers for a page the agent was on.
+- `outcome()`: `form_filled` (an upload, or 3+ form actions), then `blocked`, then
+  `login_wall`, else `unknown`. It never reads the agent final text: on 2026-11-15
+  aijobs wrote that it applied after 23 `mark_applied` and no form action.
+- `portal_done` carries the counts and `outcome`; the `━━` line and the summary print it;
+  `run_done.outcomes` maps portal to outcome.
+- Replay of the 2026-11-15 run: 17 `form_filled`, 8 `login_wall`, 45 `unknown`
+  (`blocked` cannot be replayed from the log, it cuts URLs at 60 chars).
+
 ## 6. Things learned (read before debugging)
 
 - **Obscura (2026-11-15) cannot be the browser here**: 0.2.7 sends a multipart form as

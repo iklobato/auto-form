@@ -1413,6 +1413,85 @@ class NetworkRecorder:
 # ── CDP debug logger ──────────────────────────────────────────────────────────
 
 
+class PortalOutcome(StrEnum):
+    FORM_FILLED = "form_filled"
+    BLOCKED = "blocked"
+    LOGIN_WALL = "login_wall"
+    UNKNOWN = "unknown"
+
+
+class PortalFacts:
+    """What the agent did on one portal, counted from its steps and page responses.
+
+    The outcome comes from these counts, never from the agent's final text. In the
+    70-portal dry run of 2026-11-15 aijobs wrote that it applied after 23
+    mark_applied and no form action, while web3_career reported a failure after
+    147 form actions and 4 uploads on jobs.lever.co.
+    """
+
+    FORM_ACTIONS = frozenset({"input", "select_dropdown", "upload_file"})
+    UPLOAD_ACTION = "upload_file"
+    # Replayed on the 2026-11-15 run: with 3, 17 portals count as a filled form and
+    # every one of them shows real fields being typed in the step log.
+    FORM_MIN_ACTIONS = 3
+    # Cloudflare challenge pages answer 403 or 503, rate limits 429
+    BLOCKED_STATUSES = frozenset({403, 429, 503})
+    AUTH_PATH = re.compile(
+        r"/(sign-?up|sign-?in|log-?in|join|register|auth)(/|$)", re.IGNORECASE
+    )
+    AUTH_HOST_PREFIXES = ("account.", "accounts.", "auth.", "login.")
+
+    def __init__(self) -> None:
+        self.form_actions = 0
+        self.uploads = 0
+        self.auth_steps = 0
+        self.pages: set[str] = set()
+        self.error_pages: set[str] = set()
+
+    def observe_step(self, url: str, actions: list[str]) -> None:
+        self.pages.add(url)
+        self.uploads += actions.count(self.UPLOAD_ACTION)
+        if self._is_auth_page(url):
+            self.auth_steps += 1
+            return
+        self.form_actions += sum(1 for name in actions if name in self.FORM_ACTIONS)
+
+    def observe_response(self, url: str, status: int) -> None:
+        if status in self.BLOCKED_STATUSES:
+            self.error_pages.add(url)
+
+    def outcome(self) -> PortalOutcome:
+        if self.uploads or self.form_actions >= self.FORM_MIN_ACTIONS:
+            return PortalOutcome.FORM_FILLED
+        if self.error_pages & self.pages:
+            return PortalOutcome.BLOCKED
+        if self.auth_steps:
+            return PortalOutcome.LOGIN_WALL
+        return PortalOutcome.UNKNOWN
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "outcome": self.outcome().value,
+            "form_actions": self.form_actions,
+            "uploads": self.uploads,
+            "auth_steps": self.auth_steps,
+            "pages": len(self.pages),
+            "blocked_pages": len(self.error_pages & self.pages),
+        }
+
+    def _is_auth_page(self, url: str) -> bool:
+        parts = urlsplit(url)
+        return bool(self.AUTH_PATH.search(parts.path)) or parts.netloc.startswith(
+            self.AUTH_HOST_PREFIXES
+        )
+
+
+@dataclass(frozen=True)
+class PortalReport:
+    final: str
+    outcome: PortalOutcome
+
+
 class CDPDebugger:
     """Subscribes to extra CDP event streams for debugging visibility:
 
@@ -1435,11 +1514,13 @@ class CDPDebugger:
         portal_name: str,
         app_logger: AppLogger,
         noise_fragments: tuple[str, ...] = (),
+        facts: PortalFacts | None = None,
     ):
         self.portal_name = portal_name
         self.app_logger = app_logger
         self.plog = app_logger.portal(portal_name)
         self.noise_fragments = noise_fragments
+        self.facts = facts
         self.events_file = Paths.APPLICATIONS / portal_name / "cdp.jsonl"
         self.events_file.parent.mkdir(parents=True, exist_ok=True)
         self._attached_session_ids: set[str] = set()
@@ -1505,6 +1586,8 @@ class CDPDebugger:
         }
         self._persist(record)
         if status >= self.HTTP_ERROR_MIN:
+            if self.facts is not None:
+                self.facts.observe_response(url, status)
             self.plog.warning("HTTP %d %s %s", status, method, url[:80])
             self.app_logger.emit(
                 "http_error",
@@ -1905,8 +1988,10 @@ class StepCallback:
         scroll_brake: ScrollLoopBrake | None = None,
         shots: StepShots | None = None,
         applied_stop: AppliedPageStop | None = None,
+        facts: PortalFacts | None = None,
     ):
         self.dry_run_guard = dry_run_guard
+        self.facts = facts
         self.scroll_brake = scroll_brake
         self.portal_name = portal_name
         self.app_logger = app_logger
@@ -1987,6 +2072,8 @@ class StepCallback:
         actions = [name for name, _ in action_details]
         if self.scroll_brake:
             self.scroll_brake.observe(actions, self.agent_ref)
+        if self.facts is not None:
+            self.facts.observe_step(url, actions)
 
         # INFO — single-line summary
         timing = f"{elapsed:5.1f}s" if elapsed is not None else "  ----"
@@ -2602,8 +2689,9 @@ class PortalRunner:
         self.plog = app_logger.portal(self.name)
         self._network_recorder: NetworkRecorder | None = None
         self._step_callback: StepCallback | None = None
+        self._facts = PortalFacts()
 
-    async def run(self) -> str:
+    async def run(self) -> PortalReport:
         mode = "DRY RUN" if self.opts.dry_run else "APPLY"
         self.app_logger.main().info(
             "━━ [%s] starting — mode=%s url=%s", self.name, mode, self.url
@@ -2635,9 +2723,10 @@ class PortalRunner:
         )
         actions.register_all()
         try:
-            return await self._run_agent(agent)
+            final = await self._run_agent(agent)
         finally:
             await actions.finish_job()
+        return PortalReport(final, self._facts.outcome())
 
     def _build_credentials(self) -> dict[str, str]:
         creds: dict[str, str] = {}
@@ -2752,7 +2841,10 @@ class PortalRunner:
 
         network_recorder = NetworkRecorder(self.name, self.app_logger)
         cdp_debugger = CDPDebugger(
-            self.name, self.app_logger, noise_fragments=NetworkRecorder.NOISE_FRAGMENTS
+            self.name,
+            self.app_logger,
+            noise_fragments=NetworkRecorder.NOISE_FRAGMENTS,
+            facts=self._facts,
         )
         if self.opts.dry_run and proxy is not None and proxy.username:
             # browser_use's proxy-auth handler continues every paused request,
@@ -2773,6 +2865,7 @@ class PortalRunner:
             applied_stop=AppliedPageStop(
                 KnownJobs(self.applied, self.attempted, start_url=self.url), self.plog
             ),
+            facts=self._facts,
         )
         # Files the agent is allowed to upload via browser_use's upload_file action.
         # Without this whitelist, EVERY upload attempt fails with
@@ -2831,12 +2924,15 @@ class PortalRunner:
         steps = len(history.history) if hasattr(history, "history") else "?"
         self.plog.info("finished in %.1fs — %s steps", elapsed, steps)
         self.plog.info("final result:\n%s", final)
+        facts = self._facts.as_dict()
+        self.plog.info("outcome: %s", facts)
         self.app_logger.emit(
             "portal_done",
             portal=self.name,
             elapsed_s=round(elapsed, 1),
             steps=steps,
             result_preview=final[:300],
+            **facts,
         )
         if not history.is_done():
             raise AgentStoppedEarly(
@@ -2930,8 +3026,8 @@ class Orchestrator:
             raise next(iter(self._crashed.values()))
 
     async def _retry_failures(
-        self, results: list[tuple[str, str | Exception]]
-    ) -> list[tuple[str, str | Exception]]:
+        self, results: list[tuple[str, PortalReport | Exception]]
+    ) -> list[tuple[str, PortalReport | Exception]]:
         # A profile held by a live Chrome is still held 5 s later, a gone page is still gone
         failed = {
             n
@@ -2949,25 +3045,33 @@ class Orchestrator:
         retry_results = await self._run_batch(retry_batch, "retry")
         return [r for r in results if r[0] not in failed] + retry_results
 
-    def _summarise(self, results: list[tuple[str, str | Exception]]) -> None:
+    def _summarise(self, results: list[tuple[str, PortalReport | Exception]]) -> None:
         ok = [n for n, r in results if not isinstance(r, Exception)]
         failed = [n for n, r in results if isinstance(r, Exception)]
+        outcomes = {n: r.outcome.value for n, r in results if n in ok}
         self.log.info("━━━━━━━━━━━━━━━━━━━━ all portals done ━━━━━━━━━━━━━━━━━━━━")
         self.log.info("  succeeded: %d — %s", len(ok), ok)
         self.log.info("  failed:    %d — %s", len(failed), failed)
+        for outcome in PortalOutcome:
+            names = sorted(n for n, o in outcomes.items() if o == outcome.value)
+            self.log.info("  %-12s %d — %s", outcome.value, len(names), names)
         if self._crashed:
             self.log.info("  crashed:   %s (bug, not retried)", sorted(self._crashed))
         if self.skipped_count:
             self.log.info("  skipped:   %d (URL not configured)", self.skipped_count)
         self.app_logger.emit(
-            "run_done", succeeded=ok, failed=failed, skipped=self.skipped_count
+            "run_done",
+            succeeded=ok,
+            failed=failed,
+            skipped=self.skipped_count,
+            outcomes=outcomes,
         )
 
     async def _run_batch(
         self, batch: list[dict], label: str
-    ) -> list[tuple[str, str | Exception]]:
+    ) -> list[tuple[str, PortalReport | Exception]]:
         sem = asyncio.Semaphore(self.max_workers)
-        results: list[tuple[str, str | Exception]] = []
+        results: list[tuple[str, PortalReport | Exception]] = []
         completed = 0
 
         # Failure modes we want to catch and continue past (other portals are still useful):
@@ -2979,7 +3083,7 @@ class Orchestrator:
         # summary is printed, so one bug does not cancel browsers mid-application.
         recoverable = (TimeoutError, OSError, RuntimeError, httpx.HTTPError)
 
-        async def run_one(system: dict) -> tuple[str, str | Exception]:
+        async def run_one(system: dict) -> tuple[str, PortalReport | Exception]:
             name = system["name"]
             async with sem:
                 try:
@@ -3028,7 +3132,7 @@ class Orchestrator:
         for coro in asyncio.as_completed(tasks):
             name, result = await coro
             completed += 1
-            status = "✓" if not isinstance(result, Exception) else "✗"
+            status = "✗" if isinstance(result, Exception) else f"✓ {result.outcome}"
             self.log.info(
                 "━━ [%d/%d] %s %s  (%s)",
                 completed,
@@ -3040,7 +3144,7 @@ class Orchestrator:
             results.append((name, result))
         return results
 
-    async def run_portal(self, system: dict) -> str:
+    async def run_portal(self, system: dict) -> PortalReport:
         if self.url_probe is not None:
             await self.url_probe.check(system)
         return await self.make_runner(system).run()

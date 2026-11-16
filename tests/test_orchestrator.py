@@ -4,7 +4,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fill import Orchestrator, ProfileInUse
+from fill import Orchestrator, PortalOutcome, PortalReport, ProfileInUse
+
+
+class Reports:
+    FILLED = PortalReport("applied to 1 role", PortalOutcome.FORM_FILLED)
+    WALLED = PortalReport("applied", PortalOutcome.LOGIN_WALL)
 
 
 class TestSelectActive:
@@ -104,7 +109,7 @@ class TestCrashIsolation:
         )
         runs = {
             "buggy": AsyncMock(side_effect=TypeError("bad arg")),
-            "fine": AsyncMock(return_value="applied to 1 role"),
+            "fine": AsyncMock(return_value=Reports.FILLED),
         }
         monkeypatch.setattr(
             orch, "make_runner", lambda system: MagicMock(run=runs[system["name"]])
@@ -140,7 +145,7 @@ class TestProfileInUse:
             ]
         )
         locked = AsyncMock(side_effect=ProfileInUse("Chrome pid 1 holds it"))
-        flaky = AsyncMock(side_effect=[TimeoutError("cdp"), "applied"])
+        flaky = AsyncMock(side_effect=[TimeoutError("cdp"), Reports.FILLED])
         runs = {"locked": locked, "flaky": flaky}
         monkeypatch.setattr(
             orch, "make_runner", lambda system: MagicMock(run=runs[system["name"]])
@@ -150,3 +155,27 @@ class TestProfileInUse:
         await orch.run()
 
         assert (locked.await_count, flaky.await_count) == (1, RUN_PLUS_ONE_RETRY)
+
+
+class TestOutcomeSummary:
+    async def test_run_done_carries_each_portal_outcome(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reports = {"filled": Reports.FILLED, "walled": Reports.WALLED}
+        orch = TestProxyProviders._orchestrator(
+            [{"name": name, "url": f"https://{name}.example.com/"} for name in reports]
+        )
+
+        def make_runner(system: dict) -> MagicMock:
+            return MagicMock(run=AsyncMock(return_value=reports[system["name"]]))
+
+        monkeypatch.setattr(orch, "make_runner", make_runner)
+
+        await orch.run()
+
+        run_done = next(
+            call.kwargs
+            for call in orch.app_logger.emit.call_args_list
+            if call.args and call.args[0] == "run_done"
+        )
+        assert run_done["outcomes"] == {"filled": "form_filled", "walled": "login_wall"}

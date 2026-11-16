@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from fill import Orchestrator, PortalUnreachable, StartUrlProbe
-from tests.test_orchestrator import TestProxyProviders
+from tests.test_orchestrator import Reports, TestProxyProviders
 
 START = "https://jobs.example.com/remote"
 OK = 200
@@ -90,7 +90,7 @@ class TestOrchestratorSkipsUnreachable:
 
         def make_runner(system: dict) -> MagicMock:
             built.append(system["name"])
-            return MagicMock(run=AsyncMock(return_value="applied"))
+            return MagicMock(run=AsyncMock(return_value=Reports.FILLED))
 
         monkeypatch.setattr(orch, "make_runner", make_runner)
 
