@@ -1854,6 +1854,36 @@ class InputClearer:
             self._plog.info("input index %s: clear=False changed to True", params.index)
 
 
+class LoneDone:
+    """Tells the agent that its `done` was not run because other actions came first.
+
+    browser_use runs `done` only as the first action of a step and drops it after
+    another one without telling the model (agent/service.py, "Done action is
+    allowed only as a single action"). In the feed run of 2026-11-15
+    remotive_feed sent `mark_attempted, done` 9 steps in a row.
+    """
+
+    ACTION = "done"
+    NOTE = (
+        "<sys>Your done action was not run: done must be the only action in its "
+        "step. If the task is finished, call done alone now.</sys>"
+    )
+
+    def __init__(self, plog: logging.Logger) -> None:
+        self._plog = plog
+
+    def apply(self, actions: Sequence, agent: Agent) -> None:
+        later = actions[1:]
+        if not any(
+            self.ACTION in action.model_dump(exclude_none=True) for action in later
+        ):
+            return
+        # Same private history as ScrollLoopBrake: no public API keeps a note
+        history = agent._message_manager.state.agent_history_items
+        history.append(HistoryItem(system_message=self.NOTE))
+        self._plog.info("done after other actions: told the agent to call it alone")
+
+
 @dataclass(frozen=True)
 class KnownJobs:
     """Pages that are jobs already applied to, or given up on by the agent."""
@@ -2004,9 +2034,11 @@ class StepCallback:
         shots: StepShots | None = None,
         applied_stop: AppliedPageStop | None = None,
         facts: PortalFacts | None = None,
+        lone_done: LoneDone | None = None,
     ):
         self.dry_run_guard = dry_run_guard
         self.facts = facts
+        self.lone_done = lone_done
         self.scroll_brake = scroll_brake
         self.portal_name = portal_name
         self.app_logger = app_logger
@@ -2030,6 +2062,8 @@ class StepCallback:
             if self.applied_stop and self.agent_ref and actions:
                 url = getattr(browser_state, "url", "") or ""
                 self.applied_stop.apply(url, actions, self.agent_ref)
+            if self.lone_done and self.agent_ref and actions:
+                self.lone_done.apply(actions, self.agent_ref)
             await self._record_step(browser_state, agent_output, step_num)
         except Exception as exc:
             self._report_failure(step_num, exc)
@@ -2926,6 +2960,7 @@ class PortalRunner:
                 KnownJobs(self.applied, self.attempted, start_url=self.url), self.plog
             ),
             facts=self._facts,
+            lone_done=LoneDone(self.plog),
         )
         # Files the agent is allowed to upload via browser_use's upload_file action.
         # Without this whitelist, EVERY upload attempt fails with

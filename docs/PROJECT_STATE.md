@@ -207,6 +207,13 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   `mark_attempted`. The refusal reply closes the job so the agent moves on; it does not
   ask for `mark_attempted`, because an attempted URL is skipped forever (5.4) and a
   login-walled job must stay open for a later logged-in run.
+- `LoneDone` adds a history note when `done` is not the first action of a step:
+  browser_use drops it silently (`agent/service.py`, "Done action is allowed only as a
+  single action"); remotive_feed repeated `mark_attempted, done` 9 steps in a row.
+- No step-count brake on purpose: on 2026-11-15 the longest run of steps with no new
+  page and no form action was at most 19 for the 17 `form_filled` portals and above
+  that for only 2 others (32, 31), about 15 of 1784 steps. `remote_game_jobs`
+  (158 steps) kept opening new pages and uploaded 3 times; it was not a loop.
 
 ## 6. Things learned (read before debugging)
 
