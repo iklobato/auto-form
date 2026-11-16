@@ -31,7 +31,7 @@ import socket
 import tempfile
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -40,6 +40,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 import yaml
+from pydantic import BaseModel, ConfigDict, ValidationError
 from browser_use import Agent
 from browser_use.agent.message_manager.views import HistoryItem
 from browser_use.agent.views import ActionResult
@@ -59,14 +60,17 @@ class Paths:
     """All filesystem locations the app reads or writes."""
 
     ROOT = Path(__file__).parent
-    KNOWLEDGE = ROOT / "knowledge"
     TASK_TEMPLATE = ROOT / "prompts" / "task.md"
-    SCREENSHOTS = ROOT / "screenshots"
-    PROFILES = ROOT / "browser_profiles"
-    LOGS = ROOT / "logs"
-    APPLICATIONS = ROOT / "applications"
-    APPLIED = ROOT / "applied.jsonl"
-    ATTEMPTED = ROOT / "attempted.jsonl"
+    # Runtime data (profile notes, trackers, run output). The Docker image points
+    # it at the mounted folder; without the variable it stays next to fill.py.
+    DATA = Path(os.environ.get("AUTO_FORM_DATA") or ROOT)
+    KNOWLEDGE = DATA / "knowledge"
+    SCREENSHOTS = DATA / "screenshots"
+    PROFILES = DATA / "browser_profiles"
+    LOGS = DATA / "logs"
+    APPLICATIONS = DATA / "applications"
+    APPLIED = DATA / "applied.jsonl"
+    ATTEMPTED = DATA / "attempted.jsonl"
     NOTES = KNOWLEDGE / "07_agent_notes.md"
 
 
@@ -87,6 +91,8 @@ class RunOptions:
     filter_keyword: str = ""
     note: str = ""
     resume_path: str = ""
+    # Fixed profile fields (email, gender, salary...) when the run uses profile.yaml
+    profile_fields: dict[str, str] = dataclass_field(default_factory=dict)
 
     def resume_for(self, system: dict) -> str:
         """A portal's own resume_path overrides the run-wide one.
@@ -281,6 +287,280 @@ class YamlStore:
 
 
 # ── Knowledge base ────────────────────────────────────────────────────────────
+
+
+class ProfileError(ValueError):
+    """profile.yaml is missing, unreadable or does not match the schema."""
+
+
+class ProfileSection(BaseModel):
+    # A misspelled field is an error, not a silently dropped value
+    model_config = ConfigDict(extra="forbid", coerce_numbers_to_str=True)
+
+
+class Identity(ProfileSection):
+    first_name: str
+    last_name: str
+    email: str
+    phone: str
+    city: str
+    country: str
+    preferred_name: str = ""
+    state: str = ""
+    postal_code: str = ""
+    linkedin: str = ""
+    github: str = ""
+    website: str = ""
+    twitter: str = ""
+    schedule_call: str = ""
+
+
+class WorkAuthorization(ProfileSection):
+    authorized_us: str
+    needs_sponsorship: str
+    willing_to_relocate: str
+    work_arrangement: str
+    employment_types: str
+    timezone: str
+    notice_period: str
+
+
+class Compensation(ProfileSection):
+    expected_annual_usd: str
+    expected_hourly_usd: str = ""
+    monthly_range_usd: str = ""
+    current_salary: str = ""
+    open_to_discuss: str = ""
+
+
+class Experience(ProfileSection):
+    current_title: str
+    target_title: str
+    current_employer: str = ""
+    currently_employed: str = ""
+    people_manager: str = ""
+    years: dict[str, str] = {}
+
+
+class Degree(ProfileSection):
+    degree: str
+    institution: str
+    year: str = ""
+
+
+class Eeo(ProfileSection):
+    veteran: str
+    disability: str
+    gender: str
+    ethnicity: str
+
+
+class Job(ProfileSection):
+    company: str
+    title: str
+    start: str
+    end: str
+    location: str = ""
+    highlights: list[str] = []
+
+
+class Project(ProfileSection):
+    name: str
+    summary: str
+
+
+class Profile(ProfileSection):
+    identity: Identity
+    work_authorization: WorkAuthorization
+    compensation: Compensation
+    experience: Experience
+    eeo: Eeo
+    education: list[Degree] = []
+    common_answers: dict[str, str] = {}
+    languages: list[str] = []
+    certifications: list[str] = []
+    summary: str = ""
+    skills: dict[str, list[str]] = {}
+    work_history: list[Job] = []
+    projects: list[Project] = []
+    freelance: str = ""
+    cover_letters: dict[str, str] = {}
+
+    def field_values(self) -> dict[str, str]:
+        """Profile values of the fixed form fields, by the key FieldValueGuard uses."""
+        pay = self.compensation
+        return {
+            **self.identity.model_dump(),
+            **self.eeo.model_dump(),
+            "salary": " ".join(
+                [
+                    pay.expected_annual_usd,
+                    pay.expected_hourly_usd,
+                    pay.monthly_range_usd,
+                ]
+            ),
+        }
+
+
+class ProfileMarkdown:
+    """Renders a Profile as the Markdown sections prompts/task.md refers to."""
+
+    def __init__(self, profile: Profile) -> None:
+        self.profile = profile
+
+    def render(self) -> str:
+        sections = [
+            self._quick_reference(),
+            self._about(),
+            self._skills(),
+            self._work_history(),
+            self._projects(),
+            self._cover_letters(),
+        ]
+        return "\n\n".join(section for section in sections if section)
+
+    def _quick_reference(self) -> str:
+        rows = [row for row in self._rows() if row[1]]
+        table = "\n".join(f"| {label} | {value} |" for label, value in rows)
+        return (
+            "# Form Quick-Reference\n\nCopy these answers verbatim into matching "
+            "form fields.\n\n| Field label | Answer |\n|---|---|\n" + table
+        )
+
+    def _rows(self) -> list[tuple[str, str]]:
+        return [
+            *self._identity_rows(),
+            *self._logistics_rows(),
+            *self._experience_rows(),
+            *self.profile.common_answers.items(),
+            *self._eeo_rows(),
+        ]
+
+    def _identity_rows(self) -> list[tuple[str, str]]:
+        who = self.profile.identity
+        return [
+            ("First name", who.first_name),
+            ("Last name", who.last_name),
+            ("Full name", f"{who.first_name} {who.last_name}"),
+            ("Preferred name / nickname", who.preferred_name),
+            ("Email", who.email),
+            ("Phone", who.phone),
+            ("City", who.city),
+            ("State / Province", who.state),
+            ("Country", who.country),
+            ("Postal / ZIP code", who.postal_code),
+            ("LinkedIn URL", who.linkedin),
+            ("GitHub URL", who.github),
+            ("Portfolio / Website", who.website),
+            ("Twitter / X", who.twitter),
+            ("Schedule a call", who.schedule_call),
+            ("Password (new account creation on job portals)", "<portal_password>"),
+        ]
+
+    def _logistics_rows(self) -> list[tuple[str, str]]:
+        auth, pay = self.profile.work_authorization, self.profile.compensation
+        return [
+            ("Are you authorized to work in the US?", auth.authorized_us),
+            ("Do you require visa sponsorship?", auth.needs_sponsorship),
+            ("Are you willing to relocate?", auth.willing_to_relocate),
+            ("Preferred work arrangement", auth.work_arrangement),
+            ("Employment type preference", auth.employment_types),
+            ("Current location / timezone", auth.timezone),
+            ("Notice period / earliest start date", auth.notice_period),
+            ("Expected salary (annual, USD)", pay.expected_annual_usd),
+            ("Expected hourly rate (contractor)", pay.expected_hourly_usd),
+            ("Preferred Salary Range (monthly USD)", pay.monthly_range_usd),
+            ("Current salary", pay.current_salary),
+            ("Open to discussing compensation", pay.open_to_discuss),
+        ]
+
+    def _experience_rows(self) -> list[tuple[str, str]]:
+        job = self.profile.experience
+        return [
+            *(
+                (f"Years of {skill} experience", years)
+                for skill, years in job.years.items()
+            ),
+            ("Current job title", job.current_title),
+            ("Desired / target title", job.target_title),
+            ("Current employer", job.current_employer),
+            ("Are you currently employed?", job.currently_employed),
+            ("Are you a people manager?", job.people_manager),
+            *self._degree_rows(),
+        ]
+
+    def _degree_rows(self) -> list[tuple[str, str]]:
+        return [
+            (f"Degree {number}", f"{grad.degree}, {grad.institution} {grad.year}")
+            for number, grad in enumerate(self.profile.education, 1)
+        ]
+
+    def _eeo_rows(self) -> list[tuple[str, str]]:
+        eeo = self.profile.eeo
+        return [
+            ("Veteran status", eeo.veteran),
+            ("Disability", eeo.disability),
+            ("Gender", eeo.gender),
+            ("Ethnicity", eeo.ethnicity),
+        ]
+
+    def _about(self) -> str:
+        profile = self.profile
+        lines = ["# About me", profile.summary.strip()]
+        lines += [f"- Language: {lang}" for lang in profile.languages]
+        lines += [f"- Certification: {cert}" for cert in profile.certifications]
+        if profile.freelance:
+            lines += ["", "## Freelance", profile.freelance.strip()]
+        return "\n".join(lines)
+
+    def _skills(self) -> str:
+        groups = self.profile.skills.items()
+        body = "\n".join(f"- {group}: {', '.join(items)}" for group, items in groups)
+        return f"# Technical skills\n{body}" if body else ""
+
+    def _work_history(self) -> str:
+        blocks = ["# Work history"]
+        for job in self.profile.work_history:
+            head = f"## {job.company}: {job.title} ({job.start} to {job.end}, {job.location})"
+            blocks.append(
+                "\n".join([head, *(f"- {point}" for point in job.highlights)])
+            )
+        return "\n\n".join(blocks) if len(blocks) > 1 else ""
+
+    def _projects(self) -> str:
+        items = [f"- {proj.name}: {proj.summary}" for proj in self.profile.projects]
+        return "# Projects\n" + "\n".join(items) if items else ""
+
+    def _cover_letters(self) -> str:
+        letters = self.profile.cover_letters.items()
+        blocks = [f"## {name}\n{text.strip()}" for name, text in letters]
+        return "# Cover letters\n\n" + "\n\n".join(blocks) if blocks else ""
+
+
+class ProfileFile:
+    """Reads and validates a profile.yaml (the Docker input)."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def load(self) -> Profile:
+        try:
+            raw = yaml.safe_load(self.path.read_text())
+        except (OSError, yaml.YAMLError) as exc:
+            raise ProfileError(f"{self.path}: {exc}") from exc
+        try:
+            return Profile.model_validate(raw or {})
+        except ValidationError as exc:
+            raise ProfileError(f"{self.path}: {self._describe(exc)}") from exc
+
+    def knowledge(self) -> str:
+        return ProfileMarkdown(self.load()).render()
+
+    def _describe(self, exc: ValidationError) -> str:
+        return "; ".join(
+            f"{'.'.join(str(part) for part in err['loc'])}: {err['msg']}"
+            for err in exc.errors()
+        )
 
 
 class KnowledgeBase:
@@ -3620,10 +3900,20 @@ class CLI:
             action="store_true",
             help="Print a per-portal application summary from applications/",
         )
-        p.add_argument(
+        send = p.add_mutually_exclusive_group()
+        send.add_argument(
             "--dry-run",
             action="store_true",
-            help="Assess matches but do not submit applications",
+            help="Fill forms but block every submit (the default)",
+        )
+        send.add_argument(
+            "--send",
+            action="store_true",
+            help="Really submit applications under your name (off by default)",
+        )
+        p.add_argument(
+            "--profile",
+            help="profile.yaml with your data (instead of knowledge/*.md)",
         )
         p.add_argument(
             "--filter",
@@ -3718,7 +4008,7 @@ class CLI:
             "startup",
             run_id=app_logger.run_id,
             systems_file=str(yaml_store.path),
-            dry_run=args.dry_run,
+            dry_run=opts.dry_run,
             headless=args.headless,
             workers=args.workers,
             resume=opts.resume_path,
@@ -3733,10 +4023,27 @@ class CLI:
                 args.system, systems, opts, yaml_store, deps, app_logger, log
             )
 
+    @classmethod
+    def knowledge(cls, args: argparse.Namespace, log: logging.Logger) -> str:
+        if args.profile:
+            return ProfileFile(Path(args.profile)).knowledge()
+        return KnowledgeBase(log=log).load()
+
+    @classmethod
+    def _profile_fields(cls, args: argparse.Namespace) -> dict[str, str]:
+        if not args.profile:
+            return {}
+        try:
+            return ProfileFile(Path(args.profile)).load().field_values()
+        except ProfileError as exc:
+            raise SystemExit(f"profile error: {exc}") from exc
+
     @staticmethod
     def _build_opts(args: argparse.Namespace) -> RunOptions:
         return RunOptions(
-            dry_run=args.dry_run,
+            # A run sends nothing unless --send says so
+            dry_run=not args.send,
+            profile_fields=CLI._profile_fields(args),
             headless=args.headless,
             fast=args.fast,
             max_actions=args.max_actions,
@@ -3748,7 +4055,7 @@ class CLI:
     @staticmethod
     def _build_deps(args, log, app_logger, yaml_store, opts) -> dict:
         return {
-            "knowledge": KnowledgeBase(log=log).load(),
+            "knowledge": CLI.knowledge(args, log),
             "llm": LLMFactory.create(model=args.model, log=log),
             "task_builder": TaskBuilder(log=log),
             "cred_resolver": CredentialsResolver(log=log),

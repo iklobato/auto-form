@@ -1,0 +1,112 @@
+# Example profile for the Docker image. Every value here is made up.
+# Copy it to <your folder>/profile.yaml, put your own values, then run:
+#   docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN auto-form --all
+# Fixed fields are checked at start: a missing or misspelled field stops the
+# run with its name. Text fields (summary, work history, cover letters) go to
+# the agent as written.
+---
+identity:
+  first_name: Ada
+  last_name: Example
+  preferred_name: Ada
+  email: ada.example@mail.io
+  phone: "+1 555 010 0199"
+  city: Lisbon
+  state: ""
+  country: Portugal
+  postal_code: "1000-001"
+  linkedin: https://www.linkedin.com/in/ada-example
+  github: https://github.com/ada-example
+  website: https://ada-example.dev
+  twitter: ""
+  schedule_call: ""
+
+work_authorization:
+  authorized_us: "No"
+  needs_sponsorship: "No, I work as a contractor"
+  willing_to_relocate: "No"
+  work_arrangement: Remote
+  employment_types: Full-time, Contract
+  timezone: "UTC+0 (Lisbon)"
+  notice_period: 2 weeks
+
+compensation:
+  expected_annual_usd: "120,000 - 150,000"
+  expected_hourly_usd: "70 - 90"
+  monthly_range_usd: "10,000 - 12,500"
+  current_salary: Prefer not to say
+  open_to_discuss: "Yes"
+
+experience:
+  current_title: Senior Backend Engineer
+  target_title: Senior Backend Engineer
+  current_employer: Example Corp
+  currently_employed: "Yes"
+  people_manager: "No"
+  years:
+    Professional experience: "9"
+    Python: "8"
+    Django / DRF: "6"
+    Kubernetes / cloud: "5"
+
+education:
+  - degree: BSc Computer Science
+    institution: Example University
+    year: "2015"
+
+eeo:
+  veteran: I am not a veteran
+  disability: "No"
+  gender: Prefer not to say
+  ethnicity: Prefer not to say
+
+common_answers:
+  How did you hear about this role?: Job board
+  Primary programming language: Python
+  Have you worked in a remote team before?: "Yes"
+  Comfortable with async communication?: "Yes"
+
+languages:
+  - English (fluent)
+  - Portuguese (native)
+
+certifications:
+  - AWS Certified Developer - Associate
+
+summary: >
+  Backend engineer with 9 years building Python services and data pipelines
+  on AWS. Works remote with teams in the US and Europe.
+
+skills:
+  Languages: [Python, Go, SQL]
+  Frameworks: [Django, FastAPI, Celery]
+  Cloud: [AWS, Kubernetes, Terraform]
+
+work_history:
+  - company: Example Corp
+    title: Senior Backend Engineer
+    start: 2021-03
+    end: Present
+    location: Remote
+    highlights:
+      - Moved a monolith billing service to event driven workers on SQS.
+      - Cut p95 latency of the public API from 900 ms to 180 ms.
+  - company: Sample Labs
+    title: Backend Engineer
+    start: 2016-01
+    end: 2021-02
+    location: Lisbon
+    highlights:
+      - Built the Django API used by 3 mobile apps.
+
+projects:
+  - name: Billing event pipeline
+    summary: SQS and Lambda pipeline that replaced nightly batch billing.
+
+freelance: ""
+
+cover_letters:
+  default: >
+    I build reliable Python backends and I like owning a service from design
+    to on-call. My last two roles were remote with US teams, and I am used to
+    writing things down and working async.

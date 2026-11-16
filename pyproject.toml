@@ -5,6 +5,7 @@ description = "AI-powered form filler for internal systems"
 requires-python = ">=3.13"
 dependencies = [
     "browser-use>=0.12.6",
+    "pydantic>=2.12",
     "python-dotenv>=1.2.1",
     "pyyaml>=6.0.3",
 ]
