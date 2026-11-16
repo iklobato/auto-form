@@ -273,19 +273,24 @@ data/
   resume.pdf     # the file uploaded to every form that asks for one
 ```
 
+The image is on Docker Hub for amd64 and arm64 (Apple Silicon included):
+
 ```bash
-docker build -t auto-form .
+docker pull iklobato/auto-form:0.1.0
 
 # dry run (default): fills forms, sends nothing
-docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN auto-form --all
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN iklobato/auto-form:0.1.0 --all
 
 # real applications under your name
-docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN auto-form --all --send
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN iklobato/auto-form:0.1.0 --all --send
 
 # your own site list, or one site
-docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN auto-form --systems /data/sites.yaml --all
-docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN auto-form --system golang_cafe
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN iklobato/auto-form:0.1.0 --systems /data/sites.yaml --all
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN iklobato/auto-form:0.1.0 --system golang_cafe
 ```
+
+To build it yourself instead: `docker build -t auto-form .` and use `auto-form` as the
+image name.
 
 `OPENROUTER_TOKEN` is your own OpenRouter key; each run costs you LLM credit (about
 US$ 1 for the 13 sites with the default `google/gemini-2.5-flash-lite`, measured once).
