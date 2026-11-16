@@ -189,6 +189,32 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   browser_use's step timeout) and raises a bare `Exception` on an empty reply. A failed
   capture never reaches the agent.
 
+### 5.9 Portal outcome from facts (2026-11-15)
+- "succeeded" only means no exception. `PortalFacts` counts, per portal, form actions
+  (`input`, `select_dropdown`, `upload_file`) on pages that are not sign-up/login/join,
+  uploads, steps on such auth pages, and 403/429/503 answers for a page the agent was on.
+- `outcome()`: `form_filled` (an upload, or 3+ form actions), then `blocked`, then
+  `login_wall`, else `unknown`. It never reads the agent final text: on 2026-11-15
+  aijobs wrote that it applied after 23 `mark_applied` and no form action.
+- `portal_done` carries the counts and `outcome`; the `━━` line and the summary print it;
+  `run_done.outcomes` maps portal to outcome.
+- Replay of the 2026-11-15 run: 17 `form_filled`, 8 `login_wall`, 45 `unknown`
+  (`blocked` cannot be replayed from the log, it cuts URLs at 60 chars).
+- `mark_applied` is refused (`mark_applied_refused` event, nothing recorded, dry run
+  or not) unless the current job has an upload or 3+ form actions outside auth pages,
+  or its page sent a POST to its own host (one-click apply, same rule as
+  `UnmarkedSubmits`). The job counts reset on `check_applied`, `mark_applied` and
+  `mark_attempted`. The refusal reply closes the job so the agent moves on; it does not
+  ask for `mark_attempted`, because an attempted URL is skipped forever (5.4) and a
+  login-walled job must stay open for a later logged-in run.
+- `LoneDone` adds a history note when `done` is not the first action of a step:
+  browser_use drops it silently (`agent/service.py`, "Done action is allowed only as a
+  single action"); remotive_feed repeated `mark_attempted, done` 9 steps in a row.
+- No step-count brake on purpose: on 2026-11-15 the longest run of steps with no new
+  page and no form action was at most 19 for the 17 `form_filled` portals and above
+  that for only 2 others (32, 31), about 15 of 1784 steps. `remote_game_jobs`
+  (158 steps) kept opening new pages and uploaded 3 times; it was not a loop.
+
 ## 6. Things learned (read before debugging)
 
 - **Obscura (2026-11-15) cannot be the browser here**: 0.2.7 sends a multipart form as

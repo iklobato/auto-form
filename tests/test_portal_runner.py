@@ -21,6 +21,7 @@ from fill import (
     CredentialsResolver,
     JsonlTracker,
     Paths,
+    PortalFacts,
     PortalInterrupted,
     PortalRunner,
     ProfileInUse,
@@ -57,6 +58,7 @@ def _make_runner(
         recorder=recorder,
         app_logger=mock_app_logger,
         proxy_provider=proxy_provider,
+        facts=PortalFacts(),
     )
 
 
