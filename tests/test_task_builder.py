@@ -18,6 +18,21 @@ class TestPrimaryUrlSelection:
         assert "URL=https://x.example.com/" in task
 
 
+class TestRealTemplateRules:
+    # 2026-11-16: the agent sent "I prefer not to answer" for veteran and disability
+    # while the profile answers both, and typed a made-up email and salary.
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "pick the option that matches it, even if the section says",
+            "Never make up contact data, numbers or personal facts",
+        ],
+    )
+    def test_the_shipped_prompt_carries_the_rule(self, rule: str) -> None:
+        sys = {"name": "x", "url": "https://x.example.com/"}
+        assert rule in TaskBuilder().build(sys, "K", RunOptions())
+
+
 class TestLoginLine:
     def test_present_when_credentials_exist(
         self, task_builder: TaskBuilder, sample_system: dict

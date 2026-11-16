@@ -226,6 +226,18 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   `SecretFieldGuard` first, outside the callback try/except: an `input` whose text
   holds a password placeholder runs only when the target element has
   `type="password"`; otherwise the action is dropped and the agent gets a note.
+- `GuardedStep` runs a tuple of checks (`PortalRunner._step_checks`): also
+  `ReservedEmailGuard` (drops an `input` with an email on example.com/.org/.net,
+  `.test`, `.invalid`, `.example`; the agent typed `<name>@example.com` on
+  2026-11-16) and, when a resume is configured, `ResumeReminder` (one note per page
+  that shows a `type="file"` field and had no `upload_file`; in a local run the agent
+  never uploaded, Chrome refused the submit with "Please select a file." and the agent
+  gave up).
+- `prompts/task.md` now says: never make up contact data, numbers or personal facts;
+  for EEO questions pick the option matching the profile even when the section says
+  voluntary. The user profile EEO header says "all voluntary, skip if field is
+  optional", and flash-lite answered "I prefer not to answer" for veteran and
+  disability where the profile answers both. Not measured yet after the change.
 
 ## 6. Things learned (read before debugging)
 
