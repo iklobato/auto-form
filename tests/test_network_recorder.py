@@ -25,6 +25,9 @@ class TestFiltering:
             "https://pagead2.googlesyndication.com/pagead/ping?e=1",
             "https://weworkremotely.com/listing_ads/16/impression?pk=abc",
             "https://esp.aptrinsic.com/rte/v1/command?p=AP-X&sv=0.61.9",
+            # Seen on 2026-11-15: LinkedIn retried this counter 330k times when blocked
+            "https://co.linkedin.com/jobs-guest/api/ingraphs/counter",
+            "https://www.linkedin.com/jobs-guest/api/ingraphs/counter",
         ],
     )
     def test_ignores_analytics_seen_on_job_sites(

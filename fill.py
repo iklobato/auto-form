@@ -1257,6 +1257,7 @@ class NetworkRecorder:
         "analytics.twitter.com",
         "t.co/i/adsctp",
         "px.ads.linkedin.com",
+        "linkedin.com/jobs-guest/api/ingraphs",
         "analytics.tiktok.com",
         "analytics-ipv6.tiktokw",
         "tiktokw.us",
