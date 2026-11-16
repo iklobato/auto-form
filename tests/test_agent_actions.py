@@ -783,17 +783,17 @@ class TestSubmitWithoutMark:
 class TestSubmitSeen:
     # Live run 2026-10-30: flash-lite called mark_applied for a form that never
     # went out (browser validation blocked it), so the job was recorded as sent.
-    async def test_mark_applied_without_any_post_is_flagged(
+    # Since 2026-11-16 a real run refuses it (the user chose to require a POST).
+    async def test_mark_applied_without_any_post_is_refused(
         self,
         real_run: RecordedRun,
         runs: RecordedRuns,
         applied_tracker: JsonlTracker,
     ) -> None:
-        await runs.tools()["mark_applied"](FORM_PAGE, "Python Engineer")
+        reply = await runs.tools()["mark_applied"](FORM_PAGE, "Python Engineer")
 
-        assert [record["submit_seen"] for record in applied_tracker.records()] == [
-            False
-        ]
+        assert applied_tracker.records() == []
+        assert reply.extracted_content.startswith("Not counted: the form was not sent")
 
     async def test_mark_applied_after_a_post_is_not_flagged(
         self,

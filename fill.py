@@ -2483,6 +2483,12 @@ class AgentActions:
         "plan, or Apply leads nowhere, move on to the next listing, or call done if "
         "there is none."
     )
+    UNSENT_REPLY = (
+        "Not counted: the form was not sent (no request left the page since you "
+        "opened this job). Click the final submit button, wait for the confirmation "
+        "page, then call mark_applied. If the submit is refused, fix the field the "
+        "page points to."
+    )
     ALREADY_COUNTED_REPLY = (
         "Already counted: {title} was handled earlier in this run. Do not call "
         "mark_applied again for it. Move on to the next listing, or call done if "
@@ -2555,9 +2561,33 @@ class AgentActions:
             )
         if not self._job_has_form():
             return self._refuse_without_form(job_url, job_title)
+        if self._real_run_without_post():
+            return self._refuse_unsent(job_url, job_title)
         self._counted_jobs[key] = job_title
         self._start_job()
         return None
+
+    def _real_run_without_post(self) -> bool:
+        """No request left the page for this job, in a run where it could have.
+
+        A dry run blocks every submit, so it never has one. Since 2026-11-16 a real
+        run requires one: a local run marked a filled but never sent form as
+        applied, and such a job is skipped forever. Known cost (user choice): a
+        cross-site iframe can POST before the recorder sees it (2026-10-30 probe).
+        """
+        if self.dry_run or self.network_recorder is None:
+            return False
+        return not self.network_recorder.recent
+
+    def _refuse_unsent(self, job_url: str, job_title: str) -> ActionResult:
+        self.plog.warning("mark_applied refused, form not sent: %s", job_title)
+        self.app_logger.emit(
+            "mark_applied_refused_unsent",
+            portal=self.portal_name,
+            url=job_url,
+            title=job_title,
+        )
+        return ActionResult(extracted_content=self.UNSENT_REPLY)
 
     def _refuse_without_form(self, job_url: str, job_title: str) -> ActionResult:
         self.plog.warning("mark_applied refused, no form filled: %s", job_title)

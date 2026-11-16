@@ -128,8 +128,13 @@ clear it, so `mark_applied` attaches only the current job's POSTs. Analytics hos
   that POSTed to its own host with no `mark_applied`/`mark_attempted` after it goes to
   `attempted.jsonl` with `reason: submitted_not_marked` (`UnmarkedSubmits`).
 - `mark_applied` stores `job_url` = the URL `check_applied` cleared and `apply_url` = the
-  agent's URL when different; `has_job` matches either. Its record has `submit_seen`
-  (False when no POST was captured for the job) and logs a warning; it is not refused.
+  agent's URL when different; `has_job` matches either. Its record has `submit_seen`.
+- Since 2026-11-16, in a real run `mark_applied` is REFUSED when no POST was captured
+  since the job started (`mark_applied_refused_unsent`): a local run marked a filled
+  but never sent form as applied, and that job would be skipped forever. User choice,
+  with a known cost: a cross-site iframe can POST before the recorder attaches (see
+  section 6), so a real application there may be refused and later sent again. A dry
+  run never has a POST (every submit is blocked), so it keeps only the form check.
 
 ### 5.4 Trackers and duplicates
 `applied.jsonl` and `attempted.jsonl` are append-only JSONL with `flock`. `check_applied`
@@ -299,8 +304,8 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   see 5.3b). A POST from a cross-site iframe (a different host, so Chrome runs it in another process; how a company site
   embeds Greenhouse) is not captured at all: probe on 2026-10-30, the iframe server got
   2 POSTs and the recorder 0; with a same-site iframe it got both. Requests an iframe
-  sends before its session is enabled are still missed, so `mark_applied` must not
-  require a captured POST. A single-threaded `HTTPServer` stalled the iframe load by
+  sends before its session is enabled are still missed. Despite that, since 2026-11-16
+  `mark_applied` requires a captured POST in real runs (user choice, see 5.3b). A single-threaded `HTTPServer` stalled the iframe load by
   40 s in a test (Chrome keeps a preconnect socket open); use `ThreadingHTTPServer`.
 - For a form submit (`type: Document`) CDP's `documentURL` is the POST target, not the
   page with the form; `FrameUrls` keeps each frame's URL from `Page.frameNavigated` for
