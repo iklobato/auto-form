@@ -215,6 +215,18 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   that for only 2 others (32, 31), about 15 of 1784 steps. `remote_game_jobs`
   (158 steps) kept opening new pages and uploaded 3 times; it was not a loop.
 
+### 5.10 Passwords only go into password fields (2026-11-16)
+- Every portal gets `<portal_password>` (and the LinkedIn SSO pair when set) as
+  browser_use `sensitive_data`; browser_use swaps `<secret><name></secret>` for the
+  real value when it types. On 2026-11-16 the agent typed the LinkedIn and portal
+  password placeholders into an Ashby application form (remote_game_jobs); on
+  2026-11-15 also into a Greenhouse form (dataaxy) and a hackajob form. All were dry
+  runs, nothing was sent; the screenshots of those steps were deleted.
+- `GuardedStep` wraps `StepCallback.on_step` as the browser_use step hook and runs
+  `SecretFieldGuard` first, outside the callback try/except: an `input` whose text
+  holds a password placeholder runs only when the target element has
+  `type="password"`; otherwise the action is dropped and the agent gets a note.
+
 ## 6. Things learned (read before debugging)
 
 - **Obscura (2026-11-15) cannot be the browser here**: 0.2.7 sends a multipart form as

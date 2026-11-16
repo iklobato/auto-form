@@ -1855,6 +1855,78 @@ class InputClearer:
             self._plog.info("input index %s: clear=False changed to True", params.index)
 
 
+class SecretFieldGuard:
+    """Drops typing a password placeholder into anything but a password field.
+
+    browser_use swaps `<secret><name></secret>` for the real value when it types,
+    and every portal gets the portal and LinkedIn passwords as secrets. On
+    2026-11-16 the agent typed both placeholders into an Ashby application form
+    (remote_game_jobs); on 2026-11-15 one went into a Greenhouse form (dataaxy) and
+    a hackajob form. A real run would send them to the employer.
+    """
+
+    PASSWORD_SECRETS = ("portal_password", "linkedin_sso_password")
+    PASSWORD_TYPE = "password"
+    WAIT = {"wait": {"seconds": 1}}
+    NOTE = (
+        "<sys>Your input at index {index} was not run: a password may only go into "
+        "a password field on a login or sign-up form, never into an application "
+        "field.</sys>"
+    )
+
+    def __init__(self, plog: logging.Logger) -> None:
+        self._plog = plog
+
+    def apply(self, browser_state: object, actions: list, agent: Agent) -> None:
+        fields = self._fields(browser_state)
+        dropped = [action for action in actions if self._leaks(action, fields)]
+        if not dropped:
+            return
+        # browser_use skips counting a step with no actions, so keep one harmless action
+        filler = type(actions[0]).model_validate(self.WAIT)
+        actions[:] = [action for action in actions if action not in dropped] or [filler]
+        history = agent._message_manager.state.agent_history_items
+        for action in dropped:
+            index = action.model_dump(exclude_none=True)["input"].get("index")
+            history.append(HistoryItem(system_message=self.NOTE.format(index=index)))
+            self._plog.warning(
+                "password typed outside a password field: dropped (index %s)", index
+            )
+
+    def _fields(self, browser_state: object) -> dict:
+        dom_state = getattr(browser_state, "dom_state", None)
+        return getattr(dom_state, "selector_map", None) or {}
+
+    def _leaks(self, action: object, fields: dict) -> bool:
+        params = action.model_dump(exclude_none=True).get("input")
+        text = (params or {}).get("text", "")
+        if not any(secret in text for secret in self.PASSWORD_SECRETS):
+            return False
+        node = fields.get(params.get("index"))
+        attributes = getattr(node, "attributes", None) or {}
+        return attributes.get("type", "").lower() != self.PASSWORD_TYPE
+
+
+class GuardedStep:
+    """The step hook browser_use calls: the password check, then StepCallback.
+
+    The check runs outside StepCallback's try/except on purpose: if it fails, the
+    exception makes browser_use drop the step's actions instead of running them.
+    """
+
+    def __init__(self, guard: SecretFieldGuard, callback: "StepCallback") -> None:
+        self.guard = guard
+        self.callback = callback
+
+    async def on_step(
+        self, browser_state: object, agent_output: object, step_num: int
+    ) -> None:
+        actions = getattr(agent_output, "action", None)
+        if actions and self.callback.agent_ref is not None:
+            self.guard.apply(browser_state, actions, self.callback.agent_ref)
+        await self.callback.on_step(browser_state, agent_output, step_num)
+
+
 class LoneDone:
     """Tells the agent that its `done` was not run because other actions came first.
 
@@ -3010,7 +3082,9 @@ class PortalRunner:
             max_failures=self.MAX_FAILURES,
             max_actions_per_step=self.opts.max_actions,
             flash_mode=self.opts.fast,
-            register_new_step_callback=callback.on_step,
+            register_new_step_callback=GuardedStep(
+                SecretFieldGuard(self.plog), callback
+            ).on_step,
         )
         callback.agent_ref = agent  # lets callbacks attach the recorders
         self._network_recorder = network_recorder
