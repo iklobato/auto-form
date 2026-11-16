@@ -64,7 +64,9 @@ class TestRender:
 
     def test_eeo_answers_are_rendered(self, writer: ProfileWriter) -> None:
         path = writer.write({"eeo": {"veteran": "I am not a veteran"}})
-        assert "| Veteran status | I am not a veteran |" in ProfileFile(path).knowledge()
+        assert (
+            "| Veteran status | I am not a veteran |" in ProfileFile(path).knowledge()
+        )
 
     def test_work_history_and_cover_letters_are_rendered(
         self, writer: ProfileWriter
@@ -77,6 +79,8 @@ class TestRender:
 class TestFieldValues:
     # The values the per field check compares typed text against.
     def test_fixed_fields_are_exposed_by_key(self, writer: ProfileWriter) -> None:
-        path = writer.write({"identity": {"email": "ada@mail.io"}, "eeo": {"gender": "Female"}})
+        path = writer.write(
+            {"identity": {"email": "ada@mail.io"}, "eeo": {"gender": "Female"}}
+        )
         values = ProfileFile(path).load().field_values()
         assert (values["email"], values["gender"]) == ("ada@mail.io", "Female")
