@@ -200,6 +200,13 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   `run_done.outcomes` maps portal to outcome.
 - Replay of the 2026-11-15 run: 17 `form_filled`, 8 `login_wall`, 45 `unknown`
   (`blocked` cannot be replayed from the log, it cuts URLs at 60 chars).
+- `mark_applied` is refused (`mark_applied_refused` event, nothing recorded, dry run
+  or not) unless the current job has an upload or 3+ form actions outside auth pages,
+  or its page sent a POST to its own host (one-click apply, same rule as
+  `UnmarkedSubmits`). The job counts reset on `check_applied`, `mark_applied` and
+  `mark_attempted`. The refusal reply closes the job so the agent moves on; it does not
+  ask for `mark_attempted`, because an attempted URL is skipped forever (5.4) and a
+  login-walled job must stay open for a later logged-in run.
 
 ## 6. Things learned (read before debugging)
 

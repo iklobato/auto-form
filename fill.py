@@ -366,7 +366,8 @@ class TaskBuilder:
         "Any submit is blocked by the browser and will fail. A file upload can fail "
         "the same way: that is expected, do not report it as an error and do not "
         "retry it. When a form is filled, call mark_applied for it (nothing is "
-        "recorded in a dry run) and move on."
+        "recorded in a dry run) and move on. If you could not reach or fill a form, "
+        "do not call mark_applied: move on to the next listing."
     )
 
     def __init__(
@@ -1447,14 +1448,28 @@ class PortalFacts:
         self.auth_steps = 0
         self.pages: set[str] = set()
         self.error_pages: set[str] = set()
+        # Same counts for the current job only; AgentActions resets them per job
+        self.job_form_actions = 0
+        self.job_uploads = 0
 
     def observe_step(self, url: str, actions: list[str]) -> None:
         self.pages.add(url)
-        self.uploads += actions.count(self.UPLOAD_ACTION)
+        uploads = actions.count(self.UPLOAD_ACTION)
+        self.uploads += uploads
+        self.job_uploads += uploads
         if self._is_auth_page(url):
             self.auth_steps += 1
             return
-        self.form_actions += sum(1 for name in actions if name in self.FORM_ACTIONS)
+        form_actions = sum(1 for name in actions if name in self.FORM_ACTIONS)
+        self.form_actions += form_actions
+        self.job_form_actions += form_actions
+
+    def start_job(self) -> None:
+        self.job_form_actions = 0
+        self.job_uploads = 0
+
+    def job_has_form(self) -> bool:
+        return bool(self.job_uploads) or self.job_form_actions >= self.FORM_MIN_ACTIONS
 
     def observe_response(self, url: str, status: int) -> None:
         if status in self.BLOCKED_STATUSES:
@@ -2217,6 +2232,15 @@ class AgentActions:
 
     # check_applied calls per URL in one session; the next call gets loop_detected
     SESSION_VISIT_LIMIT = 2
+    # Says the job is closed, so the agent moves on instead of calling it again
+    # (a bare "not recorded" reply made it loop on mark_applied on 2026-10-26).
+    NO_FORM_REPLY = (
+        "Not counted: no application form was filled for this job (no field typed "
+        "outside a sign-up or login page, no file uploaded, no form sent). Do not "
+        "call mark_applied again for it. If it needs a login, a sign-up or a paid "
+        "plan, or Apply leads nowhere, move on to the next listing, or call done if "
+        "there is none."
+    )
 
     def __init__(
         self,
@@ -2230,10 +2254,12 @@ class AgentActions:
         recorder: ApplicationRecorder,
         app_logger: AppLogger,
         network_recorder: "NetworkRecorder | None" = None,
+        facts: PortalFacts | None = None,
     ):
         self.agent = agent
         self.portal_name = portal_name
         self.dry_run = dry_run
+        self.facts = facts
         self.yaml_store = yaml_store
         self.applied = applied
         self.attempted = attempted
@@ -2251,12 +2277,35 @@ class AgentActions:
 
     async def finish_job(self) -> None:
         """Close the current job: record an unmarked submit, then forget its POSTs."""
+        self._start_job()
         if self.network_recorder is None:
             return
         if not self.dry_run:
             unmarked = UnmarkedSubmits(self.portal_name, self.attempted, self.plog)
             await unmarked.record(self.network_recorder.recent)
         self.network_recorder.start_job()
+
+    def _start_job(self) -> None:
+        if self.facts is not None:
+            self.facts.start_job()
+
+    def _job_has_form(self) -> bool:
+        """A form was filled for this job, or its page sent a form (one-click apply)."""
+        if self.facts is None or self.facts.job_has_form():
+            return True
+        posts = self.network_recorder.recent if self.network_recorder else []
+        unmarked = UnmarkedSubmits(self.portal_name, self.attempted, self.plog)
+        return bool(unmarked.pages(posts))
+
+    def _refuse_without_form(self, job_url: str, job_title: str) -> ActionResult:
+        self.plog.warning("mark_applied refused, no form filled: %s", job_title)
+        self.app_logger.emit(
+            "mark_applied_refused",
+            portal=self.portal_name,
+            url=job_url,
+            title=job_title,
+        )
+        return ActionResult(extracted_content=self.NO_FORM_REPLY)
 
     def register_all(self) -> None:
         self._register_check_applied()
@@ -2355,6 +2404,11 @@ class AgentActions:
         )
         network_recorder = self.network_recorder
         checked_job = self._checked_job
+        job_has_form, refuse, start_job = (
+            self._job_has_form,
+            self._refuse_without_form,
+            self._start_job,
+        )
 
         @self.agent.tools.registry.action(
             "Record that an application was successfully submitted. "
@@ -2372,6 +2426,9 @@ class AgentActions:
             cover_letter_used: str = "",
             notes: str = "",
         ) -> ActionResult:
+            if not job_has_form():
+                return refuse(job_url, job_title)
+            start_job()
             if dry_run:
                 plog.info("DRY RUN — would mark applied: %s", job_title)
                 # "not recorded" read as a failure: the agent called this 7 times in
@@ -2442,6 +2499,7 @@ class AgentActions:
             self.dry_run,
         )
         network_recorder = self.network_recorder
+        start_job = self._start_job
 
         @self.agent.tools.registry.action(
             "Record that you ATTEMPTED to apply to a job but could not complete it. "
@@ -2454,6 +2512,7 @@ class AgentActions:
         async def mark_attempted(
             job_url: str, job_title: str, reason: str, notes: str = ""
         ) -> ActionResult:
+            start_job()
             # check_applied skips attempted URLs forever, so a dry run must not record one
             if dry_run:
                 plog.info(
@@ -2720,6 +2779,7 @@ class PortalRunner:
             recorder=self.recorder,
             app_logger=self.app_logger,
             network_recorder=self._network_recorder,
+            facts=self._facts,
         )
         actions.register_all()
         try:
