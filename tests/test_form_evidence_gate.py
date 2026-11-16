@@ -107,6 +107,25 @@ class TestRealRun:
         await tools.actions["mark_applied"](JOB, "Engineer")
         assert applied_tracker.load_keys() == {JOB}
 
+    # Local run 2026-11-16: job 202 was filled, never submitted, and marked applied.
+    async def test_a_filled_form_that_was_never_sent_is_refused(
+        self, gate: GateRun, applied_tracker: JsonlTracker
+    ) -> None:
+        tools = gate.start_real(MagicMock(recent=[]))
+        gate.facts.observe_step(JOB, list(FILLED_FORM))
+        reply = await tools.actions["mark_applied"](JOB, "Engineer")
+        assert applied_tracker.load_keys() == set()
+        assert reply.extracted_content.startswith("Not counted: the form was not sent")
+
+    async def test_a_filled_and_sent_form_is_recorded(
+        self, gate: GateRun, applied_tracker: JsonlTracker
+    ) -> None:
+        sent = {"url": JOB, "page_url": JOB, "resource_type": "Document"}
+        tools = gate.start_real(MagicMock(recent=[sent]))
+        gate.facts.observe_step(JOB, list(FILLED_FORM))
+        await tools.actions["mark_applied"](JOB, "Engineer")
+        assert applied_tracker.load_keys() == {JOB}
+
     # The form work of one job must not let the next job through.
     async def test_each_job_needs_its_own_form(
         self, gate: GateRun, applied_tracker: JsonlTracker

@@ -128,8 +128,13 @@ clear it, so `mark_applied` attaches only the current job's POSTs. Analytics hos
   that POSTed to its own host with no `mark_applied`/`mark_attempted` after it goes to
   `attempted.jsonl` with `reason: submitted_not_marked` (`UnmarkedSubmits`).
 - `mark_applied` stores `job_url` = the URL `check_applied` cleared and `apply_url` = the
-  agent's URL when different; `has_job` matches either. Its record has `submit_seen`
-  (False when no POST was captured for the job) and logs a warning; it is not refused.
+  agent's URL when different; `has_job` matches either. Its record has `submit_seen`.
+- Since 2026-11-16, in a real run `mark_applied` is REFUSED when no POST was captured
+  since the job started (`mark_applied_refused_unsent`): a local run marked a filled
+  but never sent form as applied, and that job would be skipped forever. User choice,
+  with a known cost: a cross-site iframe can POST before the recorder attaches (see
+  section 6), so a real application there may be refused and later sent again. A dry
+  run never has a POST (every submit is blocked), so it keeps only the form check.
 
 ### 5.4 Trackers and duplicates
 `applied.jsonl` and `attempted.jsonl` are append-only JSONL with `flock`. `check_applied`
@@ -215,6 +220,33 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   that for only 2 others (32, 31), about 15 of 1784 steps. `remote_game_jobs`
   (158 steps) kept opening new pages and uploaded 3 times; it was not a loop.
 
+### 5.10 Passwords only go into password fields (2026-11-16)
+- Every portal gets `<portal_password>` (and the LinkedIn SSO pair when set) as
+  browser_use `sensitive_data`; browser_use swaps `<secret><name></secret>` for the
+  real value when it types. On 2026-11-16 the agent typed the LinkedIn and portal
+  password placeholders into an Ashby application form (remote_game_jobs); on
+  2026-11-15 also into a Greenhouse form (dataaxy) and a hackajob form. All were dry
+  runs, nothing was sent; the screenshots of those steps were deleted.
+- `GuardedStep` wraps `StepCallback.on_step` as the browser_use step hook and runs
+  `SecretFieldGuard` first, outside the callback try/except: an `input` whose text
+  holds a password placeholder runs only when the target element has
+  `type="password"`; otherwise the action is dropped and the agent gets a note.
+- `GuardedStep` runs a tuple of checks (`PortalRunner._step_checks`): also
+  `ReservedEmailGuard` (drops an `input` with an email on example.com/.org/.net,
+  `.test`, `.invalid`, `.example`; the agent typed `<name>@example.com` on
+  2026-11-16) and, when a resume is configured, `ResumeReminder` (one note per page
+  that shows a `type="file"` field and had no `upload_file`; in a local run the agent
+  never uploaded, Chrome refused the submit with "Please select a file." and the agent
+  gave up).
+- `UnknownSecretGuard` drops an `input` with a `<secret>` tag that is not one of this
+  run's `sensitive_data` names: browser_use types unknown tags literally. rustjobs
+  typed `<secret>Henrique</secret>` and `<first_name>` tags on 2026-11-16.
+- `prompts/task.md` now says: never make up contact data, numbers or personal facts;
+  for EEO questions pick the option matching the profile even when the section says
+  voluntary. The user profile EEO header says "all voluntary, skip if field is
+  optional", and flash-lite answered "I prefer not to answer" for veteran and
+  disability where the profile answers both. Not measured yet after the change.
+
 ## 6. Things learned (read before debugging)
 
 - **Obscura (2026-11-15) cannot be the browser here**: 0.2.7 sends a multipart form as
@@ -272,8 +304,8 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   see 5.3b). A POST from a cross-site iframe (a different host, so Chrome runs it in another process; how a company site
   embeds Greenhouse) is not captured at all: probe on 2026-10-30, the iframe server got
   2 POSTs and the recorder 0; with a same-site iframe it got both. Requests an iframe
-  sends before its session is enabled are still missed, so `mark_applied` must not
-  require a captured POST. A single-threaded `HTTPServer` stalled the iframe load by
+  sends before its session is enabled are still missed. Despite that, since 2026-11-16
+  `mark_applied` requires a captured POST in real runs (user choice, see 5.3b). A single-threaded `HTTPServer` stalled the iframe load by
   40 s in a test (Chrome keeps a preconnect socket open); use `ThreadingHTTPServer`.
 - For a form submit (`type: Document`) CDP's `documentURL` is the POST target, not the
   page with the form; `FrameUrls` keeps each frame's URL from `Page.frameNavigated` for

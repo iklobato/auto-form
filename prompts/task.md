@@ -113,6 +113,13 @@ mark the application partial.
   from "Cover Letters" in my profile and trim to fit.
 - **Unknown/unusual fields**: answer honestly with the closest profile data. Never invent
   facts, never leave a required field blank.
+- **Never make up contact data, numbers or personal facts**: no email, phone, salary,
+  pronoun or date that is not in my profile. If the profile has no answer and the field
+  is optional, leave it empty.
+- **Demographic / EEO questions** (veteran, disability, gender, ethnicity, race): when
+  my profile gives an answer, pick the option that matches it, even if the section says
+  the questions are voluntary. Choose "prefer not to answer" only when that is the
+  answer in my profile.
 - **File uploads**: upload the resume PDF when prompted: {resume_line_inner}
 - **Multi-page forms**: fill all visible fields on each page, then click Next / Continue.
   Don't skip optional fields if you have a relevant answer.

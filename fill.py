@@ -1855,6 +1855,213 @@ class InputClearer:
             self._plog.info("input index %s: clear=False changed to True", params.index)
 
 
+class SecretFieldGuard:
+    """Drops typing a password placeholder into anything but a password field.
+
+    browser_use swaps `<secret><name></secret>` for the real value when it types,
+    and every portal gets the portal and LinkedIn passwords as secrets. On
+    2026-11-16 the agent typed both placeholders into an Ashby application form
+    (remote_game_jobs); on 2026-11-15 one went into a Greenhouse form (dataaxy) and
+    a hackajob form. A real run would send them to the employer.
+    """
+
+    PASSWORD_SECRETS = ("portal_password", "linkedin_sso_password")
+    PASSWORD_TYPE = "password"
+    WAIT = {"wait": {"seconds": 1}}
+    NOTE = (
+        "<sys>Your input at index {index} was not run: a password may only go into "
+        "a password field on a login or sign-up form, never into an application "
+        "field.</sys>"
+    )
+
+    def __init__(self, plog: logging.Logger) -> None:
+        self._plog = plog
+
+    def apply(self, browser_state: object, actions: list, agent: Agent) -> None:
+        fields = self._fields(browser_state)
+        dropped = [action for action in actions if self._leaks(action, fields)]
+        if not dropped:
+            return
+        # browser_use skips counting a step with no actions, so keep one harmless action
+        filler = type(actions[0]).model_validate(self.WAIT)
+        actions[:] = [action for action in actions if action not in dropped] or [filler]
+        history = agent._message_manager.state.agent_history_items
+        for action in dropped:
+            index = action.model_dump(exclude_none=True)["input"].get("index")
+            history.append(HistoryItem(system_message=self.NOTE.format(index=index)))
+            self._plog.warning(
+                "password typed outside a password field: dropped (index %s)", index
+            )
+
+    def _fields(self, browser_state: object) -> dict:
+        dom_state = getattr(browser_state, "dom_state", None)
+        return getattr(dom_state, "selector_map", None) or {}
+
+    def _leaks(self, action: object, fields: dict) -> bool:
+        params = action.model_dump(exclude_none=True).get("input")
+        text = (params or {}).get("text", "")
+        if not any(secret in text for secret in self.PASSWORD_SECRETS):
+            return False
+        node = fields.get(params.get("index"))
+        attributes = getattr(node, "attributes", None) or {}
+        return attributes.get("type", "").lower() != self.PASSWORD_TYPE
+
+
+class ReservedEmailGuard:
+    """Drops typing an email on a reserved test domain (example.com, .test, ...).
+
+    Those domains never receive mail (RFC 2606), so such an address is always made
+    up. On 2026-11-16 the agent typed `<name>@example.com` twice into an Ashby form.
+    """
+
+    RESERVED = re.compile(
+        r"@[\w.-]*\b(example\.(com|org|net)|[\w-]+\.(test|invalid|example))\b",
+        re.IGNORECASE,
+    )
+    WAIT = {"wait": {"seconds": 1}}
+    NOTE = (
+        "<sys>Your input at index {index} was not run: it held a made-up email. Use "
+        "only the email from my profile, never invent contact data.</sys>"
+    )
+
+    def __init__(self, plog: logging.Logger) -> None:
+        self._plog = plog
+
+    def apply(self, browser_state: object, actions: list, agent: Agent) -> None:
+        dropped = [action for action in actions if self._made_up(action)]
+        if not dropped:
+            return
+        filler = type(actions[0]).model_validate(self.WAIT)
+        actions[:] = [action for action in actions if action not in dropped] or [filler]
+        history = agent._message_manager.state.agent_history_items
+        for action in dropped:
+            index = action.model_dump(exclude_none=True)["input"].get("index")
+            history.append(HistoryItem(system_message=self.NOTE.format(index=index)))
+            text = action.model_dump(exclude_none=True)["input"].get("text", "")
+            domain = self.RESERVED.search(text).group(0)
+            self._plog.warning(
+                "made-up email typed: dropped (index %s, %s)", index, domain
+            )
+
+    def _made_up(self, action: object) -> bool:
+        params = action.model_dump(exclude_none=True).get("input") or {}
+        return bool(self.RESERVED.search(params.get("text", "")))
+
+
+class UnknownSecretGuard:
+    """Drops typing a `<secret>` tag that browser_use has no value for.
+
+    browser_use swaps only the placeholder names it was given; any other
+    `<secret>...</secret>` is typed into the page as is, tags included. On
+    2026-11-16 the agent typed `<secret>Henrique</secret>` and `<first_name>`
+    placeholders into a rustjobs form.
+    """
+
+    TAG = re.compile(r"<secret>(.*?)</secret>")
+    WAIT = {"wait": {"seconds": 1}}
+    NOTE = (
+        "<sys>Your input at index {index} was not run: <secret> tags work only for "
+        "{known}. For every other field type the plain value from my profile, with "
+        "no tags.</sys>"
+    )
+
+    def __init__(self, known: tuple[str, ...], plog: logging.Logger) -> None:
+        self._known = known
+        self._plog = plog
+
+    def apply(self, browser_state: object, actions: list, agent: Agent) -> None:
+        dropped = [action for action in actions if self._unknown(action)]
+        if not dropped:
+            return
+        filler = type(actions[0]).model_validate(self.WAIT)
+        actions[:] = [action for action in actions if action not in dropped] or [filler]
+        history = agent._message_manager.state.agent_history_items
+        known = ", ".join(self._known) or "nothing in this run"
+        for action in dropped:
+            index = action.model_dump(exclude_none=True)["input"].get("index")
+            note = self.NOTE.format(index=index, known=known)
+            history.append(HistoryItem(system_message=note))
+            self._plog.warning(
+                "unknown <secret> placeholder typed: dropped (index %s)", index
+            )
+
+    def _unknown(self, action: object) -> bool:
+        params = action.model_dump(exclude_none=True).get("input") or {}
+        names = self.TAG.findall(params.get("text", ""))
+        return any(name not in self._known for name in names)
+
+
+class ResumeReminder:
+    """Tells the agent once per page when a file field is there and no resume went in.
+
+    In a local run on 2026-11-16 the agent filled every field but never called
+    upload_file; Chrome refused the submit ("Please select a file.") and the agent
+    gave up after 6 clicks, since it does not read the browser's validation bubble.
+    """
+
+    UPLOAD_ACTION = "upload_file"
+    FILE_TYPE = "file"
+    NOTE = (
+        "<sys>This page has a file upload field and no file was uploaded here yet. "
+        "Upload my resume with upload_file, path {path}, before you submit.</sys>"
+    )
+
+    def __init__(self, resume_path: str, plog: logging.Logger) -> None:
+        self._resume_path = resume_path
+        self._plog = plog
+        # page url -> True once the resume went in or the agent was told
+        self._handled: dict[str, bool] = {}
+
+    def apply(self, browser_state: object, actions: list, agent: Agent) -> None:
+        url = getattr(browser_state, "url", "") or ""
+        if self._handled.get(url):
+            return
+        if any(
+            self.UPLOAD_ACTION in action.model_dump(exclude_none=True)
+            for action in actions
+        ):
+            self._handled[url] = True
+            return
+        if not self._has_file_field(browser_state):
+            return
+        self._handled[url] = True
+        history = agent._message_manager.state.agent_history_items
+        history.append(
+            HistoryItem(system_message=self.NOTE.format(path=self._resume_path))
+        )
+        self._plog.info("file field with no upload: reminded the agent")
+
+    def _has_file_field(self, browser_state: object) -> bool:
+        dom_state = getattr(browser_state, "dom_state", None)
+        fields = getattr(dom_state, "selector_map", None) or {}
+        return any(
+            (getattr(node, "attributes", None) or {}).get("type", "").lower()
+            == self.FILE_TYPE
+            for node in fields.values()
+        )
+
+
+class GuardedStep:
+    """The step hook browser_use calls: the step checks, then StepCallback.
+
+    The checks run outside StepCallback's try/except on purpose: if one fails, the
+    exception makes browser_use drop the step's actions instead of running them.
+    """
+
+    def __init__(self, checks: tuple, callback: "StepCallback") -> None:
+        self.checks = checks
+        self.callback = callback
+
+    async def on_step(
+        self, browser_state: object, agent_output: object, step_num: int
+    ) -> None:
+        actions = getattr(agent_output, "action", None)
+        if actions and self.callback.agent_ref is not None:
+            for check in self.checks:
+                check.apply(browser_state, actions, self.callback.agent_ref)
+        await self.callback.on_step(browser_state, agent_output, step_num)
+
+
 class LoneDone:
     """Tells the agent that its `done` was not run because other actions came first.
 
@@ -2276,6 +2483,12 @@ class AgentActions:
         "plan, or Apply leads nowhere, move on to the next listing, or call done if "
         "there is none."
     )
+    UNSENT_REPLY = (
+        "Not counted: the form was not sent (no request left the page since you "
+        "opened this job). Click the final submit button, wait for the confirmation "
+        "page, then call mark_applied. If the submit is refused, fix the field the "
+        "page points to."
+    )
     ALREADY_COUNTED_REPLY = (
         "Already counted: {title} was handled earlier in this run. Do not call "
         "mark_applied again for it. Move on to the next listing, or call done if "
@@ -2348,9 +2561,33 @@ class AgentActions:
             )
         if not self._job_has_form():
             return self._refuse_without_form(job_url, job_title)
+        if self._real_run_without_post():
+            return self._refuse_unsent(job_url, job_title)
         self._counted_jobs[key] = job_title
         self._start_job()
         return None
+
+    def _real_run_without_post(self) -> bool:
+        """No request left the page for this job, in a run where it could have.
+
+        A dry run blocks every submit, so it never has one. Since 2026-11-16 a real
+        run requires one: a local run marked a filled but never sent form as
+        applied, and such a job is skipped forever. Known cost (user choice): a
+        cross-site iframe can POST before the recorder sees it (2026-10-30 probe).
+        """
+        if self.dry_run or self.network_recorder is None:
+            return False
+        return not self.network_recorder.recent
+
+    def _refuse_unsent(self, job_url: str, job_title: str) -> ActionResult:
+        self.plog.warning("mark_applied refused, form not sent: %s", job_title)
+        self.app_logger.emit(
+            "mark_applied_refused_unsent",
+            portal=self.portal_name,
+            url=job_url,
+            title=job_title,
+        )
+        return ActionResult(extracted_content=self.UNSENT_REPLY)
 
     def _refuse_without_form(self, job_url: str, job_title: str) -> ActionResult:
         self.plog.warning("mark_applied refused, no form filled: %s", job_title)
@@ -2925,6 +3162,16 @@ class PortalRunner:
             pass  # alive, owned by another user
         return int(pid_text)
 
+    def _step_checks(self, uploads: list[str], secrets: dict[str, str]) -> tuple:
+        checks = (
+            SecretFieldGuard(self.plog),
+            ReservedEmailGuard(self.plog),
+            UnknownSecretGuard(tuple(secrets), self.plog),
+        )
+        if not uploads:
+            return checks
+        return (*checks, ResumeReminder(uploads[0], self.plog))
+
     def _build_agent(
         self, task: str, credentials: dict[str, str], *, proxy: Proxy | None = None
     ) -> Agent:
@@ -3010,7 +3257,9 @@ class PortalRunner:
             max_failures=self.MAX_FAILURES,
             max_actions_per_step=self.opts.max_actions,
             flash_mode=self.opts.fast,
-            register_new_step_callback=callback.on_step,
+            register_new_step_callback=GuardedStep(
+                self._step_checks(allowed_uploads, credentials), callback
+            ).on_step,
         )
         callback.agent_ref = agent  # lets callbacks attach the recorders
         self._network_recorder = network_recorder
