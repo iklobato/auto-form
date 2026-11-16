@@ -493,6 +493,27 @@ class TestSaveNote:
         assert "## Portal: acme" in text
         assert "Form has 3 pages" in text
 
+    # In Docker the notes go to /data/out/knowledge, which a fresh folder lacks.
+    async def test_creates_the_notes_folder(
+        self, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+    ) -> None:
+        fixture = request.getfixturevalue
+        monkeypatch.setattr(Paths, "NOTES", fixture("tmp_app_root") / "new" / "n.md")
+        AgentActions(
+            fixture("mock_agent"),
+            "acme",
+            dry_run=False,
+            yaml_store=None,
+            applied=fixture("applied_tracker"),
+            attempted=fixture("attempted_tracker"),
+            recorder=fixture("recorder"),
+            app_logger=fixture("mock_app_logger"),
+        ).register_all()
+
+        await fixture("fake_registry").actions["save_note"]("Form has 3 pages")
+
+        assert "Form has 3 pages" in Paths.NOTES.read_text()
+
 
 class TestSaveCredentials:
     @pytest.mark.asyncio

@@ -47,6 +47,21 @@ class TestProfileFlag:
             CLI._build_opts(args)
 
 
+class TestFreshDataFolder:
+    # First Docker run on 2026-11-16: /data/out did not exist yet and fill.py died
+    # with FileNotFoundError: '/data/out/logs' before reading anything.
+    def test_a_run_creates_the_missing_folders(self, tmp_path: Path) -> None:
+        out_dir = tmp_path / "new" / "out"
+        log = tmp_path / "run.txt"
+        command = (
+            f"cd {shlex.quote(str(REPO))} && AUTO_FORM_DATA={shlex.quote(str(out_dir))} "
+            f"{shlex.quote(sys.executable)} fill.py --list --systems portals/no-login.yaml"
+            f" > {shlex.quote(str(log))} 2>&1"
+        )
+        assert os.system(command) == 0, log.read_text()
+        assert (out_dir / "logs").is_dir()
+
+
 class TestDataFolder:
     # Paths are set when fill is imported, so this runs a fresh interpreter.
     def test_outputs_follow_auto_form_data(self, tmp_path: Path) -> None:

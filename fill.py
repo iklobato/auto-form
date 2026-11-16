@@ -139,13 +139,14 @@ class AppLogger:
 
     def __init__(self, run_id: str | None = None):
         self.run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
-        Paths.LOGS.mkdir(exist_ok=True)
         self.log_file = Paths.LOGS / f"{self.run_id}.log"
         self.events_file = Paths.LOGS / "events.jsonl"
         self._console = self._setup()
         self.main().info("Log file: %s", self.log_file)
 
     def _setup(self) -> logging.StreamHandler:
+        # A fresh Docker data folder has no logs/ (nor its parent) yet
+        Paths.LOGS.mkdir(parents=True, exist_ok=True)
         fmt = logging.Formatter(
             fmt="%(asctime)s [%(levelname)-8s] %(name)s — %(message)s",
             datefmt="%H:%M:%S",
@@ -3292,6 +3293,13 @@ class AgentActions:
             )
             return ActionResult(extracted_content=f"Screenshot saved: {path}")
 
+    @classmethod
+    def _append_note(cls, entry: str) -> None:
+        # A fresh Docker data folder has no knowledge/ yet
+        Paths.NOTES.parent.mkdir(parents=True, exist_ok=True)
+        with open(Paths.NOTES, "a") as notes:
+            notes.write(entry)
+
     def _register_note(self) -> None:
         portal, plog, app_logger = self.portal_name, self.plog, self.app_logger
         dry_run = self.dry_run  # knowledge/*.md is in every prompt, real runs too
@@ -3307,8 +3315,7 @@ class AgentActions:
             ts = time.strftime("%Y-%m-%d %H:%M")
             entry = f"\n## Portal: {portal} ({ts})\n{note.strip()}\n"
             async with AgentActions._notes_lock:
-                with open(Paths.NOTES, "a") as f:
-                    f.write(entry)
+                AgentActions._append_note(entry)
             plog.info("NOTE saved (%d chars): %s", len(note), note[:120])
             app_logger.emit("note", portal=portal, length=len(note), preview=note[:200])
             return ActionResult(extracted_content="Note saved.")
