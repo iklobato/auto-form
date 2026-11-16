@@ -6,8 +6,11 @@ Chrome through [browser_use](https://github.com/browser-use/browser-use), gives 
 site, pick matching roles, fill the apply form, upload your resume and submit. It
 records every application, every attempt it gave up on, and the requests it sent.
 
-> **A run without `--dry-run` sends real applications under your name.** Start with
-> `--dry-run` (section 4). It fills the forms but the browser blocks every submit.
+> **Only a run with `--send` sends real applications under your name.** Every other run
+> is a dry run: it fills the forms but the browser blocks every submit.
+
+Want to run it in Docker with a `profile.yaml` and your resume PDF? See
+[Docker](#docker) at the end.
 
 Working on the code (person or AI agent)? Read
 [docs/PROJECT_STATE.md](docs/PROJECT_STATE.md) first, then the latest file in
@@ -74,10 +77,10 @@ Some sites return HTTP 403 to a headless Chrome (We Work Remotely does). Leave
 
 ```bash
 # one site
-uv run python fill.py --system weworkremotely --model google/gemini-2.5-flash --max-actions 12
+uv run python fill.py --system weworkremotely --send --model google/gemini-2.5-flash --max-actions 12
 
 # every site in the file, 2 at a time, no window
-uv run python fill.py --all --workers 2 --headless --model google/gemini-2.5-flash --max-actions 12
+uv run python fill.py --all --send --workers 2 --headless --model google/gemini-2.5-flash --max-actions 12
 ```
 
 **Which model and `--max-actions`.** The defaults are `google/gemini-2.5-flash-lite` and
@@ -211,7 +214,9 @@ disability questions whose profile answers did not match the option text.
 --list                 list the sites and stop
 --summary              print applications per site from applications/ and stop
 --systems PATH         the site list (default systems.yaml)
---dry-run              fill forms, never submit (the browser blocks it)
+--send                 really submit applications (without it every run is a dry run)
+--dry-run              fill forms, never submit (the default; cannot go with --send)
+--profile PATH         read your data from a profile.yaml instead of knowledge/*.md
 --headless             no Chrome window (some sites answer 403)
 --workers N            sites at the same time with --all, 1 or more (default 5)
 --model ID             OpenRouter model id (default google/gemini-2.5-flash-lite)
@@ -256,6 +261,47 @@ browser_profiles/<site>/                   Chrome profile per site (cookies, log
 ```
 
 Everything above is git-ignored.
+
+## Docker
+
+The image runs headless Chromium on the 13 sites with no login that reached a form in
+the November 2026 dry runs (`portals/no-login.yaml`). Your data goes in one folder:
+
+```
+data/
+  profile.yaml   # your data, see profile.example.yaml (every field is checked)
+  resume.pdf     # the file uploaded to every form that asks for one
+```
+
+The image is on GitHub Container Registry for amd64 and arm64 (Apple Silicon included):
+
+```bash
+docker pull ghcr.io/iklobato/auto-form:0.1.0
+
+# dry run (default): fills forms, sends nothing
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN ghcr.io/iklobato/auto-form:0.1.0 --all
+
+# real applications under your name
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN ghcr.io/iklobato/auto-form:0.1.0 --all --send
+
+# your own site list, or one site
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN ghcr.io/iklobato/auto-form:0.1.0 --systems /data/sites.yaml --all
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN ghcr.io/iklobato/auto-form:0.1.0 --system golang_cafe
+```
+
+To build it yourself instead: `docker build -t auto-form .` and use `auto-form` as the
+image name.
+
+`OPENROUTER_TOKEN` is your own OpenRouter key; each run costs you LLM credit (about
+US$ 1 for the 13 sites with the default `google/gemini-2.5-flash-lite`, measured once).
+Output (trackers, screenshots, logs, the requests sent) goes to `data/out/`.
+
+What the run checks for you: a misspelled or missing field in `profile.yaml` stops it
+before any browser starts; a value typed into a fixed field (name, email, phone, links,
+gender, veteran, disability, ethnicity, salary, city, country) that is not the one in
+your profile is dropped and the agent is told the right one; passwords never go into a
+field that is not a password field; with `--send`, a job only counts as applied when
+the form was really sent.
 
 ## License
 

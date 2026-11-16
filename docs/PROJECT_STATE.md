@@ -247,6 +247,23 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   optional", and flash-lite answered "I prefer not to answer" for veteran and
   disability where the profile answers both. Not measured yet after the change.
 
+### 5.11 profile.yaml, --send and the data folder (2026-11-16)
+- `--profile profile.yaml` replaces `knowledge/*.md`: pydantic models (`Profile` and its
+  sections, `extra="forbid"`) validate it and `ProfileMarkdown` renders the same
+  "Form Quick-Reference" table and sections the prompt refers to. A bad file stops the
+  run with the field path (`identity.email: ...`). `profile.example.yaml` is made up.
+- A run is a dry run unless `--send` is given (`--dry-run` stays as an explicit alias;
+  both together are refused).
+- `AUTO_FORM_DATA` moves `knowledge/`, trackers, logs, screenshots, applications and
+  browser profiles to another folder; `prompts/` stays next to `fill.py`.
+- `FieldValueGuard` (in `GuardedStep`) drops an `input`/`select_dropdown` into a fixed
+  field (first/last name, email, phone, LinkedIn, GitHub, gender, veteran, disability,
+  ethnicity, salary, city, country) when the value is not the profile value, and tells
+  the agent the right one. The field is recognised from its accessible name, label,
+  name, id, placeholder, autocomplete or type. Yes/no/decline answers compare by
+  meaning; salary compares the numbers. Only active with `--profile`.
+- `portals/no-login.yaml`: the 13 no-login portals that reached a form on 2026-11-15/16.
+
 ## 6. Things learned (read before debugging)
 
 - **Obscura (2026-11-15) cannot be the browser here**: 0.2.7 sends a multipart form as

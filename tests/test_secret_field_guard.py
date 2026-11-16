@@ -114,6 +114,8 @@ class TestWiring:
 
         hook = agent_ctor.call_args.kwargs["register_new_step_callback"]
         assert isinstance(hook.__self__, GuardedStep)
+        check_types = {type(check).__name__ for check in hook.__self__.checks}
+        assert {"SecretFieldGuard", "FieldValueGuard"} <= check_types
 
     def _runner(self, request: pytest.FixtureRequest) -> PortalRunner:
         fixture = request.getfixturevalue

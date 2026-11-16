@@ -1,0 +1,157 @@
+# Portals with no login that reached an application form in the dry runs of
+# 2026-11-15 and 2026-11-16. Default list of the Docker image (--systems overrides).
+sources:
+- name: coding_job_board
+  url: https://www.codingjobboard.com/
+  search_url: https://www.codingjobboard.com/?remote=true
+  description: 'Coding Job Board aggregates programming jobs and supports a remote=true filter.
+
+    '
+  search_instructions: Browse all listed roles with the remote filter. Click each job post and verify
+    it is active before applying.
+  application_notes: 'Open original job posts and verify they are active before applying.
+
+    '
+- name: dataaxy
+  url: https://dataaxy.com/
+  search_url: https://dataaxy.com/
+  description: 'Dataaxy is a data-focused job board. Use query search for remote data jobs.
+
+    '
+  search_instructions: Browse all listed roles. Click each listing and verify external postings are still
+    active.
+  application_notes: 'Apply through employer links and verify external postings are still active.
+
+    '
+- name: golang_cafe
+  url: https://golang.cafe/
+  search_url: https://golang.cafe/
+  description: 'Golang Cafe is a Go job board. Use live search/filter controls rather than stale remote-specific
+    paths.
+
+    '
+  search_instructions: Open the homepage and browse all listed roles using the site's search and filter
+    controls. Click each job detail and apply through the employer link.
+  application_notes: 'Open the job detail and apply through the employer link.
+
+    '
+- name: justremote
+  url: https://justremote.co/
+  search_url: https://justremote.co/remote-developer-jobs
+  description: 'JustRemote is a remote-focused board with direct category pages for developer roles.
+
+    '
+  search_instructions: Browse all listed roles. Click each listing to view details and the apply link.
+  application_notes: 'Open the job detail and follow the external apply link. Some deeper discovery features
+    may be paid, so prioritize visible listings.
+
+    '
+- name: larajobs
+  url: https://larajobs.com/
+  search_url: https://larajobs.com/?remote=1
+  description: 'LaraJobs is a Laravel/PHP job board with a remote filter query.
+
+    '
+  search_instructions: Browse all listed roles with the remote filter. Open each detail and apply via
+    employer instructions.
+  application_notes: 'Open details and apply via employer instructions.
+
+    '
+- name: pyjobs
+  url: https://www.pyjobs.com/
+  search_url: https://www.pyjobs.com/
+  description: 'PyJobs is a Python-focused job board where q=remote can surface remote Python roles.
+
+    '
+  search_instructions: Browse all listed roles. Click each listing and follow the external apply path.
+  application_notes: 'Open details and follow the external apply path.
+
+    '
+- name: remote_game_jobs
+  url: https://remotegamejobs.com/
+  search_url: https://remotegamejobs.com/
+  description: 'Remote Game Jobs focuses on remote jobs in game development, including engineering and
+    programming roles.
+
+    '
+  search_instructions: Browse all listed roles. Click each listing and follow studio application instructions.
+  application_notes: 'Open the listing and follow studio application instructions. Portfolio links may
+    be requested.
+
+    '
+- name: remote_python
+  url: https://www.remotepython.com/
+  search_url: https://www.remotepython.com/
+  description: 'Remote Python is a niche board focused on Python remote roles.
+
+    '
+  search_instructions: Browse all visible listings. Follow the listed apply instructions or external employer
+    links.
+  application_notes: 'Follow the listed apply instructions or external employer links.
+
+    '
+- name: remote_rocketship
+  url: https://www.remoterocketship.com/
+  search_url: https://www.remoterocketship.com/jobs/python
+  description: 'Remote Rocketship is a remote job search engine with technology-specific pages such as
+    Python jobs.
+
+    '
+  search_instructions: Browse all listed roles or use the site's search. Click each job detail and follow
+    the external apply link.
+  application_notes: 'Open job details and follow external apply links. Validate the original employer
+    posting if the listing is aggregated.
+
+    '
+- name: rustjobs
+  url: https://rustjobs.dev/
+  search_url: https://rustjobs.dev/
+  description: 'Rust Jobs is a Rust-focused job board; use homepage controls to locate remote roles.
+
+    '
+  search_instructions: Browse all listed roles from the homepage. Apply through job detail links after
+    verifying the employer posting is active.
+  application_notes: 'Apply through job detail links after verifying the employer posting is active.
+
+    '
+- name: techtree
+  url: https://jobs.techtree.dev/
+  search_url: https://jobs.techtree.dev/
+  description: TechTree — remote engineering job board
+  filter_notes: 'Skip by title: Product Manager, Designer, Marketing, Sales, HR, Support, iOS, Android,
+    Mobile, Finance, Legal. Only open backend, software engineering, Python, data, DevOps, or AI/ML titles.
+
+    '
+  search_instructions: 'Browse all listed roles on the board. Use any keyword or filter controls to narrow
+    to "Python", "backend", or "engineer" if available. Click each listing to view the role detail and
+    follow the apply link.
+
+    '
+  application_notes: 'Open each listing and follow the employer''s application link. Confirm the role
+    is fully remote before applying.
+
+    '
+- name: trulyremote
+  url: https://www.trulyremote.co/
+  search_url: https://www.trulyremote.co/
+  description: 'TrulyRemote is a remote job board; use the homepage and live navigation instead of unverified
+    old category URLs.
+
+    '
+  search_instructions: Browse all listed roles using homepage navigation. Click each listing and follow
+    external apply links.
+  application_notes: 'Follow external apply links and verify the employer posting before submitting.
+
+    '
+- name: web3_career
+  url: https://web3.career/
+  search_url: https://web3.career/remote-jobs
+  description: 'Web3 Career has a direct remote-jobs page for blockchain and Web3 roles.
+
+    '
+  search_instructions: Browse all listed remote roles. Never provide private keys, seed phrases, or wallet
+    credentials. Apply only through normal career forms or business email.
+  application_notes: 'Never provide private keys, seed phrases, or wallet credentials. Apply only through
+    normal career forms or business email.
+
+    '
