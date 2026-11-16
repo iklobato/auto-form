@@ -1937,11 +1937,58 @@ class ReservedEmailGuard:
         for action in dropped:
             index = action.model_dump(exclude_none=True)["input"].get("index")
             history.append(HistoryItem(system_message=self.NOTE.format(index=index)))
-            self._plog.warning("made-up email typed: dropped (index %s)", index)
+            text = action.model_dump(exclude_none=True)["input"].get("text", "")
+            domain = self.RESERVED.search(text).group(0)
+            self._plog.warning(
+                "made-up email typed: dropped (index %s, %s)", index, domain
+            )
 
     def _made_up(self, action: object) -> bool:
         params = action.model_dump(exclude_none=True).get("input") or {}
         return bool(self.RESERVED.search(params.get("text", "")))
+
+
+class UnknownSecretGuard:
+    """Drops typing a `<secret>` tag that browser_use has no value for.
+
+    browser_use swaps only the placeholder names it was given; any other
+    `<secret>...</secret>` is typed into the page as is, tags included. On
+    2026-11-16 the agent typed `<secret>Henrique</secret>` and `<first_name>`
+    placeholders into a rustjobs form.
+    """
+
+    TAG = re.compile(r"<secret>(.*?)</secret>")
+    WAIT = {"wait": {"seconds": 1}}
+    NOTE = (
+        "<sys>Your input at index {index} was not run: <secret> tags work only for "
+        "{known}. For every other field type the plain value from my profile, with "
+        "no tags.</sys>"
+    )
+
+    def __init__(self, known: tuple[str, ...], plog: logging.Logger) -> None:
+        self._known = known
+        self._plog = plog
+
+    def apply(self, browser_state: object, actions: list, agent: Agent) -> None:
+        dropped = [action for action in actions if self._unknown(action)]
+        if not dropped:
+            return
+        filler = type(actions[0]).model_validate(self.WAIT)
+        actions[:] = [action for action in actions if action not in dropped] or [filler]
+        history = agent._message_manager.state.agent_history_items
+        known = ", ".join(self._known) or "nothing in this run"
+        for action in dropped:
+            index = action.model_dump(exclude_none=True)["input"].get("index")
+            note = self.NOTE.format(index=index, known=known)
+            history.append(HistoryItem(system_message=note))
+            self._plog.warning(
+                "unknown <secret> placeholder typed: dropped (index %s)", index
+            )
+
+    def _unknown(self, action: object) -> bool:
+        params = action.model_dump(exclude_none=True).get("input") or {}
+        names = self.TAG.findall(params.get("text", ""))
+        return any(name not in self._known for name in names)
 
 
 class ResumeReminder:
@@ -3085,8 +3132,12 @@ class PortalRunner:
             pass  # alive, owned by another user
         return int(pid_text)
 
-    def _step_checks(self, uploads: list[str]) -> tuple:
-        checks = (SecretFieldGuard(self.plog), ReservedEmailGuard(self.plog))
+    def _step_checks(self, uploads: list[str], secrets: dict[str, str]) -> tuple:
+        checks = (
+            SecretFieldGuard(self.plog),
+            ReservedEmailGuard(self.plog),
+            UnknownSecretGuard(tuple(secrets), self.plog),
+        )
         if not uploads:
             return checks
         return (*checks, ResumeReminder(uploads[0], self.plog))
@@ -3177,7 +3228,7 @@ class PortalRunner:
             max_actions_per_step=self.opts.max_actions,
             flash_mode=self.opts.fast,
             register_new_step_callback=GuardedStep(
-                self._step_checks(allowed_uploads), callback
+                self._step_checks(allowed_uploads, credentials), callback
             ).on_step,
         )
         callback.agent_ref = agent  # lets callbacks attach the recorders

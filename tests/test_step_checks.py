@@ -12,7 +12,13 @@ import pytest
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.tools.service import Tools
 
-from fill import GuardedStep, ReservedEmailGuard, ResumeReminder, StepCallback
+from fill import (
+    GuardedStep,
+    ReservedEmailGuard,
+    ResumeReminder,
+    StepCallback,
+    UnknownSecretGuard,
+)
 
 FORM = "https://jobs.example-ats.io/acme/101/apply"
 NEXT_FORM = "https://jobs.example-ats.io/acme/202/apply"
@@ -90,6 +96,37 @@ class TestReservedEmailGuard:
         "text", ["me@proton.me", "<secret><linkedin_sso_email></secret>", "example"]
     )
     async def test_other_text_runs(self, runner: StepRunner, text: str) -> None:
+        kept = await runner.step(FORM, (runner.typing(text),))
+        assert kept[0]["input"]["text"] == text
+
+
+class TestUnknownSecretGuard:
+    # rustjobs on 2026-11-16 typed `<secret>Henrique</secret>`; browser_use only swaps
+    # names it knows, so the tags would go into the form as text.
+    @pytest.fixture
+    def runner(self, mock_app_logger: MagicMock) -> StepRunner:
+        guard = UnknownSecretGuard(
+            ("<linkedin_sso_email>", "<portal_password>"),
+            mock_app_logger.portal("acme"),
+        )
+        return StepRunner.build((guard,), mock_app_logger)
+
+    @pytest.mark.parametrize(
+        "text", ["<secret>Henrique</secret>", "<secret><first_name></secret>"]
+    )
+    async def test_an_unknown_placeholder_is_dropped(
+        self, runner: StepRunner, text: str
+    ) -> None:
+        kept = await runner.step(FORM, (runner.typing(text), runner.CLICK))
+        assert kept == [runner.CLICK]
+        assert "plain value" in runner.notes()[0]
+
+    @pytest.mark.parametrize(
+        "text", ["<secret><linkedin_sso_email></secret>", "Henrique"]
+    )
+    async def test_a_known_placeholder_or_plain_text_runs(
+        self, runner: StepRunner, text: str
+    ) -> None:
         kept = await runner.step(FORM, (runner.typing(text),))
         assert kept[0]["input"]["text"] == text
 

@@ -233,6 +233,9 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
   that shows a `type="file"` field and had no `upload_file`; in a local run the agent
   never uploaded, Chrome refused the submit with "Please select a file." and the agent
   gave up).
+- `UnknownSecretGuard` drops an `input` with a `<secret>` tag that is not one of this
+  run's `sensitive_data` names: browser_use types unknown tags literally. rustjobs
+  typed `<secret>Henrique</secret>` and `<first_name>` tags on 2026-11-16.
 - `prompts/task.md` now says: never make up contact data, numbers or personal facts;
   for EEO questions pick the option matching the profile even when the section says
   voluntary. The user profile EEO header says "all voluntary, skip if field is
