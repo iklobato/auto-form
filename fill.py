@@ -2321,6 +2321,158 @@ class ResumeReminder:
         )
 
 
+class ValueMatch:
+    """Does a typed value say the same as the profile value? One rule per kind."""
+
+    DECLINE = re.compile(r"prefer not|decline|not to (say|answer|disclose)|don.?t wish")
+    NO = re.compile(r"\b(no|not)\b")
+    YES = re.compile(r"\byes\b")
+    CATEGORIES = ("decline", "no", "yes")
+    URL_PREFIX = re.compile(r"^(https?://)?(www\.)?")
+    NUMBER = re.compile(r"\d[\d,.]*")
+
+    def same(self, kind: str, typed: str, expected: str) -> bool:
+        return getattr(self, f"_{kind}")(
+            typed.strip().lower(), expected.strip().lower()
+        )
+
+    def _exact(self, typed: str, expected: str) -> bool:
+        return typed == expected
+
+    def _digits(self, typed: str, expected: str) -> bool:
+        typed_digits, expected_digits = re.sub(r"\D", "", typed), re.sub(
+            r"\D", "", expected
+        )
+        return bool(typed_digits) and (
+            typed_digits.endswith(expected_digits)
+            or expected_digits.endswith(typed_digits)
+        )
+
+    def _url(self, typed: str, expected: str) -> bool:
+        return self.URL_PREFIX.sub("", typed).rstrip("/") == self.URL_PREFIX.sub(
+            "", expected
+        ).rstrip("/")
+
+    def _contains(self, typed: str, expected: str) -> bool:
+        return typed in expected or expected in typed
+
+    def _choice(self, typed: str, expected: str) -> bool:
+        # "I prefer not to answer" holds "no" as text, so a yes/no/decline answer
+        # is compared by its meaning, never by substring
+        kinds = (self._category(typed), self._category(expected))
+        if set(kinds) & set(self.CATEGORIES):
+            return kinds[0] == kinds[1]
+        return self._contains(typed, expected)
+
+    def _numbers(self, typed: str, expected: str) -> bool:
+        allowed = {self._amount(num) for num in self.NUMBER.findall(expected)}
+        return {self._amount(num) for num in self.NUMBER.findall(typed)} <= allowed
+
+    def _category(self, text: str) -> str:
+        for name, pattern in (
+            ("decline", self.DECLINE),
+            ("no", self.NO),
+            ("yes", self.YES),
+        ):
+            if pattern.search(text):
+                return name
+        return text
+
+    def _amount(self, number: str) -> str:
+        return number.replace(",", "").removesuffix(".00").rstrip(".")
+
+
+class FieldValueGuard:
+    """Drops a value typed into a fixed field when it is not the profile.yaml value.
+
+    Fixed fields (name, email, phone, links, location, EEO, salary) have one right
+    answer in profile.yaml. On 2026-11-16 the agent still sent gender "Non-binary"
+    against "Prefer not to say", a salary in no profile row, and "prefer not to
+    answer" for veteran. The field is told apart by its label, name, placeholder,
+    id, autocomplete or type; free text fields are never checked.
+    """
+
+    # key, how to compare, pattern on the field description; first match wins
+    FIELDS = (
+        ("first_name", "exact", r"first.?name|given.?name"),
+        ("last_name", "exact", r"last.?name|surname|family.?name"),
+        ("email", "exact", r"e-?mail"),
+        ("phone", "digits", r"phone|mobile|\btel\b"),
+        ("linkedin", "url", r"linkedin"),
+        ("github", "url", r"github"),
+        ("gender", "choice", r"\bgender\b"),
+        ("veteran", "choice", r"veteran"),
+        ("disability", "choice", r"disab"),
+        ("ethnicity", "choice", r"ethnic|\brace\b"),
+        ("salary", "numbers", r"salary|compensation"),
+        ("city", "contains", r"\bcity\b"),
+        ("country", "contains", r"\bcountry\b"),
+    )
+    DESCRIBING = (
+        "label",
+        "name",
+        "id",
+        "placeholder",
+        "aria-label",
+        "autocomplete",
+        "type",
+    )
+    TYPED = ("input", "select_dropdown")
+    WAIT = {"wait": {"seconds": 1}}
+    NOTE = (
+        "<sys>Your {action} at index {index} was not run: this is the {key} field "
+        "and my profile says {expected}. Use that value.</sys>"
+    )
+
+    def __init__(self, profile: dict[str, str], plog: logging.Logger) -> None:
+        self._profile = profile
+        self._plog = plog
+
+    def apply(self, browser_state: object, actions: list, agent: Agent) -> None:
+        dom_state = getattr(browser_state, "dom_state", None)
+        fields = getattr(dom_state, "selector_map", None) or {}
+        notes = [(action, self._wrong(action, fields)) for action in actions]
+        dropped = [(action, why) for action, why in notes if why]
+        if not dropped:
+            return
+        filler = type(actions[0]).model_validate(self.WAIT)
+        kept = [action for action, why in notes if not why]
+        actions[:] = kept or [filler]
+        history = agent._message_manager.state.agent_history_items
+        for _, why in dropped:
+            history.append(HistoryItem(system_message=why))
+            self._plog.warning("value not from profile, dropped: %s", why)
+
+    def _wrong(self, action: object, fields: dict) -> str:
+        """The note for a wrong value in a fixed field, or "" to let it run."""
+        dumped = action.model_dump(exclude_none=True)
+        name = next((typed for typed in self.TYPED if typed in dumped), None)
+        params = dumped.get(name) or {}
+        typed = params.get("text", "")
+        key, kind = self._field(fields.get(params.get("index")))
+        expected = self._profile.get(key, "")
+        if not expected or not typed or "<secret>" in typed:
+            return ""
+        if ValueMatch().same(kind, typed, expected):
+            return ""
+        return self.NOTE.format(
+            action=name, index=params.get("index"), key=key, expected=expected
+        )
+
+    def _field(self, node: object) -> tuple[str, str]:
+        if node is None:
+            return "", "exact"
+        attributes = getattr(node, "attributes", None) or {}
+        label = getattr(getattr(node, "ax_node", None), "name", "") or ""
+        text = " ".join(
+            [label, *(attributes.get(attr, "") for attr in self.DESCRIBING)]
+        )
+        for key, kind, pattern in self.FIELDS:
+            if re.search(pattern, text, re.IGNORECASE):
+                return key, kind
+        return "", "exact"
+
+
 class GuardedStep:
     """The step hook browser_use calls: the step checks, then StepCallback.
 
@@ -3447,6 +3599,7 @@ class PortalRunner:
             SecretFieldGuard(self.plog),
             ReservedEmailGuard(self.plog),
             UnknownSecretGuard(tuple(secrets), self.plog),
+            FieldValueGuard(self.opts.profile_fields, self.plog),
         )
         if not uploads:
             return checks
