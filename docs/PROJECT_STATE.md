@@ -158,6 +158,14 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
 - `PortalRunner._clean_stale_locks` raises `ProfileInUse` if the profile's `SingletonLock`
   points at a live Chrome on this host; it only removes locks from dead or foreign pids.
   `Orchestrator` does not retry `ProfileInUse`.
+- `StartUrlProbe` sends one GET to `search_url` (else `url`) before any browser
+  starts. A 404/410, a timeout, a DNS or TLS error raises `PortalUnreachable`: no
+  Chrome, no LLM call, event `portal_unreachable`, not retried. 403, 429 and 5xx do
+  not skip (Cloudflare boards answer 403 and golang.cafe 429 to a plain GET, and the
+  browser still works there). Portals with `credentials` are not checked (a logged-out
+  GET can 404). It ignores `HTTP(S)_PROXY`, like Chrome. On 2026-11-15 it skipped 6 of
+  the 70 in `systems-all.yaml`: remote_co, jobgether, remotehub, remote_europe,
+  django_jobs, remote_jobs_club.
 - `ScrollLoopBrake` (called from `StepCallback`) adds a note to the agent history after
   every 3rd scroll-only step in a row (see section 6 for why it uses a private API).
 

@@ -2506,6 +2506,57 @@ class ProfileInUse(RuntimeError):
     """A live Chrome on this host already holds the portal's browser profile."""
 
 
+class PortalUnreachable(RuntimeError):
+    """The portal's start page is gone (404/410) or does not answer at all."""
+
+
+class StartUrlProbe:
+    """One GET on a portal's start page before a browser and the LLM are spent on it.
+
+    In the 70-portal dry run of 2026-11-15, 8 portals had a start page that was gone
+    or did not answer; the agent still spent up to 610 s on each to find that out.
+    Only a gone page or no answer skips: Cloudflare boards answer 403 and
+    golang.cafe / rustjobs.dev answered 429 to a plain GET, and the browser still
+    filled forms on the last two.
+    """
+
+    # Real board pages loaded in 1.1 to 8.2 s (docs/PROJECT_STATE.md section 8).
+    TIMEOUT_S = 15.0
+    GONE_STATUSES = frozenset({404, 410})
+    USER_AGENT = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+    )
+
+    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        self.transport = transport
+
+    async def check(self, system: dict) -> None:
+        # A start page behind a login can 404 to a logged-out GET (hackajob) and
+        # still work in the portal's logged-in browser profile.
+        if system.get("credentials"):
+            return
+        url = expand_env(system.get("search_url", "")) or expand_env(system["url"])
+        status = await self._status(url)
+        if status in self.GONE_STATUSES:
+            raise PortalUnreachable(f"{url}: HTTP {status}")
+
+    async def _status(self, url: str) -> int:
+        async with httpx.AsyncClient(
+            transport=self.transport,
+            timeout=self.TIMEOUT_S,
+            follow_redirects=True,
+            headers={"User-Agent": self.USER_AGENT},
+            # Chrome ignores HTTP(S)_PROXY; check the page by the same route it uses.
+            trust_env=False,
+        ) as client:
+            try:
+                response = await client.get(url)
+            except httpx.TransportError as exc:
+                raise PortalUnreachable(f"{url}: {type(exc).__name__}: {exc}") from exc
+        return response.status_code
+
+
 class PortalRunner:
     """Runs the apply flow for one portal end-to-end."""
 
@@ -2818,6 +2869,7 @@ class Orchestrator:
         recorder: ApplicationRecorder,
         app_logger: AppLogger,
         default_proxy_provider: ProxyProvider | None = None,
+        url_probe: StartUrlProbe | None = None,
     ):
         self.systems = systems
         self.knowledge = knowledge
@@ -2832,6 +2884,7 @@ class Orchestrator:
         self.recorder = recorder
         self.app_logger = app_logger
         self.default_proxy_provider = default_proxy_provider
+        self.url_probe = url_probe
         self.log = app_logger.main()
         self.active = self._select_active(systems)
         self.skipped_count = len(systems) - len(self.active)
@@ -2879,12 +2932,12 @@ class Orchestrator:
     async def _retry_failures(
         self, results: list[tuple[str, str | Exception]]
     ) -> list[tuple[str, str | Exception]]:
-        # A profile held by a live Chrome is still held 5 s later
+        # A profile held by a live Chrome is still held 5 s later, a gone page is still gone
         failed = {
             n
             for n, r in results
             if isinstance(r, Exception)
-            and not isinstance(r, ProfileInUse)
+            and not isinstance(r, (ProfileInUse, PortalUnreachable))
             and n not in self._crashed
         }
         if not failed:
@@ -2930,7 +2983,15 @@ class Orchestrator:
             name = system["name"]
             async with sem:
                 try:
-                    return (name, await self.make_runner(system).run())
+                    return (name, await self.run_portal(system))
+                except PortalUnreachable as exc:
+                    self.log.warning(
+                        "[%s] skipped: start page unreachable: %s", name, exc
+                    )
+                    self.app_logger.emit(
+                        "portal_unreachable", portal=name, error=str(exc)
+                    )
+                    return (name, exc)
                 except recoverable as exc:
                     self.log.error(
                         "[%s] failed (recoverable): %s: %s",
@@ -2978,6 +3039,11 @@ class Orchestrator:
             )
             results.append((name, result))
         return results
+
+    async def run_portal(self, system: dict) -> str:
+        if self.url_probe is not None:
+            await self.url_probe.check(system)
+        return await self.make_runner(system).run()
 
     def make_runner(self, system: dict) -> PortalRunner:
         return PortalRunner(
@@ -3267,7 +3333,7 @@ class CLI:
             log.error("[%s] URL not configured — set the env var in .env", system_name)
             raise SystemExit(1)
         orchestrator = CLI._orchestrator([system], 1, deps)
-        asyncio.run(orchestrator.make_runner(system).run())
+        asyncio.run(orchestrator.run_portal(system))
 
     @classmethod
     def _orchestrator(
@@ -3287,6 +3353,7 @@ class CLI:
             recorder=deps["recorder"],
             app_logger=deps["app_logger"],
             default_proxy_provider=deps["default_proxy_provider"],
+            url_probe=StartUrlProbe(),
         )
 
 
