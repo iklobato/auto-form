@@ -1446,14 +1446,15 @@ class PortalFacts:
         self.form_actions = 0
         self.uploads = 0
         self.auth_steps = 0
-        self.pages: set[str] = set()
-        self.error_pages: set[str] = set()
+        # url -> steps on it / last blocking status; dicts keep first-seen order
+        self.pages: dict[str, int] = {}
+        self.error_pages: dict[str, int] = {}
         # Same counts for the current job only; AgentActions resets them per job
         self.job_form_actions = 0
         self.job_uploads = 0
 
     def observe_step(self, url: str, actions: list[str]) -> None:
-        self.pages.add(url)
+        self.pages[url] = self.pages.get(url, 0) + 1
         uploads = actions.count(self.UPLOAD_ACTION)
         self.uploads += uploads
         self.job_uploads += uploads
@@ -1473,12 +1474,12 @@ class PortalFacts:
 
     def observe_response(self, url: str, status: int) -> None:
         if status in self.BLOCKED_STATUSES:
-            self.error_pages.add(url)
+            self.error_pages[url] = status
 
     def outcome(self) -> PortalOutcome:
         if self.uploads or self.form_actions >= self.FORM_MIN_ACTIONS:
             return PortalOutcome.FORM_FILLED
-        if self.error_pages & self.pages:
+        if self.error_pages.keys() & self.pages.keys():
             return PortalOutcome.BLOCKED
         if self.auth_steps:
             return PortalOutcome.LOGIN_WALL
@@ -1491,7 +1492,7 @@ class PortalFacts:
             "uploads": self.uploads,
             "auth_steps": self.auth_steps,
             "pages": len(self.pages),
-            "blocked_pages": len(self.error_pages & self.pages),
+            "blocked_pages": len(self.error_pages.keys() & self.pages.keys()),
         }
 
     def _is_auth_page(self, url: str) -> bool:
@@ -2275,6 +2276,11 @@ class AgentActions:
         "plan, or Apply leads nowhere, move on to the next listing, or call done if "
         "there is none."
     )
+    ALREADY_COUNTED_REPLY = (
+        "Already counted: {title} was handled earlier in this run. Do not call "
+        "mark_applied again for it. Move on to the next listing, or call done if "
+        "there is none."
+    )
 
     def __init__(
         self,
@@ -2308,6 +2314,8 @@ class AgentActions:
         # Listing URL that check_applied cleared last; mark_applied records it, since
         # the agent often passes the apply-form URL instead (a different key).
         self._checked_job: dict[str, str] = {}
+        # job_url_key -> title of each job mark_applied accepted in this session
+        self._counted_jobs: dict[str, str] = {}
 
     async def finish_job(self) -> None:
         """Close the current job: record an unmarked submit, then forget its POSTs."""
@@ -2330,6 +2338,19 @@ class AgentActions:
         posts = self.network_recorder.recent if self.network_recorder else []
         unmarked = UnmarkedSubmits(self.portal_name, self.attempted, self.plog)
         return bool(unmarked.pages(posts))
+
+    def _gate(self, job_url: str, job_title: str) -> ActionResult | None:
+        """The reply that refuses this mark_applied, or None to let it through."""
+        key = job_url_key(job_url)
+        if key in self._counted_jobs:
+            return ActionResult(
+                extracted_content=self.ALREADY_COUNTED_REPLY.format(title=job_title)
+            )
+        if not self._job_has_form():
+            return self._refuse_without_form(job_url, job_title)
+        self._counted_jobs[key] = job_title
+        self._start_job()
+        return None
 
     def _refuse_without_form(self, job_url: str, job_title: str) -> ActionResult:
         self.plog.warning("mark_applied refused, no form filled: %s", job_title)
@@ -2438,11 +2459,7 @@ class AgentActions:
         )
         network_recorder = self.network_recorder
         checked_job = self._checked_job
-        job_has_form, refuse, start_job = (
-            self._job_has_form,
-            self._refuse_without_form,
-            self._start_job,
-        )
+        gate = self._gate
 
         @self.agent.tools.registry.action(
             "Record that an application was successfully submitted. "
@@ -2460,9 +2477,9 @@ class AgentActions:
             cover_letter_used: str = "",
             notes: str = "",
         ) -> ActionResult:
-            if not job_has_form():
-                return refuse(job_url, job_title)
-            start_job()
+            refusal = gate(job_url, job_title)
+            if refusal is not None:
+                return refusal
             if dry_run:
                 plog.info("DRY RUN — would mark applied: %s", job_title)
                 # "not recorded" read as a failure: the agent called this 7 times in
@@ -2764,6 +2781,7 @@ class PortalRunner:
         recorder: ApplicationRecorder,
         app_logger: AppLogger,
         proxy_provider: ProxyProvider | None = None,
+        facts: PortalFacts,
     ):
         self.system = system
         self.name = system["name"]
@@ -2782,7 +2800,7 @@ class PortalRunner:
         self.plog = app_logger.portal(self.name)
         self._network_recorder: NetworkRecorder | None = None
         self._step_callback: StepCallback | None = None
-        self._facts = PortalFacts()
+        self._facts = facts
 
     async def run(self) -> PortalReport:
         mode = "DRY RUN" if self.opts.dry_run else "APPLY"
@@ -3258,6 +3276,7 @@ class Orchestrator:
             recorder=self.recorder,
             app_logger=self.app_logger,
             proxy_provider=self._proxy_providers[system["name"]],
+            facts=PortalFacts(),
         )
 
 

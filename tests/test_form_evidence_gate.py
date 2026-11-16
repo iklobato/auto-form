@@ -70,6 +70,15 @@ class TestDryRun:
         reply = await tools.actions["mark_applied"](JOB, "Engineer")
         assert reply.extracted_content.startswith("Done: Engineer counts as handled")
 
+    # golang_cafe on 2026-11-15: two more mark_applied on a job already counted got
+    # "no application form was filled", which is not what happened.
+    async def test_a_repeat_on_a_counted_job_says_so(self, gate: GateRun) -> None:
+        tools = gate.start_dry()
+        gate.facts.observe_step(JOB, list(FILLED_FORM))
+        await tools.actions["mark_applied"](JOB, "Engineer")
+        reply = await tools.actions["mark_applied"](JOB, "Engineer")
+        assert reply.extracted_content.startswith("Already counted: Engineer")
+
 
 class TestRealRun:
     async def test_no_form_writes_nothing(
