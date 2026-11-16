@@ -273,20 +273,20 @@ data/
   resume.pdf     # the file uploaded to every form that asks for one
 ```
 
-The image is on Docker Hub for amd64 and arm64 (Apple Silicon included):
+The image is on GitHub Container Registry for amd64 and arm64 (Apple Silicon included):
 
 ```bash
-docker pull iklobato/auto-form:0.1.0
+docker pull ghcr.io/iklobato/auto-form:0.1.0
 
 # dry run (default): fills forms, sends nothing
-docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN iklobato/auto-form:0.1.0 --all
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN ghcr.io/iklobato/auto-form:0.1.0 --all
 
 # real applications under your name
-docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN iklobato/auto-form:0.1.0 --all --send
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN ghcr.io/iklobato/auto-form:0.1.0 --all --send
 
 # your own site list, or one site
-docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN iklobato/auto-form:0.1.0 --systems /data/sites.yaml --all
-docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN iklobato/auto-form:0.1.0 --system golang_cafe
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN ghcr.io/iklobato/auto-form:0.1.0 --systems /data/sites.yaml --all
+docker run --rm -v "$PWD/data:/data" -e OPENROUTER_TOKEN ghcr.io/iklobato/auto-form:0.1.0 --system golang_cafe
 ```
 
 To build it yourself instead: `docker build -t auto-form .` and use `auto-form` as the

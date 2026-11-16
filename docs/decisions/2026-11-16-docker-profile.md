@@ -21,10 +21,10 @@ the same day (password guard, resume reminder, POST required for `mark_applied`,
 | 12 | Per field value check | Yes, for fixed fields only | Structured profile makes the check possible; stops the made-up gender and salary seen on 2026-11-16 | 2, 5 |
 | 13 | On a mismatch | Drop the input and tell the agent the profile value | Same pattern as the password and email guards | 12 |
 | 14 | Chromium user and sandbox | Non-root user, Chrome sandbox off | Common container setup; isolation comes from Docker; no extra `docker run` flags | 11 |
-| 15 | Distribution | ~~`docker build` from the repo, no registry~~ Changed the same day: Docker Hub `iklobato/auto-form` | Users should not need a local build | 1 |
+| 15 | Distribution | ~~`docker build` from the repo, no registry~~ Changed the same day: GHCR `ghcr.io/iklobato/auto-form` now, Docker Hub `iklobato/auto-form` once the owner creates the account and adds the secrets | Users should not need a local build; GHCR needs no new account | 1 |
 | 16 | Version | `v0.1.0`, image tags `0.1.0`, `0.1` and `latest` | First public version; the profile.yaml format may still change | 15 |
 | 17 | Platforms | `linux/amd64` and `linux/arm64` | Runs natively on Intel/AMD and Apple Silicon | 15 |
-| 18 | Release steps | PR and merge to `master`, git tag `v0.1.0`, GitHub Release, and a workflow that builds and pushes on every `v*.*.*` tag | Repeatable releases; needs repo secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` | 15 |
+| 18 | Release steps | PR and merge to `master`, git tag `v0.1.0`, GitHub Release, and a workflow that builds and pushes on every `v*.*.*` tag | Repeatable releases; GHCR uses the workflow token; Docker Hub is skipped until the repo secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` exist | 15 |
 
 ## Not decided / defaults taken without a question
 
