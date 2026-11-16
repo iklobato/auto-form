@@ -33,8 +33,9 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import ClassVar, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
@@ -76,10 +77,13 @@ class Paths:
 class RunOptions:
     """Per-run knobs passed from the CLI down to PortalRunner."""
 
+    # 5 left 10 of 14 fields empty in the 2026-10-30 local run; 12 filled them
+    DEFAULT_MAX_ACTIONS: ClassVar[int] = 12
+
     dry_run: bool = False
     headless: bool = False
     fast: bool = False
-    max_actions: int = 5
+    max_actions: int = DEFAULT_MAX_ACTIONS
     filter_keyword: str = ""
     note: str = ""
     resume_path: str = ""
@@ -1253,6 +1257,7 @@ class NetworkRecorder:
         "analytics.twitter.com",
         "t.co/i/adsctp",
         "px.ads.linkedin.com",
+        "linkedin.com/jobs-guest/api/ingraphs",
         "analytics.tiktok.com",
         "analytics-ipv6.tiktokw",
         "tiktokw.us",
@@ -1327,12 +1332,6 @@ class NetworkRecorder:
         add_cdp_handler(cdp_client, "Target.attachedToTarget", frames.on_attached)
 
     def _on_request(self, event: dict, session_id: str | None = None) -> None:
-        request_id = event.get("requestId", "")
-        if request_id and request_id in self._seen_request_ids:
-            return
-        if request_id:
-            self._seen_request_ids.add(request_id)
-
         req = event.get("request", {}) or {}
         method = req.get("method", "")
         url = req.get("url", "")
@@ -1340,6 +1339,12 @@ class NetworkRecorder:
             return
         if any(noise in url for noise in self.NOISE_FRAGMENTS):
             return
+        # Checked after the filters, so only recorded POSTs are kept for the run
+        request_id = event.get("requestId", "")
+        if request_id and request_id in self._seen_request_ids:
+            return
+        if request_id:
+            self._seen_request_ids.add(request_id)
         body = req.get("postData") or ""
         headers = req.get("headers") or {}
         capture = {
@@ -1412,7 +1417,7 @@ class CDPDebugger:
     """Subscribes to extra CDP event streams for debugging visibility:
 
     - Network.responseReceived — pair status codes with outgoing POSTs
-    - Network.loadingFailed    — network errors (DNS, CORS, ERR_CONNECTION)
+    - Network.loadingFailed/Finished — network errors; both end the request's entry
     - Page.frameNavigated      — every navigation, including silent redirects
     - Target.targetCreated     — every new tab/popup opened by the page
     - Runtime.exceptionThrown  — uncaught JavaScript errors
@@ -1438,8 +1443,7 @@ class CDPDebugger:
         self.events_file = Paths.APPLICATIONS / portal_name / "cdp.jsonl"
         self.events_file.parent.mkdir(parents=True, exist_ok=True)
         self._attached_session_ids: set[str] = set()
-        # Map requestId → (method, url) so responses can be paired with their POST
-        self._request_index: dict[str, tuple[str, str]] = {}
+        self._request_index: dict[str, tuple[str, str]] = {}  # id: (method, url)
 
     async def attach_if_needed(self, browser_session) -> None:
         if browser_session is None:
@@ -1458,11 +1462,11 @@ class CDPDebugger:
             params={"discover": True},
             session_id=sid,
         )
-
         for method, callback in (
             ("Network.requestWillBeSent", self._on_request_index),
             ("Network.responseReceived", self._on_response),
             ("Network.loadingFailed", self._on_loading_failed),
+            ("Network.loadingFinished", self._on_loading_finished),
             ("Page.frameNavigated", self._on_navigated),
             ("Target.targetCreated", self._on_target_created),
             ("Runtime.exceptionThrown", self._on_exception),
@@ -1472,8 +1476,6 @@ class CDPDebugger:
 
         self._attached_session_ids.add(sid)
         self.plog.debug("CDPDebugger attached to session %s", sid[:12])
-
-    # ── handlers ──────────────────────────────────────────────────────────
 
     def _is_noise(self, url: str) -> bool:
         return any(noise in url for noise in self.noise_fragments)
@@ -1514,9 +1516,12 @@ class CDPDebugger:
         else:
             self.plog.debug("HTTP %d %s %s", status, method, url[:80])
 
+    def _on_loading_finished(self, event: dict, session_id: str | None = None) -> None:
+        self._request_index.pop(event.get("requestId", ""), None)
+
     def _on_loading_failed(self, event: dict, session_id: str | None = None) -> None:
         rid = event.get("requestId", "")
-        method, url = self._request_index.get(rid, ("?", ""))
+        method, url = self._request_index.pop(rid, ("?", ""))
         if self._is_noise(url):
             return
         error = event.get("errorText", "")
@@ -1729,6 +1734,150 @@ class ScrollLoopBrake:
         )
 
 
+class InputClearer:
+    """Makes every `input` action replace the field instead of appending to it.
+
+    flash-lite sent `clear: False` when it typed into a field again, so phone,
+    LinkedIn and website went out twice in the 2026-10-30 local run. No form here
+    needs append, so the flag is forced on before browser_use runs the action.
+    """
+
+    ACTION = "input"
+
+    def __init__(self, plog: logging.Logger) -> None:
+        self._plog = plog
+
+    def apply(self, actions: Sequence) -> None:
+        for action in actions:
+            params = getattr(getattr(action, "root", action), self.ACTION, None)
+            if params is None or getattr(params, "clear", True):
+                continue
+            params.clear = True
+            self._plog.info("input index %s: clear=False changed to True", params.index)
+
+
+@dataclass(frozen=True)
+class KnownJobs:
+    """Pages that are jobs already applied to, or given up on by the agent."""
+
+    applied: JsonlTracker
+    attempted: JsonlTracker
+    # Never a job, even when recorded: 1 of 16 real attempts on 2026-11-15 named a
+    # portal start URL (captcha), and locking it would end every later run there
+    start_url: str
+
+    def holds(self, url: str) -> bool:
+        if not url or job_url_key(url) == job_url_key(self.start_url):
+            return False
+        if self.applied.has_job(url):
+            return True
+        # submitted_not_marked is a guess from any same-host POST and can name a
+        # listing (Ashby loads its board through same-host GraphQL POSTs)
+        wanted = job_url_key(url)
+        return any(
+            job_url_key(record[field]) == wanted
+            for record in self.attempted.records()
+            if record.get("reason") != UnmarkedSubmits.REASON
+            for field in JsonlTracker.JOB_URL_FIELDS
+            if record.get(field)
+        )
+
+
+class AppliedPageStop:
+    """Drops form actions on a job the trackers already hold.
+
+    check_applied is the agent's own duplicate check, and an agent that skips it
+    can fill and send the same job again (flash-lite did on 2026-10-30). Navigation
+    and the custom tools still run, so the agent can leave the page.
+    """
+
+    # evaluate runs page JavaScript, which can submit the form too
+    PAGE_ACTIONS = frozenset(
+        {"click", "input", "upload_file", "send_keys", "select_dropdown", "evaluate"}
+    )
+    NOTE = (
+        "<sys>{url} is already in the applied or attempted list. Do not fill or "
+        "submit it again: go back and open the next listing.</sys>"
+    )
+    GO_BACK = {"go_back": {}}
+
+    def __init__(self, known: KnownJobs, plog: logging.Logger) -> None:
+        self._known = known
+        self._plog = plog
+
+    def apply(self, url: str, actions: list, agent: Agent) -> None:
+        if not self._known.holds(url):
+            return
+        kept = [action for action in actions if not self._touches_page(action)]
+        if len(kept) == len(actions):
+            return
+        # browser_use skips counting a step with no actions, so the step number
+        # would repeat; going back is also what the note tells the agent to do
+        actions[:] = kept or [type(actions[0]).model_validate(self.GO_BACK)]
+        history = agent._message_manager.state.agent_history_items
+        history.append(HistoryItem(system_message=self.NOTE.format(url=url)))
+        self._plog.warning("already applied to %s: form actions dropped", url)
+
+    def _touches_page(self, action: object) -> bool:
+        return bool(self.PAGE_ACTIONS & action.model_dump(exclude_none=True).keys())
+
+
+class ShotPhase(StrEnum):
+    BEFORE = "before"  # the page the LLM saw when it chose the step's actions
+    AFTER = "after"  # the page once those actions ran
+
+
+class EmptyScreenshot(RuntimeError):
+    """The browser answered a screenshot request without image data."""
+
+
+class StepShots:
+    """One agent's step screenshots, in screenshots/<portal>/<run_id>/.
+
+    A portal retried in the same run gets a new agent whose steps start at 1 again,
+    so it writes to <run_id>-2 instead of overwriting the first attempt.
+    """
+
+    # browser_use gives its own screenshot 6 s; captures here took 0.10 to 0.13 s
+    TIMEOUT_S = 6.0
+
+    def __init__(self, base: Path) -> None:
+        self._base = base
+        self._folder: Path | None = None
+
+    async def capture(self, session: BrowserSession) -> bytes:
+        """PNG of the current page, or TimeoutError after TIMEOUT_S.
+
+        Not BrowserSession.take_screenshot: it has no time limit (on_step_end runs
+        outside browser_use's step timeout) and raises a bare Exception on no data.
+        """
+        return await asyncio.wait_for(self._capture(session), self.TIMEOUT_S)
+
+    async def _capture(self, session: BrowserSession) -> bytes:
+        cdp = await session.get_or_create_cdp_session()
+        reply = await cdp.cdp_client.send.Page.captureScreenshot(
+            params={"format": "png"}, session_id=cdp.session_id
+        )
+        if not reply.get("data"):
+            raise EmptyScreenshot("the browser returned no screenshot data")
+        return base64.b64decode(reply["data"])
+
+    def save(self, step_num: int, phase: ShotPhase, png: bytes) -> Path:
+        path = self._resolve_folder() / f"step{step_num:04d}_{phase}.png"
+        path.write_bytes(png)
+        return path
+
+    def _resolve_folder(self) -> Path:
+        if self._folder is None:
+            folder, attempt = self._base, 1
+            while folder.exists():
+                attempt += 1
+                folder = self._base.with_name(f"{self._base.name}-{attempt}")
+            folder.mkdir(parents=True)
+            self._folder = folder
+        return self._folder
+
+
 # ── Per-step callback ─────────────────────────────────────────────────────────
 
 
@@ -1741,6 +1890,11 @@ class StepCallback:
               elapsed since previous step
     """
 
+    # Instance values replace these: the previous step's time, and the agent,
+    # which PortalRunner sets after building it
+    _last_step_at: float | None = None
+    agent_ref: Agent | None = None
+
     def __init__(
         self,
         portal_name: str,
@@ -1749,18 +1903,18 @@ class StepCallback:
         cdp_debugger: "CDPDebugger | None" = None,
         dry_run_guard: DryRunGuard | None = None,
         scroll_brake: ScrollLoopBrake | None = None,
+        shots: StepShots | None = None,
+        applied_stop: AppliedPageStop | None = None,
     ):
         self.dry_run_guard = dry_run_guard
         self.scroll_brake = scroll_brake
         self.portal_name = portal_name
         self.app_logger = app_logger
         self.plog = app_logger.portal(portal_name)
-        self.shot_dir = Paths.SCREENSHOTS / portal_name
-        self.shot_dir.mkdir(parents=True, exist_ok=True)
-        self._last_step_at: float | None = None
+        self.shots = shots
+        self.applied_stop = applied_stop
         self.network_recorder = network_recorder
         self.cdp_debugger = cdp_debugger
-        self.agent_ref = None  # set by PortalRunner after agent build
 
     async def on_step(self, browser_state, agent_output, step_num: int) -> None:
         # browser_use runs this hook between the LLM reply and executing its actions,
@@ -1772,22 +1926,44 @@ class StepCallback:
             session = getattr(self.agent_ref, "browser_session", None)
             await self.dry_run_guard.attach_if_needed(session)
         try:
+            actions = getattr(agent_output, "action", None)
+            if self.applied_stop and self.agent_ref and actions:
+                url = getattr(browser_state, "url", "") or ""
+                self.applied_stop.apply(url, actions, self.agent_ref)
             await self._record_step(browser_state, agent_output, step_num)
         except Exception as exc:
-            self.plog.warning(
-                "step %04d: step callback failed, agent continues: %s: %s",
-                step_num,
-                type(exc).__name__,
-                exc,
-                exc_info=True,
+            self._report_failure(step_num, exc)
+
+    async def on_step_end(self, agent: Agent) -> None:
+        """browser_use hook after a step's actions ran: saves the page as it is now."""
+        step_num = agent.state.n_steps - 1  # browser_use counts the step as done
+        session = agent.browser_session
+        if self.shots is None or session is None:
+            return
+        try:
+            path = self.shots.save(
+                step_num, ShotPhase.AFTER, await self.shots.capture(session)
             )
-            self.app_logger.emit(
-                "step_callback_error",
-                portal=self.portal_name,
-                step=step_num,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
+            self.plog.debug("  screenshot  : %s", path.name)
+        except (TimeoutError, RuntimeError, OSError, ValueError) as exc:
+            # CDP error or no reply, disk, no focused page or bad base64
+            self._report_failure(step_num, exc)
+
+    def _report_failure(self, step_num: int, exc: Exception) -> None:
+        self.plog.warning(
+            "step %04d: step callback failed, agent continues: %s: %s",
+            step_num,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        self.app_logger.emit(
+            "step_callback_error",
+            portal=self.portal_name,
+            step=step_num,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
 
     async def _record_step(self, browser_state, agent_output, step_num: int) -> None:
         # Lazy CDP attach — runs once on first step when browser_session exists
@@ -1806,8 +1982,9 @@ class StepCallback:
         next_goal = getattr(agent_output, "next_goal", None) or ""
         eval_prev = getattr(agent_output, "evaluation_previous_goal", None) or ""
         memory = getattr(agent_output, "memory", None) or ""
-        actions = self._extract_action_names(agent_output)
+        InputClearer(self.plog).apply(getattr(agent_output, "action", None) or [])
         action_details = self._extract_action_details(agent_output)
+        actions = [name for name, _ in action_details]
         if self.scroll_brake:
             self.scroll_brake.observe(actions, self.agent_ref)
 
@@ -1836,10 +2013,9 @@ class StepCallback:
             self.plog.debug("  memory      : %s", memory[:200])
 
         screenshot_path = None
-        if browser_state.screenshot:
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            screenshot_path = self.shot_dir / f"step{step_num:04d}_{ts}.png"
-            screenshot_path.write_bytes(base64.b64decode(browser_state.screenshot))
+        if self.shots and browser_state.screenshot:
+            png = base64.b64decode(browser_state.screenshot)
+            screenshot_path = self.shots.save(step_num, ShotPhase.BEFORE, png)
             self.plog.debug("  screenshot  : %s", screenshot_path.name)
 
         self.app_logger.emit(
@@ -1858,16 +2034,6 @@ class StepCallback:
             elapsed_s=round(elapsed, 2) if elapsed else None,
             screenshot=screenshot_path.name if screenshot_path else None,
         )
-
-    @staticmethod
-    def _extract_action_names(agent_output) -> list[str]:
-        names: list[str] = []
-        for act in getattr(agent_output, "action", []) or []:
-            if hasattr(act, "model_dump"):
-                names.extend(act.model_dump(exclude_none=True).keys())
-            elif isinstance(act, dict):
-                names.extend(k for k, v in act.items() if v is not None)
-        return names
 
     @staticmethod
     def _extract_action_details(agent_output) -> list[tuple[str, dict]]:
@@ -2318,6 +2484,16 @@ class AgentActions:
 # ── Per-portal runner ─────────────────────────────────────────────────────────
 
 
+class PortalInterrupted(RuntimeError):
+    """browser_use cancelled the portal's work from inside, not a cancel of the run.
+
+    bubus raises CancelledError out of Agent.run when one of its handlers times out:
+    on 2026-11-15 Chrome took over 30 s to start with 5 workers. CancelledError is
+    not an Exception, so it skipped the Orchestrator's handlers and stopped the
+    whole batch after 7 of 70 portals. As a RuntimeError it is retried once.
+    """
+
+
 class AgentStoppedEarly(RuntimeError):
     """The agent hit max_steps or max_failures without calling `done`.
 
@@ -2328,6 +2504,57 @@ class AgentStoppedEarly(RuntimeError):
 
 class ProfileInUse(RuntimeError):
     """A live Chrome on this host already holds the portal's browser profile."""
+
+
+class PortalUnreachable(RuntimeError):
+    """The portal's start page is gone (404/410) or does not answer at all."""
+
+
+class StartUrlProbe:
+    """One GET on a portal's start page before a browser and the LLM are spent on it.
+
+    In the 70-portal dry run of 2026-11-15, 8 portals had a start page that was gone
+    or did not answer; the agent still spent up to 610 s on each to find that out.
+    Only a gone page or no answer skips: Cloudflare boards answer 403 and
+    golang.cafe / rustjobs.dev answered 429 to a plain GET, and the browser still
+    filled forms on the last two.
+    """
+
+    # Real board pages loaded in 1.1 to 8.2 s (docs/PROJECT_STATE.md section 8).
+    TIMEOUT_S = 15.0
+    GONE_STATUSES = frozenset({404, 410})
+    USER_AGENT = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+    )
+
+    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        self.transport = transport
+
+    async def check(self, system: dict) -> None:
+        # A start page behind a login can 404 to a logged-out GET (hackajob) and
+        # still work in the portal's logged-in browser profile.
+        if system.get("credentials"):
+            return
+        url = expand_env(system.get("search_url", "")) or expand_env(system["url"])
+        status = await self._status(url)
+        if status in self.GONE_STATUSES:
+            raise PortalUnreachable(f"{url}: HTTP {status}")
+
+    async def _status(self, url: str) -> int:
+        async with httpx.AsyncClient(
+            transport=self.transport,
+            timeout=self.TIMEOUT_S,
+            follow_redirects=True,
+            headers={"User-Agent": self.USER_AGENT},
+            # Chrome ignores HTTP(S)_PROXY; check the page by the same route it uses.
+            trust_env=False,
+        ) as client:
+            try:
+                response = await client.get(url)
+            except httpx.TransportError as exc:
+                raise PortalUnreachable(f"{url}: {type(exc).__name__}: {exc}") from exc
+        return response.status_code
 
 
 class PortalRunner:
@@ -2374,6 +2601,7 @@ class PortalRunner:
         self.proxy_provider = proxy_provider
         self.plog = app_logger.portal(self.name)
         self._network_recorder: NetworkRecorder | None = None
+        self._step_callback: StepCallback | None = None
 
     async def run(self) -> str:
         mode = "DRY RUN" if self.opts.dry_run else "APPLY"
@@ -2541,6 +2769,10 @@ class PortalRunner:
                 DryRunGuard(self.name, self.app_logger) if self.opts.dry_run else None
             ),
             scroll_brake=ScrollLoopBrake(self.plog),
+            shots=StepShots(Paths.SCREENSHOTS / self.name / self.app_logger.run_id),
+            applied_stop=AppliedPageStop(
+                KnownJobs(self.applied, self.attempted, start_url=self.url), self.plog
+            ),
         )
         # Files the agent is allowed to upload via browser_use's upload_file action.
         # Without this whitelist, EVERY upload attempt fails with
@@ -2576,6 +2808,7 @@ class PortalRunner:
         )
         callback.agent_ref = agent  # lets callbacks attach the recorders
         self._network_recorder = network_recorder
+        self._step_callback = callback
         return agent
 
     async def _run_agent(self, agent: Agent) -> str:
@@ -2585,7 +2818,13 @@ class PortalRunner:
             self.opts.fast,
             self.opts.max_actions,
         )
-        history = await agent.run()
+        on_step_end = self._step_callback.on_step_end if self._step_callback else None
+        try:
+            history = await agent.run(on_step_end=on_step_end)
+        except asyncio.CancelledError as exc:
+            if asyncio.current_task().cancelling():
+                raise  # the run itself is being cancelled (Ctrl+C)
+            raise PortalInterrupted(f"{self.name}: {exc}") from exc
         elapsed = time.monotonic() - t0
 
         final = history.final_result() or "(no result)"
@@ -2630,6 +2869,7 @@ class Orchestrator:
         recorder: ApplicationRecorder,
         app_logger: AppLogger,
         default_proxy_provider: ProxyProvider | None = None,
+        url_probe: StartUrlProbe | None = None,
     ):
         self.systems = systems
         self.knowledge = knowledge
@@ -2644,6 +2884,7 @@ class Orchestrator:
         self.recorder = recorder
         self.app_logger = app_logger
         self.default_proxy_provider = default_proxy_provider
+        self.url_probe = url_probe
         self.log = app_logger.main()
         self.active = self._select_active(systems)
         self.skipped_count = len(systems) - len(self.active)
@@ -2691,12 +2932,12 @@ class Orchestrator:
     async def _retry_failures(
         self, results: list[tuple[str, str | Exception]]
     ) -> list[tuple[str, str | Exception]]:
-        # A profile held by a live Chrome is still held 5 s later
+        # A profile held by a live Chrome is still held 5 s later, a gone page is still gone
         failed = {
             n
             for n, r in results
             if isinstance(r, Exception)
-            and not isinstance(r, ProfileInUse)
+            and not isinstance(r, (ProfileInUse, PortalUnreachable))
             and n not in self._crashed
         }
         if not failed:
@@ -2742,7 +2983,15 @@ class Orchestrator:
             name = system["name"]
             async with sem:
                 try:
-                    return (name, await self._make_runner(system).run())
+                    return (name, await self.run_portal(system))
+                except PortalUnreachable as exc:
+                    self.log.warning(
+                        "[%s] skipped: start page unreachable: %s", name, exc
+                    )
+                    self.app_logger.emit(
+                        "portal_unreachable", portal=name, error=str(exc)
+                    )
+                    return (name, exc)
                 except recoverable as exc:
                     self.log.error(
                         "[%s] failed (recoverable): %s: %s",
@@ -2791,7 +3040,12 @@ class Orchestrator:
             results.append((name, result))
         return results
 
-    def _make_runner(self, system: dict) -> PortalRunner:
+    async def run_portal(self, system: dict) -> str:
+        if self.url_probe is not None:
+            await self.url_probe.check(system)
+        return await self.make_runner(system).run()
+
+    def make_runner(self, system: dict) -> PortalRunner:
         return PortalRunner(
             system,
             knowledge=self.knowledge,
@@ -2947,8 +3201,8 @@ class CLI:
         p.add_argument(
             "--max-actions",
             type=positive_int,
-            default=5,
-            help="Max actions per LLM call (default 5; raise to 8–12)",
+            default=RunOptions.DEFAULT_MAX_ACTIONS,
+            help="Max actions per LLM call (default %(default)s)",
         )
         p.add_argument(
             "--model", help="OpenRouter model id (overrides OPENROUTER_MODEL env)"
@@ -2988,6 +3242,7 @@ class CLI:
             log.info("Resume PDF: %s", opts.resume_path)
 
         deps = cls._build_deps(args, log, app_logger, yaml_store, opts)
+        deps.update(opts=opts, yaml_store=yaml_store, app_logger=app_logger)
         deps["default_proxy_provider"] = ProxyProviderFactory.build(
             default_proxy_cfg,
             log=log,
@@ -3057,23 +3312,8 @@ class CLI:
     @staticmethod
     def _run_all(systems, workers, opts, yaml_store, deps, app_logger, log) -> None:
         log.info("Mode: ALL portals (%d)", len(systems))
-        asyncio.run(
-            Orchestrator(
-                systems,
-                knowledge=deps["knowledge"],
-                llm=deps["llm"],
-                opts=opts,
-                max_workers=workers,
-                yaml_store=yaml_store,
-                task_builder=deps["task_builder"],
-                cred_resolver=deps["cred_resolver"],
-                applied=deps["applied"],
-                attempted=deps["attempted"],
-                recorder=deps["recorder"],
-                app_logger=app_logger,
-                default_proxy_provider=deps["default_proxy_provider"],
-            ).run()
-        )
+        orchestrator = CLI._orchestrator(systems, workers, deps)
+        asyncio.run(orchestrator.run())
 
     @staticmethod
     def _run_single(
@@ -3092,24 +3332,29 @@ class CLI:
         if not url or url.startswith("$"):
             log.error("[%s] URL not configured — set the env var in .env", system_name)
             raise SystemExit(1)
-        proxy_provider = portal_proxy_provider(
-            system, deps["default_proxy_provider"], log=log
-        )
-        runner = PortalRunner(
-            system,
+        orchestrator = CLI._orchestrator([system], 1, deps)
+        asyncio.run(orchestrator.run_portal(system))
+
+    @classmethod
+    def _orchestrator(
+        cls, systems: list[dict], workers: int, deps: dict
+    ) -> "Orchestrator":
+        return Orchestrator(
+            systems,
             knowledge=deps["knowledge"],
             llm=deps["llm"],
-            opts=opts,
-            yaml_store=yaml_store,
+            opts=deps["opts"],
+            max_workers=workers,
+            yaml_store=deps["yaml_store"],
             task_builder=deps["task_builder"],
             cred_resolver=deps["cred_resolver"],
             applied=deps["applied"],
             attempted=deps["attempted"],
             recorder=deps["recorder"],
-            app_logger=app_logger,
-            proxy_provider=proxy_provider,
+            app_logger=deps["app_logger"],
+            default_proxy_provider=deps["default_proxy_provider"],
+            url_probe=StartUrlProbe(),
         )
-        asyncio.run(runner.run())
 
 
 def main() -> None:

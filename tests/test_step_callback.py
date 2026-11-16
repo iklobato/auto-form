@@ -8,8 +8,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from browser_use.browser.views import BrowserStateSummary
+from browser_use.tools.service import Tools
 
-from fill import DryRunGuard, Paths, StepCallback
+from fill import DryRunGuard, Paths, ShotPhase, StepCallback, StepShots
 
 
 def _png_b64() -> str:
@@ -22,30 +23,53 @@ def _png_b64() -> str:
     return base64.b64encode(raw).decode()
 
 
+@pytest.fixture
+def run_shots(tmp_app_root: Path) -> StepShots:
+    return StepShots(Paths.SCREENSHOTS / "acme" / "test-run")
+
+
+class TestStepShots:
+    def test_a_retried_portal_gets_its_own_folder(self, tmp_app_root: Path) -> None:
+        base = Paths.SCREENSHOTS / "acme" / "test-run"
+        first = StepShots(base).save(1, ShotPhase.BEFORE, b"first")
+        retry = StepShots(base).save(1, ShotPhase.BEFORE, b"retry")
+
+        assert first.read_bytes() == b"first"
+        assert retry == base.with_name("test-run-2") / "step0001_before.png"
+
+
 class TestActionNameExtraction:
-    def test_extracts_from_pydantic_actions(self):
-        # When agent_output.action is a list of pydantic-like objects with model_dump.
+    """Action names as logged in the `step` event."""
+
+    async def _logged_actions(self, mock_app_logger: MagicMock, action: object) -> list:
+        state = MagicMock(
+            spec=BrowserStateSummary, url="https://acme/x", screenshot=None
+        )
+        output = MagicMock(action=action, next_goal="", evaluation_previous_goal="")
+        await StepCallback("acme", mock_app_logger).on_step(state, output, step_num=1)
+        return mock_app_logger.emit.call_args.kwargs["actions"]
+
+    @pytest.mark.asyncio
+    async def test_extracts_from_pydantic_actions(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ) -> None:
         action = MagicMock()
-        action.model_dump.return_value = {"click": {"index": 5}, "wait": None}
-        names = StepCallback._extract_action_names(MagicMock(action=[action]))
-        # `wait` is None → excluded (exclude_none in real model_dump)
-        assert names == [
-            "click",
-            "wait",
-        ]  # MagicMock returns full dict; we test the wiring
+        action.model_dump.return_value = {"click": {"index": 5}}
+        assert await self._logged_actions(mock_app_logger, [action]) == ["click"]
 
-    def test_extracts_from_dict_actions(self):
-        out = MagicMock(action=[{"click": {"index": 1}, "scroll": None}])
-        names = StepCallback._extract_action_names(out)
-        assert "click" in names
+    @pytest.mark.asyncio
+    async def test_dict_actions_skip_none_values(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ) -> None:
+        action = {"click": {"index": 1}, "scroll": None}
+        assert await self._logged_actions(mock_app_logger, [action]) == ["click"]
 
-    def test_handles_empty_action_list(self):
-        out = MagicMock(action=[])
-        assert StepCallback._extract_action_names(out) == []
-
-    def test_handles_none_action_attr(self):
-        out = MagicMock(action=None)
-        assert StepCallback._extract_action_names(out) == []
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", [[], None])
+    async def test_no_actions(
+        self, action: list | None, tmp_app_root: Path, mock_app_logger: MagicMock
+    ) -> None:
+        assert await self._logged_actions(mock_app_logger, action) == []
 
 
 class TestOnStepFailureIsolation:
@@ -83,9 +107,9 @@ class TestOnStepFailureIsolation:
 class TestOnStep:
     @pytest.mark.asyncio
     async def test_saves_screenshot_when_present(
-        self, tmp_app_root: Path, mock_app_logger: MagicMock
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
     ):
-        cb = StepCallback("acme", mock_app_logger)
+        cb = StepCallback("acme", mock_app_logger, shots=run_shots)
         state = MagicMock(spec=BrowserStateSummary)
         state.url = "https://acme/jobs"
         state.screenshot = _png_b64()
@@ -95,15 +119,15 @@ class TestOnStep:
 
         await cb.on_step(state, agent_output, step_num=1)
 
-        files = list((Paths.SCREENSHOTS / "acme").glob("step0001_*.png"))
-        assert len(files) == 1
-        assert files[0].read_bytes().startswith(b"\x89PNG")
+        run_dir = Paths.SCREENSHOTS / "acme" / "test-run"
+        assert [shot.name for shot in run_dir.iterdir()] == ["step0001_before.png"]
+        assert (run_dir / "step0001_before.png").read_bytes().startswith(b"\x89PNG")
 
     @pytest.mark.asyncio
     async def test_no_screenshot_no_file(
-        self, tmp_app_root: Path, mock_app_logger: MagicMock
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
     ):
-        cb = StepCallback("acme", mock_app_logger)
+        cb = StepCallback("acme", mock_app_logger, shots=run_shots)
         state = MagicMock(spec=BrowserStateSummary)
         state.url = "https://acme/jobs"
         state.screenshot = None
@@ -147,6 +171,133 @@ class TestOnStep:
             step_num=1,
         )
         assert mock_app_logger.emit.call_args.kwargs["url"] == "unknown"
+
+
+class FakeScreenshotSession:
+    """Stands in for the CDP session behind a screenshot (Page.captureScreenshot)."""
+
+    session_id = "s1"
+
+    def __init__(self, reply: dict, delay_s: float = 0.0) -> None:
+        self.reply = reply
+        self.delay_s = delay_s
+
+    @property
+    def cdp_client(self) -> "FakeScreenshotSession":
+        return self
+
+    @property
+    def send(self) -> "FakeScreenshotSession":
+        return self
+
+    @property
+    def Page(self) -> "FakeScreenshotSession":  # noqa: N802 - CDP domain name
+        return self
+
+    async def get_or_create_cdp_session(self) -> "FakeScreenshotSession":
+        return self
+
+    async def captureScreenshot(  # noqa: N802 - CDP method name
+        self, params: dict, session_id: str
+    ) -> dict:
+        await asyncio.sleep(self.delay_s)
+        return self.reply
+
+
+class TestAfterStepScreenshot:
+    """on_step_end saves what the page looks like after the step's actions ran."""
+
+    # browser_use bumps n_steps before on_step_end, so step 1 has ended at 2
+    STEPS_AFTER_FIRST = 2
+    # longer than the patched limit below, so the capture never answers in time
+    HANG_S = 5.0
+    SHORT_LIMIT_S = 0.05
+
+    def _agent(self, session: FakeScreenshotSession | None) -> MagicMock:
+        return MagicMock(
+            browser_session=session, state=MagicMock(n_steps=self.STEPS_AFTER_FIRST)
+        )
+
+    @pytest.mark.asyncio
+    async def test_saves_after_shot_next_to_before_shot(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
+    ) -> None:
+        agent = self._agent(FakeScreenshotSession({"data": _png_b64()}))
+
+        await StepCallback("acme", mock_app_logger, shots=run_shots).on_step_end(agent)
+
+        shot = Paths.SCREENSHOTS / "acme" / "test-run" / "step0001_after.png"
+        assert shot.read_bytes() == base64.b64decode(_png_b64())
+
+    @pytest.mark.asyncio
+    async def test_a_capture_that_never_answers_is_cut_off(
+        self,
+        mock_app_logger: MagicMock,
+        run_shots: StepShots,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # browser_use awaits on_step_end outside its step timeout
+        monkeypatch.setattr(StepShots, "TIMEOUT_S", self.SHORT_LIMIT_S)
+        agent = self._agent(FakeScreenshotSession({}, delay_s=self.HANG_S))
+
+        await StepCallback("acme", mock_app_logger, shots=run_shots).on_step_end(agent)
+
+        event = mock_app_logger.emit.call_args
+        assert event.args == ("step_callback_error",)
+        assert (event.kwargs["error_type"], event.kwargs["step"]) == ("TimeoutError", 1)
+
+    @pytest.mark.asyncio
+    async def test_a_reply_without_data_is_reported_not_raised(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
+    ) -> None:
+        agent = self._agent(FakeScreenshotSession({}))
+
+        await StepCallback("acme", mock_app_logger, shots=run_shots).on_step_end(agent)
+
+        event = mock_app_logger.emit.call_args
+        assert event.kwargs["error"] == "the browser returned no screenshot data"
+        assert list(Paths.SCREENSHOTS.rglob("*.png")) == []
+
+    @pytest.mark.asyncio
+    async def test_no_browser_session_no_file(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock, run_shots: StepShots
+    ) -> None:
+        await StepCallback("acme", mock_app_logger, shots=run_shots).on_step_end(
+            self._agent(None)
+        )
+
+        assert list(Paths.SCREENSHOTS.rglob("*.png")) == []
+
+
+class TestInputAlwaysClears:
+    """flash-lite sent clear: False when it typed into a field again (2026-10-30)."""
+
+    FIELD_INDEX = 3
+    BUTTON_INDEX = 4
+    PHONE = "555-0100"
+
+    def _actions(self, raw_actions: list[dict]) -> list:
+        action_model = Tools().registry.create_action_model()
+        return [action_model.model_validate(raw) for raw in raw_actions]
+
+    @pytest.mark.asyncio
+    async def test_append_input_is_turned_into_clear(
+        self, tmp_app_root: Path, mock_app_logger: MagicMock
+    ) -> None:
+        typed = {"index": self.FIELD_INDEX, "text": self.PHONE}
+        click = {"click": {"index": self.BUTTON_INDEX}}
+        actions = self._actions([{"input": {**typed, "clear": False}}, click])
+        state = MagicMock(
+            spec=BrowserStateSummary, url="https://acme/x", screenshot=None
+        )
+        output = MagicMock(action=actions, next_goal="", evaluation_previous_goal="")
+
+        await StepCallback("acme", mock_app_logger).on_step(state, output, step_num=1)
+
+        assert [action.model_dump(exclude_unset=True) for action in actions] == [
+            {"input": {**typed, "clear": True}},
+            click,
+        ]
 
 
 class TestDryRunGuard:

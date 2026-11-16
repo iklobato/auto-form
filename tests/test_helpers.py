@@ -74,3 +74,10 @@ class TestMaxActionsArg:
     def test_rejects_less_than_one(self, value: str) -> None:
         with pytest.raises(SystemExit):
             CLI._build_parser().parse_args(["--all", "--max-actions", value])
+
+    # Default 5 left 10 of 14 fields empty in the 2026-10-30 local run
+    EXPECTED_DEFAULT = 12
+
+    def test_default_is_twelve(self) -> None:
+        args = CLI._build_parser().parse_args(["--all"])
+        assert args.max_actions == self.EXPECTED_DEFAULT

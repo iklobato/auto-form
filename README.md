@@ -62,7 +62,7 @@ the browser, so nothing is sent. In a dry run nothing is written to `applied.jso
 Then look at what it did:
 
 ```bash
-ls screenshots/weworkremotely/            # one PNG per step
+ls screenshots/weworkremotely/<run_id>/   # two PNGs per step: before and after
 tail -n 50 logs/<run_id>.log              # the run id is printed at start
 grep "DRY RUN: blocked" logs/<run_id>.log # what the browser stopped
 ```
@@ -81,7 +81,7 @@ uv run python fill.py --all --workers 2 --headless --model google/gemini-2.5-fla
 ```
 
 **Which model and `--max-actions`.** The defaults are `google/gemini-2.5-flash-lite` and
-5 actions per step. In a local end-to-end test on 2026-10-30 these defaults sent no
+12 actions per step. In a local end-to-end test on 2026-10-30 the old default of 5 sent no
 application: the agent filled 4 of 14 fields, the browser blocked the submit, and the
 agent said it worked. browser_use drops actions past `--max-actions` without telling the
 model. With `--model google/gemini-2.5-flash --max-actions 12` both test forms were
@@ -92,9 +92,12 @@ flash for sites where you expect a form; flash-lite is fine for scanning. Detail
 
 **Duplicates.** Before applying, the agent calls `check_applied`, which skips a job
 already in `applied.jsonl` or `attempted.jsonl` (URLs are compared without tracking
-params, `www.`, trailing slash). A run can be stopped and started again. Known gap: an
-agent that never calls `check_applied` can still apply twice (seen once with
-flash-lite).
+params, `www.`, trailing slash). A run can be stopped and started again. If the agent
+skips `check_applied` and opens a job that is in `applied.jsonl`, or in
+`attempted.jsonl` with a reason the agent gave, the program drops that step's clicks,
+typing, uploads and page scripts and sends the agent back. Not covered: attempts with
+reason `submitted_not_marked` (a guess that can name a listing page) and the site's own
+start page.
 
 ## 6. After a real run, check
 
@@ -212,7 +215,7 @@ disability questions whose profile answers did not match the option text.
 --headless             no Chrome window (some sites answer 403)
 --workers N            sites at the same time with --all, 1 or more (default 5)
 --model ID             OpenRouter model id (default google/gemini-2.5-flash-lite)
---max-actions N        actions per LLM step, 1 or more (default 5; 12 works better for forms)
+--max-actions N        actions per LLM step, 1 or more (default 12)
 --fast                 browser_use flash mode: no self-check step, about 30% faster
 --filter WORD          only roles whose title or description has WORD
 --note "TEXT"          extra context added to the prompt for this run
@@ -240,7 +243,9 @@ disability questions whose profile answers did not match the option text.
 ```
 logs/<run_id>.log                          the run log
 logs/events.jsonl                          one JSON event per line (steps, errors, blocks)
-screenshots/<site>/stepNNNN_<time>.png     one screenshot per agent step
+screenshots/<site>/<run_id>/stepNNNN_before.png  the page the model saw for that step
+screenshots/<site>/<run_id>/stepNNNN_after.png   the page after the step's actions ran
+                                           (a retried site writes to <run_id>-2)
 applications/<site>/<time>_<title>.json    one record per application
 applications/<site>/INDEX.md               table of applications for that site
 applications/<site>/network/*_post.json    every POST/PUT/PATCH sent (not analytics)

@@ -2,11 +2,14 @@
 
 Read this first if you are an agent (or a person) picking up this repo. It says what the
 code does today, what was learned the hard way, what was done, and what is still open.
-Last updated: 2026-10-30.
+Last updated: 2026-11-15.
 
 Work of one session, with its evidence, lives in `docs/sessions/<date>.md`:
 [2026-10-30](sessions/2026-10-30.md) (retries, dry-run safety, duplicate applications,
-submit capture, local end-to-end test).
+submit capture, local end-to-end test);
+[2026-11-15](sessions/2026-11-15.md) (before/after screenshots, duplicate stop,
+`clear=True`, `--max-actions` 12, Obscura tried and dropped). Decisions with their
+reasons: `docs/decisions/<date>-<topic>.md`.
 
 This repo is public. Never put personal data here (names, emails, phone, resume file
 names, anything from `knowledge/`, `systems*.yaml` or `.env`).
@@ -55,7 +58,7 @@ uv run python fill.py --summary                   # applications on disk
 | `applications/<portal>/` | no | per-application JSON, `INDEX.md`, `network/*_post.json`, `cdp.jsonl` |
 | `logs/` | no | run logs and `events.jsonl` (one JSON event per line) |
 | `browser_profiles/<portal>/` | no | Chrome profile per portal; also `portal_password` (0600) |
-| `screenshots/<portal>/` | no | one PNG per agent step |
+| `screenshots/<portal>/<run_id>/` | no | `stepNNNN_before.png` and `stepNNNN_after.png` per agent step (`<run_id>-2` for a retry) |
 
 ## 4. How a run works
 
@@ -71,9 +74,11 @@ uv run python fill.py --summary                   # applications on disk
    task text (`TaskBuilder`), proxy (acquired in a thread), then `_build_agent`
    (browser profile, `NetworkRecorder`, `CDPDebugger`, optional `DryRunGuard`,
    `StepCallback`) and `AgentActions.register_all` (custom tools).
-4. `browser_use.Agent.run()` loops. Before each step's actions execute, browser_use calls
-   `StepCallback.on_step`, which attaches the guard and recorders, logs the step and saves
-   a screenshot.
+4. `browser_use.Agent.run(on_step_end=...)` loops. Before each step's actions execute,
+   browser_use calls `StepCallback.on_step`, which attaches the guard and recorders, runs
+   `AppliedPageStop` and `InputClearer` on the actions, logs the step and saves the
+   "before" screenshot. After the actions, `StepCallback.on_step_end` saves the "after"
+   screenshot.
 5. The agent calls the custom tools: `check_applied`, `mark_applied`, `mark_attempted`,
    `save_screenshot`, `save_note`, `save_credentials`.
 6. `PortalRunner._run_agent` raises `AgentStoppedEarly` if the agent never called `done`
@@ -153,10 +158,51 @@ params such as `gh_jid` are kept. An attempted URL is skipped forever.
 - `PortalRunner._clean_stale_locks` raises `ProfileInUse` if the profile's `SingletonLock`
   points at a live Chrome on this host; it only removes locks from dead or foreign pids.
   `Orchestrator` does not retry `ProfileInUse`.
+- `StartUrlProbe` sends one GET to `search_url` (else `url`) before any browser
+  starts. A 404/410, a timeout, a DNS or TLS error raises `PortalUnreachable`: no
+  Chrome, no LLM call, event `portal_unreachable`, not retried. 403, 429 and 5xx do
+  not skip (Cloudflare boards answer 403 and golang.cafe 429 to a plain GET, and the
+  browser still works there). Portals with `credentials` are not checked (a logged-out
+  GET can 404). It ignores `HTTP(S)_PROXY`, like Chrome. On 2026-11-15 it skipped 6 of
+  the 70 in `systems-all.yaml`: remote_co, jobgether, remotehub, remote_europe,
+  django_jobs, remote_jobs_club.
 - `ScrollLoopBrake` (called from `StepCallback`) adds a note to the agent history after
   every 3rd scroll-only step in a row (see section 6 for why it uses a private API).
 
+### 5.7 Step actions are corrected before they run (2026-11-15)
+- `InputClearer` sets `clear=True` on every `input` action (flash-lite sent
+  `clear: False` and values went out twice). The params are at `action.root.input`.
+- `AppliedPageStop`: when `KnownJobs.holds(url)` (the page URL is in `applied.jsonl` or
+  in an attempt the agent recorded), `click`, `input`, `upload_file`, `send_keys`,
+  `select_dropdown` and `evaluate` are dropped and a note goes to the agent history.
+  Records with reason `submitted_not_marked` are ignored (they can name a listing), and
+  the portal start URL never counts (1 of 16 real attempts named one, reason
+  `captcha`). If no action is left, a `go_back` replaces them: browser_use does not count
+  a step with an empty action list.
+
+### 5.8 Screenshots (2026-11-15)
+- `StepShots` writes `screenshots/<portal>/<run_id>/stepNNNN_before.png` from
+  `on_step` and `stepNNNN_after.png` from `on_step_end` (step = `n_steps - 1`, because
+  browser_use bumps it first). A retried portal (same run id, steps from 1 again) writes
+  to `<run_id>-2`. The after shot calls `Page.captureScreenshot` itself with a 6 s
+  limit: `BrowserSession.take_screenshot` has none (and `on_step_end` runs outside
+  browser_use's step timeout) and raises a bare `Exception` on an empty reply. A failed
+  capture never reaches the agent.
+
 ## 6. Things learned (read before debugging)
+
+- **Obscura (2026-11-15) cannot be the browser here**: 0.2.7 sends a multipart form as
+  urlencoded without the file, `fetch` with `FormData` without the file part, and only
+  pauses requests on page sessions, so `DryRunGuard` does not block. Details and the
+  wiring facts (`--ready-file`, `is_local=True`) in
+  [sessions/2026-11-15.md](sessions/2026-11-15.md) section 3.
+- browser_use with `is_local=False` lets `upload_file` take any path. Any browser reached
+  over `cdp_url` on this machine must use `is_local=True`.
+- `fill.py` calls `load_dotenv()` without `override`: an `OPENROUTER_TOKEN` exported in
+  the shell wins over `.env` (seen 2026-11-15: every LLM call failed with 401
+  "User not found").
+- The OpenRouter key `usage` lags by minutes; a before/after read right around one run
+  is not a cost measurement.
 
 - browser_use returns the history instead of raising when it hits `max_steps` or
   `max_failures`. Check `history.is_done()`.
@@ -289,6 +335,9 @@ server records the POST, with it the server records nothing.
 - Measured: the guard does not slow screenshots (0.10 to 0.13 s with and without, 5 runs
   each on an Ashby page). Page loads were 1.1 to 1.5 s or about 8.2 s in both groups; the
   8 s is browser_use's own readiness timeout.
+- Branch `feat/step-screenshots-and-fixes` (2026-11-15, one commit per change, each with
+  its test): `--max-actions` 12, `clear=True`, three review findings, before/after
+  screenshots, `AppliedPageStop`. Evidence: [sessions/2026-11-15.md](sessions/2026-11-15.md).
 
 ## 9. Open items and next steps
 
@@ -302,12 +351,14 @@ Each item says when it is done.
 2. **Closed 2026-10-30:** dry-run upload error (notice changed, see section 7), guard on
    a real submit (real-Chrome test), LLM network-error retry, E741 lint.
 3. **Open from 2026-10-30** (details, fix ideas and "done when" for each in
-   [sessions/2026-10-30.md](sessions/2026-10-30.md), section 6): `clear: False` sends a
-   value twice; the default `--max-actions 5` cuts form fills short (no form was sent in
-   the default local run); `mark_applied` with no POST is still recorded as applied
-   (`submit_seen: false`); an agent that skips `check_applied` can still apply twice;
-   Veteran/Disability answers; scroll brake measured once; Greenhouse in a cross-site
-   iframe and the guard on an agent's submit click not seen live; three review findings.
+   [sessions/2026-10-30.md](sessions/2026-10-30.md), section 6): `mark_applied` with no
+   POST is still recorded as applied (`submit_seen: false`); Veteran/Disability answers;
+   scroll brake measured once; Greenhouse in a cross-site iframe and the guard on an
+   agent's submit click not seen live. **Closed 2026-11-15:** `clear: False`, default
+   `--max-actions`, the three review findings. **Narrowed 2026-11-15:** an agent that
+   skips `check_applied` is stopped on jobs in `applied.jsonl` or agent-recorded attempts,
+   not on `submitted_not_marked` ones ([sessions/2026-11-15.md](sessions/2026-11-15.md)
+   section 5 has what is left).
 4. **Records written before 2026-10-30** with a form URL as `job_url` do not match their
    listing URL. The user's `applied.jsonl` did not exist on 2026-10-30, so nothing to fix
    there today.

@@ -1,20 +1,27 @@
 """PortalRunner — credential injection (portal_password + LinkedIn SSO)."""
 
+import asyncio
+import base64
 import os
 import socket
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from browser_use.browser.views import BrowserStateSummary
+from browser_use.tools.service import Tools
 
 import fill
+from tests.test_step_callback import FakeScreenshotSession
 from fill import (
     AgentStoppedEarly,
     ApplicationRecorder,
     CredentialsResolver,
     JsonlTracker,
+    Paths,
+    PortalInterrupted,
     PortalRunner,
     ProfileInUse,
     Proxy,
@@ -640,6 +647,46 @@ def fresh_runner(request: pytest.FixtureRequest) -> PortalRunner:
     )
 
 
+class TestAgentInterrupted:
+    # 2026-11-15, systems-all.yaml with 5 workers: Chrome took over 30 s to start,
+    # bubus raised CancelledError ("interrupted because of a parent timeout") out of
+    # Agent.run; it is not an Exception, so it stopped the whole batch after 7 of 70
+    async def test_cancel_from_inside_browser_use_is_a_retryable_failure(
+        self, fresh_runner: PortalRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        interrupted = asyncio.CancelledError("interrupted because of a parent timeout")
+        agent.run.side_effect = interrupted
+        agent_ctor.return_value = agent
+
+        with pytest.raises(PortalInterrupted, match="parent timeout") as raised:
+            await fresh_runner.run()
+
+        # Orchestrator retries RuntimeError
+        assert isinstance(raised.value, RuntimeError)
+
+    async def test_cancelling_the_run_itself_still_cancels(
+        self, fresh_runner: PortalRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        started = asyncio.Event()
+
+        async def run_until_cancelled(on_step_end: Callable | None = None) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        agent.run.side_effect = run_until_cancelled
+        agent_ctor.return_value = agent
+        task = asyncio.create_task(fresh_runner.run())
+        await started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 class TestBrowserStartSession:
     # run() writes the generated portal password into the profile dir first
     async def test_first_run_reports_a_fresh_profile(
@@ -681,6 +728,80 @@ class TestRunRecordsUnmarkedSubmit:
         assert attempted.load_keys() == {SUBMIT_PAGE}
 
 
+class TestAfterStepScreenshotWiring:
+    async def test_run_saves_a_screenshot_after_each_step(
+        self, fresh_runner: PortalRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        agent.run.side_effect = OneStepEnds(agent).end_one_step
+        agent_ctor.return_value = agent
+
+        await fresh_runner.run()
+
+        shots = sorted(Paths.SCREENSHOTS.rglob("*.png"))
+        assert [shot.name for shot in shots] == ["step0001_after.png"]
+        assert shots[0].read_bytes() == OneStepEnds.PNG
+
+
+class TestAppliedJobWiring:
+    # flash-lite opened a job it had already sent and sent it again (2026-10-30)
+    async def test_form_actions_on_an_applied_job_are_dropped(
+        self,
+        fresh_runner: PortalRunner,
+        request: pytest.FixtureRequest,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await request.getfixturevalue("applied_tracker").append(
+            {"job_url": SUBMIT_PAGE}
+        )
+        _, agent_ctor = TestProxyWiring._patch_browser(monkeypatch)
+        agent = TestRunAgentOutcome._agent_returning(is_done=True)
+        agent._message_manager.state.agent_history_items = []
+        step = ClickOnPage(agent_ctor, agent)
+        agent.run.side_effect = step.click_send
+        agent_ctor.return_value = agent
+
+        await fresh_runner.run()
+
+        sent = [action.model_dump(exclude_unset=True) for action in step.actions]
+        assert sent == [{"go_back": {}}]
+
+
+class ClickOnPage:
+    """Agent.run stand-in: the model asks to click on SUBMIT_PAGE."""
+
+    def __init__(self, agent_ctor: MagicMock, agent: MagicMock) -> None:
+        self.agent_ctor = agent_ctor
+        self.agent = agent
+        self.actions: list = []
+
+    async def click_send(self, on_step_end: Callable | None = None) -> MagicMock:
+        action_model = Tools().registry.create_action_model()
+        self.actions.append(action_model.model_validate({"click": {"index": 1}}))
+        on_step = self.agent_ctor.call_args.kwargs["register_new_step_callback"]
+        state = MagicMock(spec=BrowserStateSummary, url=SUBMIT_PAGE, screenshot=None)
+        await on_step(state, MagicMock(action=self.actions), 1)
+        return self.agent.run.return_value
+
+
+class OneStepEnds:
+    """Agent.run stand-in: one step ends, browser_use calls the on_step_end hook."""
+
+    PNG = b"\x89PNG after"
+    STEPS_AFTER_FIRST = 2
+
+    def __init__(self, agent: MagicMock) -> None:
+        self.agent = agent
+
+    async def end_one_step(self, on_step_end: Callable | None = None) -> MagicMock:
+        reply = {"data": base64.b64encode(self.PNG).decode()}
+        self.agent.browser_session = FakeScreenshotSession(reply)
+        self.agent.state.n_steps = self.STEPS_AFTER_FIRST
+        await on_step_end(self.agent)
+        return self.agent.run.return_value
+
+
 SUBMIT_PAGE = "https://jobs.acme.example/1001/apply"
 
 
@@ -691,7 +812,7 @@ class BrowserSubmits:
         self.agent_ctor = agent_ctor
         self.agent = agent
 
-    async def submit_then_stop(self) -> MagicMock:
+    async def submit_then_stop(self, on_step_end: object = None) -> MagicMock:
         on_step = self.agent_ctor.call_args.kwargs["register_new_step_callback"]
         state = MagicMock(spec=BrowserStateSummary, url=SUBMIT_PAGE, screenshot=None)
         await on_step(state, MagicMock(action=[]), 1)
